@@ -1656,10 +1656,18 @@ impl RequestForwarder {
         // keywords, which Codex Desktop's built-in tool schemas do (#6867). Move
         // each such `$ref` into `allOf` for that upstream only; every other
         // provider keeps byte-identical tool schemas (prompt-cache prefix intact).
+        // The gate matches the Moonshot host directly, or the Kimi/Moonshot model
+        // id when a relay (NewAPI, one-api, corporate gateway) fronts Moonshot
+        // under its own host.
         if codex_responses_to_chat
-            && super::providers::transform_codex_chat_moonshot_schema::upstream_requires_ref_sibling_all_of(
+            && (super::providers::transform_codex_chat_moonshot_schema::upstream_requires_ref_sibling_all_of(
                 &base_url,
-            )
+            ) || request_body
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    super::providers::transform_codex_chat_moonshot_schema::model_requires_ref_sibling_all_of,
+                ))
         {
             let rewritten =
                 super::providers::transform_codex_chat_moonshot_schema::wrap_ref_siblings_in_chat_tools(

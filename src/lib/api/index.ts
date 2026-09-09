@@ -19,6 +19,7 @@ export type {
   DesktopAppId,
   DesktopAppStatus,
   DesktopLifecycleAction,
+  DesktopLifecycleJob,
   ToolLifecycleCapabilities,
 } from "./settings";
 export { mcpApi } from "./mcp";

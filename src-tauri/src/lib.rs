@@ -1167,9 +1167,20 @@ pub fn run() {
                     "Failed to reconcile interrupted Provider Center transactions: {error}"
                 ),
             }
+            match app_state
+                .db
+                .interrupt_incomplete_lifecycle_jobs(chrono::Utc::now().timestamp_millis())
+            {
+                Ok(0) => {}
+                Ok(count) => log::warn!(
+                    "Marked {count} interrupted application lifecycle job(s) for review"
+                ),
+                Err(error) => log::error!("Failed to reconcile lifecycle jobs: {error}"),
+            }
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
             app.manage(provider_center::ProviderCenterOperationState::default());
+            app.manage(commands::DesktopLifecycleOperationState::default());
 
             // 初始化 SkillService
             let skill_service = SkillService::new();
@@ -1670,6 +1681,9 @@ pub fn run() {
             commands::get_desktop_app_status,
             commands::check_desktop_app_updates,
             commands::run_desktop_app_lifecycle_action,
+            commands::cancel_desktop_lifecycle_job,
+            commands::get_desktop_lifecycle_job,
+            commands::list_desktop_lifecycle_jobs,
             commands::launch_desktop_app,
             commands::get_codex_desktop_status,
             commands::run_tool_lifecycle_action,
@@ -1697,6 +1711,9 @@ pub fn run() {
             commands::duplicate_provider_center_definition,
             commands::discover_provider_center_models,
             commands::scan_provider_center_imports,
+            commands::start_provider_center_import_session,
+            commands::get_provider_center_import_session,
+            commands::commit_provider_center_import_candidate,
             commands::import_provider_center_candidate,
             commands::apply_provider_center_bindings,
             commands::preview_provider_center_apply,

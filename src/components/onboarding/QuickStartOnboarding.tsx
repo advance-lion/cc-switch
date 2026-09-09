@@ -23,11 +23,10 @@ import {
 } from "@/components/ui/collapsible";
 import { CodexIcon } from "@/components/BrandIcons";
 import { useSettingsQuery } from "@/lib/query";
-import { providersApi, settingsApi } from "@/lib/api";
-import { generateUUID } from "@/utils/uuid";
+import { settingsApi } from "@/lib/api";
+import { providerCenterApi } from "@/lib/api/providerCenter";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { cn } from "@/lib/utils";
-import type { ProviderMeta } from "@/types";
 
 type CodexRuntime = {
   version: string | null;
@@ -40,11 +39,10 @@ interface QuickStartOnboardingProps {
   onComplete?: () => void;
 }
 
-const tomlString = (value: string) => JSON.stringify(value.trim());
-
 /**
- * A deliberately small first-run path. It writes a normal Codex provider,
- * rather than maintaining a second onboarding-only configuration format.
+ * A deliberately small first-run path. It creates the same shared Provider
+ * definition used by Provider Center, then explicitly applies its Codex
+ * binding. There is no onboarding-only configuration format.
  */
 export function QuickStartOnboarding({
   onComplete,
@@ -63,7 +61,6 @@ export function QuickStartOnboarding({
   const [apiKey, setApiKey] = useState("");
   const [apiFormat, setApiFormat] = useState<ApiFormat>("openai_chat");
   const [model, setModel] = useState("");
-  const [providerId, setProviderId] = useState("custom");
   const [formError, setFormError] = useState<string | null>(null);
 
   const isOpen =
@@ -123,7 +120,6 @@ export function QuickStartOnboarding({
     const cleanName = name.trim();
     const cleanUrl = baseUrl.trim().replace(/\/+$/, "");
     const cleanKey = apiKey.trim();
-    const cleanProviderId = providerId.trim() || "custom";
     setFormError(null);
 
     if (!cleanName || !cleanUrl || !cleanKey) {
@@ -142,43 +138,31 @@ export function QuickStartOnboarding({
 
     setSaving(true);
     try {
-      const configLines = [
-        `model_provider = ${tomlString(cleanProviderId)}`,
-        ...(model.trim() ? [`model = ${tomlString(model)}`] : []),
-        "",
-        `[model_providers.${cleanProviderId}]`,
-        `name = ${tomlString(cleanName)}`,
-        `base_url = ${tomlString(cleanUrl)}`,
-        // Codex itself speaks Responses. CC Switch's apiFormat meta controls
-        // whether its compatibility gateway converts this to Chat/Anthropic.
-        'wire_api = "responses"',
-        "requires_openai_auth = true",
-      ];
-      const now = Date.now();
-      const meta: ProviderMeta = {
-        apiFormat,
-        custom_endpoints: {
-          [cleanUrl]: { url: cleanUrl, addedAt: now },
-        },
-      };
-      const providerId = generateUUID();
-      await providersApi.add(
-        {
-          id: providerId,
-          name: cleanName,
-          category: "custom",
-          createdAt: now,
-          icon: "openai",
-          settingsConfig: {
-            auth: { OPENAI_API_KEY: cleanKey },
-            config: `${configLines.join("\n")}\n`,
-          },
-          meta,
-        },
-        "codex",
+      const protocol = apiFormat === "openai_chat"
+        ? "openai-chat"
+        : apiFormat === "openai_responses"
+          ? "openai-responses"
+          : "anthropic";
+      const definition = await providerCenterApi.save({
+        name: cleanName,
+        baseUrl: cleanUrl,
+        protocol,
+        models: model.trim() ? [model.trim()] : [],
+        notes: "由首次启动引导创建",
+        enabled: true,
+        credentialAction: "replace",
+        apiKey: cleanKey,
+        appTypes: ["codex"],
+      });
+      const preview = await providerCenterApi.previewApply(definition.id, ["codex"]);
+      const result = await providerCenterApi.applyTransaction(
+        definition.id,
+        ["codex"],
+        preview.token,
       );
-      await providersApi.switch(providerId, "codex");
-      await providersApi.updateTrayMenu();
+      if (result.status !== "applied") {
+        throw new Error(`配置未能完整应用（${result.status}）`);
+      }
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
       await finish();
       toast.success(t("quickStart.providerSaved"));
@@ -309,10 +293,6 @@ export function QuickStartOnboarding({
                     <Label htmlFor="quick-model">{t("quickStart.model")}</Label>
                     <Input id="quick-model" value={model} onChange={(event) => setModel(event.target.value)} placeholder={t("quickStart.modelPlaceholder")} />
                   </div>
-                </div>
-                <div className="mt-4 space-y-2">
-                  <Label htmlFor="quick-provider-id">{t("quickStart.providerId")}</Label>
-                  <Input id="quick-provider-id" value={providerId} onChange={(event) => setProviderId(event.target.value.replace(/[^a-zA-Z0-9_-]/g, ""))} placeholder="custom" />
                 </div>
               </CollapsibleContent>
             </Collapsible>

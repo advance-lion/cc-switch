@@ -27,6 +27,7 @@ import {
   type AppId,
   type DesktopAppId,
   type DesktopAppStatus,
+  type DesktopLifecycleJob,
   type ToolLifecycleCapabilities,
 } from "@/lib/api";
 import { isUpdateAvailable } from "@/lib/version";
@@ -112,6 +113,7 @@ interface LifecycleRowProps {
   onCheckOrUpdate: () => void;
   onUninstall: () => void;
   onRedetect: () => void;
+  onCancel?: () => void;
 }
 
 function LifecycleRow({
@@ -139,6 +141,7 @@ function LifecycleRow({
   onCheckOrUpdate,
   onUninstall,
   onRedetect,
+  onCancel,
 }: LifecycleRowProps) {
   const { t } = useTranslation();
   return (
@@ -189,6 +192,11 @@ function LifecycleRow({
       </div>
 
       <div className="flex shrink-0 flex-wrap items-center gap-2">
+        {busy && onCancel && (
+          <Button variant="outline" size="sm" onClick={onCancel}>
+            停止
+          </Button>
+        )}
         {installed ? (
           <>
             <Button
@@ -464,6 +472,8 @@ function DesktopLifecycleRow({
   const [action, setAction] = useState<string | null>(null);
   const [uninstallOpen, setUninstallOpen] = useState(false);
   const [uninstallCompletedOpen, setUninstallCompletedOpen] = useState(false);
+  const [lastJob, setLastJob] = useState<DesktopLifecycleJob | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const lastRefreshRequestRef = useRef(refreshRequestId);
 
   const refresh = useCallback(async (includeLatest = false) => {
@@ -487,6 +497,10 @@ function DesktopLifecycleRow({
 
   useEffect(() => {
     if (!desktopCache.has(app)) void refresh(false);
+    void settingsApi
+      .listDesktopLifecycleJobs(app)
+      .then((jobs) => setLastJob(jobs[0] ?? null))
+      .catch(() => undefined);
   }, [app, refresh]);
 
   useEffect(() => {
@@ -496,11 +510,15 @@ function DesktopLifecycleRow({
   }, [refresh, refreshRequestId]);
 
   const runLifecycle = async (nextAction: "install" | "update" | "uninstall") => {
+    const jobId = crypto.randomUUID();
+    setActiveJobId(jobId);
     setAction(nextAction);
     try {
-      const next = await settingsApi.runDesktopAppLifecycleAction(app, nextAction);
+      const next = await settingsApi.runDesktopAppLifecycleAction(app, nextAction, jobId);
       setStatus(next);
       desktopCache.set(app, next);
+      const jobs = await settingsApi.listDesktopLifecycleJobs(app).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       if (nextAction === "uninstall") {
         setUninstallOpen(false);
         setUninstallCompletedOpen(true);
@@ -510,6 +528,8 @@ function DesktopLifecycleRow({
         );
       }
     } catch (error) {
+      const jobs = await settingsApi.listDesktopLifecycleJobs(app).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       const key = nextAction === "install"
         ? "appLifecycle.installFailed"
         : nextAction === "update"
@@ -517,7 +537,17 @@ function DesktopLifecycleRow({
           : "appLifecycle.uninstallFailed";
       toast.error(t(key), { description: extractErrorMessage(error) });
     } finally {
+      setActiveJobId(null);
       setAction(null);
+    }
+  };
+
+  const cancelLifecycle = async () => {
+    if (!activeJobId) return;
+    const accepted = await settingsApi.cancelDesktopLifecycleJob(activeJobId);
+    if (!accepted) {
+      toast.error("当前操作已经结束，正在重新检测状态");
+      await refresh(false);
     }
   };
 
@@ -544,33 +574,43 @@ function DesktopLifecycleRow({
 
   return (
     <>
-      <LifecycleRow
-        title={title}
-        subtitle={t("appLifecycle.desktopDescription")}
-        installed={installed}
-        version={status?.version ?? null}
-        latestVersion={status?.latest_version ?? null}
-        updateChecked={updateChecked}
-        updateAvailable={updateAvailable}
-        installationSource={status?.installation_source}
-        loading={loading}
-        busy={action !== null}
-        action={action}
-        canInstall={status?.can_install ?? false}
-        canUpdate={status?.can_update ?? false}
-        canUninstall={status?.can_uninstall ?? false}
-        canLaunch={status?.can_launch ?? false}
-        disabledReason={status?.reason}
-        launchLabel={t("appLifecycle.launchDesktop")}
-        onInstall={() => void runLifecycle("install")}
-        onAiInstall={onAiInstall}
-        onLaunch={() => void launch()}
-        onCheckOrUpdate={() =>
-          void (updateChecked && updateAvailable ? runLifecycle("update") : refresh(true))
-        }
-        onUninstall={() => setUninstallOpen(true)}
-        onRedetect={() => void refresh(false)}
-      />
+      <div className="space-y-1.5">
+        <LifecycleRow
+          title={title}
+          subtitle={t("appLifecycle.desktopDescription")}
+          installed={installed}
+          version={status?.version ?? null}
+          latestVersion={status?.latest_version ?? null}
+          updateChecked={updateChecked}
+          updateAvailable={updateAvailable}
+          installationSource={status?.installation_source}
+          loading={loading}
+          busy={action !== null}
+          action={action}
+          canInstall={status?.can_install ?? false}
+          canUpdate={status?.can_update ?? false}
+          canUninstall={status?.can_uninstall ?? false}
+          canLaunch={status?.can_launch ?? false}
+          disabledReason={status?.reason}
+          launchLabel={t("appLifecycle.launchDesktop")}
+          onInstall={() => void runLifecycle("install")}
+          onAiInstall={onAiInstall}
+          onLaunch={() => void launch()}
+          onCheckOrUpdate={() =>
+            void (updateChecked && updateAvailable ? runLifecycle("update") : refresh(true))
+          }
+          onUninstall={() => setUninstallOpen(true)}
+          onRedetect={() => void refresh(false)}
+          onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
+        />
+        {lastJob && ["failed", "interrupted"].includes(lastJob.state) && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+            上次{lastJob.action === "install" ? "安装" : lastJob.action === "update" ? "更新" : "卸载"}
+            {lastJob.state === "interrupted" ? "被中断" : "失败"}
+            {lastJob.errorMessage ? `：${lastJob.errorMessage}` : "，请重新检测后重试。"}
+          </div>
+        )}
+      </div>
       <ConfirmDialog
         isOpen={uninstallOpen}
         title={t("appLifecycle.uninstallTitle", { app: title })}

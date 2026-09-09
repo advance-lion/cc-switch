@@ -4,8 +4,19 @@
 //! resolves through this fixed registry, so the renderer can never provide an
 //! executable path, package identifier, download URL, or arbitrary command.
 
+use crate::database::LifecycleJobRecord;
+use crate::store::AppState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tauri::State;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -18,11 +29,13 @@ struct DesktopAppManifest {
     id: &'static str,
     display_name: &'static str,
     windows_package_name: &'static str,
+    windows_display_name: &'static str,
     windows_app_id_suffix: &'static str,
     winget_id: &'static str,
     winget_source: &'static str,
     macos_bundle_path: &'static str,
     macos_app_name: &'static str,
+    macos_cask: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -37,23 +50,27 @@ const CODEX_DESKTOP: DesktopAppManifest = DesktopAppManifest {
     id: "codex-desktop",
     display_name: "Codex Desktop",
     windows_package_name: "OpenAI.Codex",
+    windows_display_name: "Codex",
     windows_app_id_suffix: "App",
     // Official Microsoft Store product id from the OpenAI Codex Windows page.
     winget_id: "9PLM9XGG6VKS",
     winget_source: "msstore",
     macos_bundle_path: "/Applications/Codex.app",
     macos_app_name: "Codex",
+    macos_cask: "codex-app",
 };
 
 const CLAUDE_DESKTOP: DesktopAppManifest = DesktopAppManifest {
     id: "claude-desktop",
     display_name: "Claude Desktop",
     windows_package_name: "Claude",
+    windows_display_name: "Claude",
     windows_app_id_suffix: "Claude",
     winget_id: "Anthropic.Claude",
     winget_source: "winget",
     macos_bundle_path: "/Applications/Claude.app",
     macos_app_name: "Claude",
+    macos_cask: "claude",
 };
 
 fn manifest(app: &str) -> Result<DesktopAppManifest, String> {
@@ -64,7 +81,7 @@ fn manifest(app: &str) -> Result<DesktopAppManifest, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopAppStatus {
     pub id: String,
     pub display_name: String,
@@ -72,6 +89,8 @@ pub struct DesktopAppStatus {
     pub version: Option<String>,
     pub latest_version: Option<String>,
     pub path: Option<String>,
+    #[serde(default)]
+    pub launch_target: Option<String>,
     pub package_identity: Option<String>,
     pub installation_source: String,
     pub can_install: bool,
@@ -83,13 +102,15 @@ pub struct DesktopAppStatus {
 
 #[derive(Debug, Deserialize)]
 struct AppxRecord {
+    kind: String,
     version: String,
-    package_full_name: String,
-    package_family_name: String,
+    package_full_name: Option<String>,
+    package_family_name: Option<String>,
     install_location: String,
+    launch_target: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum DesktopLifecycleAction {
     Install,
     Update,
@@ -105,10 +126,142 @@ impl DesktopLifecycleAction {
             _ => Err(format!("Unsupported desktop lifecycle action: {value}")),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Uninstall => "uninstall",
+        }
+    }
 }
 
-#[cfg(target_os = "windows")]
+#[derive(Default)]
+pub struct DesktopLifecycleOperationState {
+    locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    cancellations: RwLock<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl DesktopLifecycleOperationState {
+    async fn lock(&self, app_id: &str) -> OwnedMutexGuard<()> {
+        let lock = if let Some(lock) = self.locks.read().await.get(app_id).cloned() {
+            lock
+        } else {
+            let mut locks = self.locks.write().await;
+            locks
+                .entry(app_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn register_job(&self, job_id: &str) -> Arc<AtomicBool> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.cancellations
+            .write()
+            .await
+            .insert(job_id.to_string(), cancellation.clone());
+        cancellation
+    }
+
+    async fn finish_job(&self, job_id: &str) {
+        self.cancellations.write().await.remove(job_id);
+    }
+
+    async fn cancel_job(&self, job_id: &str) -> bool {
+        if let Some(cancellation) = self.cancellations.read().await.get(job_id) {
+            cancellation.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopLifecycleJob {
+    pub id: String,
+    pub app_id: String,
+    pub component: String,
+    pub action: String,
+    pub state: String,
+    pub pre_probe: Option<DesktopAppStatus>,
+    pub post_probe: Option<DesktopAppStatus>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn job_record(job: &DesktopLifecycleJob) -> Result<LifecycleJobRecord, String> {
+    Ok(LifecycleJobRecord {
+        id: job.id.clone(),
+        app_id: job.app_id.clone(),
+        component: job.component.clone(),
+        action: job.action.clone(),
+        state: job.state.clone(),
+        plan_json: serde_json::to_string(&serde_json::json!({
+            "appId": job.app_id,
+            "component": job.component,
+            "action": job.action,
+            "source": "registered-manifest",
+        }))
+        .map_err(|error| error.to_string())?,
+        pre_probe_json: job
+            .pre_probe
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        post_probe_json: job
+            .post_probe
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        error_code: job.error_code.clone(),
+        error_message: job.error_message.clone(),
+        created_at: job.created_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+    })
+}
+
+fn job_from_record(record: LifecycleJobRecord) -> Result<DesktopLifecycleJob, String> {
+    Ok(DesktopLifecycleJob {
+        id: record.id,
+        app_id: record.app_id,
+        component: record.component,
+        action: record.action,
+        state: record.state,
+        pre_probe: record
+            .pre_probe_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| format!("Invalid lifecycle pre-probe: {error}"))?,
+        post_probe: record
+            .post_probe_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| format!("Invalid lifecycle post-probe: {error}"))?,
+        error_code: record.error_code,
+        error_message: record.error_message,
+        created_at: record.created_at,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn command_output(command: &mut Command, label: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     let output = command
         .output()
@@ -120,6 +273,57 @@ fn command_output(command: &mut Command, label: &str) -> Result<String, String> 
         return Err(format!(
             "{label} failed with exit code {}{}",
             output.status.code().unwrap_or(-1),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(stdout)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn command_output_cancellable(
+    command: &mut Command,
+    label: &str,
+    cancellation: &AtomicBool,
+) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start {label}: {error}"))?;
+    let status = loop {
+        if cancellation.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("JOB_CANCELLED".to_string());
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("Failed while waiting for {label}: {error}"))?
+        {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let stdout = stdout.trim().to_string();
+    let stderr = stderr.trim().to_string();
+    if !status.success() {
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!(
+            "{label} failed with exit code {}{}",
+            status.code().unwrap_or(-1),
             if detail.is_empty() {
                 String::new()
             } else {
@@ -150,14 +354,37 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
     let script = format!(
         r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $pkg = Get-AppxPackage -Name '{}' | Sort-Object Version -Descending | Select-Object -First 1
-if ($null -eq $pkg) {{ Write-Output 'null'; exit 0 }}
+if ($null -ne $pkg) {{
+  [pscustomobject]@{{
+    kind = 'appx'
+    version = $pkg.Version.ToString()
+    package_full_name = $pkg.PackageFullName
+    package_family_name = $pkg.PackageFamilyName
+    install_location = $pkg.InstallLocation
+    launch_target = $null
+  }} | ConvertTo-Json -Compress
+  exit 0
+}}
+$uninstallRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+$entry = Get-ItemProperty $uninstallRoots -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DisplayName -eq '{}' }} |
+  Sort-Object DisplayVersion -Descending | Select-Object -First 1
+if ($null -eq $entry) {{ Write-Output 'null'; exit 0 }}
+$launch = $entry.DisplayIcon
+if ($launch) {{ $launch = $launch.Trim('"').Split(',')[0] }}
 [pscustomobject]@{{
-  version = $pkg.Version.ToString()
-  package_full_name = $pkg.PackageFullName
-  package_family_name = $pkg.PackageFamilyName
-  install_location = $pkg.InstallLocation
+  kind = 'win32'
+  version = [string]$entry.DisplayVersion
+  package_full_name = $null
+  package_family_name = $null
+  install_location = [string]$entry.InstallLocation
+  launch_target = $launch
 }} | ConvertTo-Json -Compress"#,
-        manifest.windows_package_name
+        manifest.windows_package_name, manifest.windows_display_name
     );
     let output = powershell_output(&script, "desktop application detection")?;
     if output.trim().is_empty() || output.trim() == "null" {
@@ -168,6 +395,7 @@ if ($null -eq $pkg) {{ Write-Output 'null'; exit 0 }}
             version: None,
             latest_version: None,
             path: None,
+            launch_target: None,
             package_identity: None,
             installation_source: "not_installed".to_string(),
             can_install: true,
@@ -180,15 +408,21 @@ if ($null -eq $pkg) {{ Write-Output 'null'; exit 0 }}
 
     let record: AppxRecord = serde_json::from_str(&output)
         .map_err(|error| format!("Invalid desktop package metadata: {error}"))?;
-    if !record.package_full_name.starts_with(manifest.windows_package_name)
-        || !record
+    if record.kind == "appx" {
+        let valid_identity = record
+            .package_full_name
+            .as_deref()
+            .is_some_and(|value| value.starts_with(manifest.windows_package_name));
+        let valid_family = record
             .package_family_name
-            .starts_with(manifest.windows_package_name)
-    {
-        return Err(format!(
-            "Detected package identity does not match {}",
-            manifest.display_name
-        ));
+            .as_deref()
+            .is_some_and(|value| value.starts_with(manifest.windows_package_name));
+        if !valid_identity || !valid_family {
+            return Err(format!(
+                "Detected package identity does not match {}",
+                manifest.display_name
+            ));
+        }
     }
 
     Ok(DesktopAppStatus {
@@ -198,8 +432,11 @@ if ($null -eq $pkg) {{ Write-Output 'null'; exit 0 }}
         version: Some(record.version),
         latest_version: None,
         path: Some(record.install_location),
-        package_identity: Some(record.package_full_name),
-        installation_source: if manifest.id == "codex-desktop" {
+        launch_target: record.launch_target,
+        package_identity: record.package_full_name,
+        installation_source: if record.kind == "win32" {
+            "official_exe".to_string()
+        } else if manifest.id == "codex-desktop" {
             "microsoft_store".to_string()
         } else {
             "official_appx".to_string()
@@ -231,6 +468,12 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
     } else {
         None
     };
+    let homebrew_available = Command::new("brew")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
     Ok(DesktopAppStatus {
         id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
@@ -238,14 +481,20 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         version,
         latest_version: None,
         path: installed.then(|| manifest.macos_bundle_path.to_string()),
+        launch_target: installed.then(|| manifest.macos_bundle_path.to_string()),
         package_identity: None,
-        installation_source: if installed { "application_bundle" } else { "not_installed" }
-            .to_string(),
-        can_install: false,
-        can_update: false,
-        can_uninstall: false,
+        installation_source: if installed {
+            "application_bundle"
+        } else {
+            "not_installed"
+        }
+        .to_string(),
+        can_install: !installed && homebrew_available,
+        can_update: installed && homebrew_available,
+        can_uninstall: installed && homebrew_available,
         can_launch: installed,
-        reason: Some("Automatic desktop installation is currently supported on Windows only.".to_string()),
+        reason: (!homebrew_available)
+            .then(|| "需要 Homebrew 才能自动安装、更新或卸载；仍可启动现有应用".to_string()),
     })
 }
 
@@ -258,13 +507,16 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         version: None,
         latest_version: None,
         path: None,
+        launch_target: None,
         package_identity: None,
         installation_source: "unsupported_platform".to_string(),
         can_install: false,
         can_update: false,
         can_uninstall: false,
         can_launch: false,
-        reason: Some("This desktop application is not supported on the current platform.".to_string()),
+        reason: Some(
+            "This desktop application is not supported on the current platform.".to_string(),
+        ),
     })
 }
 
@@ -283,6 +535,44 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
     latest_parts.resize(length, 0);
     current_parts.resize(length, 0);
     latest_parts > current_parts
+}
+
+fn verification_satisfied(
+    action: DesktopLifecycleAction,
+    before: &DesktopAppStatus,
+    after: &DesktopAppStatus,
+) -> bool {
+    match action {
+        DesktopLifecycleAction::Install => after.installed,
+        DesktopLifecycleAction::Update => {
+            after.installed
+                && (before.version.is_none()
+                    || after.version.as_deref() != before.version.as_deref())
+        }
+        DesktopLifecycleAction::Uninstall => !after.installed,
+    }
+}
+
+fn detect_after_action(
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    before: &DesktopAppStatus,
+) -> Result<DesktopAppStatus, String> {
+    let mut last = detect_desktop_app(manifest)?;
+    if verification_satisfied(action, before, &last) {
+        return Ok(last);
+    }
+    // Store/Appx registration can trail the installer process. Poll briefly
+    // before declaring verification failure, while keeping success tied to a
+    // real post-action probe.
+    for _ in 0..29 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = detect_desktop_app(manifest)?;
+        if verification_satisfied(action, before, &last) {
+            return Ok(last);
+        }
+    }
+    Ok(last)
 }
 
 #[cfg(target_os = "windows")]
@@ -318,12 +608,48 @@ fn latest_winget_version(manifest: DesktopAppManifest) -> Result<String, String>
     ))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn latest_winget_version(manifest: DesktopAppManifest) -> Result<String, String> {
+    let mut command = Command::new("brew");
+    command.args(["info", "--cask", "--json=v2", manifest.macos_cask]);
+    let output = command_output(&mut command, "desktop update lookup")?;
+    let value: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|error| format!("Invalid Homebrew metadata: {error}"))?;
+    value
+        .pointer("/casks/0/version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "Could not determine the latest {} version",
+                manifest.display_name
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn latest_winget_version(manifest: DesktopAppManifest) -> Result<String, String> {
     Err(format!(
         "Automatic {} update checks are currently supported on Windows only",
         manifest.display_name
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_action(
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    let verb = match action {
+        DesktopLifecycleAction::Install => "install",
+        DesktopLifecycleAction::Update => "upgrade",
+        DesktopLifecycleAction::Uninstall => "uninstall",
+    };
+    let mut command = Command::new("brew");
+    command.args([verb, "--cask", manifest.macos_cask]);
+    command_output_cancellable(&mut command, "desktop lifecycle action", cancellation).map(|_| ())
 }
 
 #[cfg(target_os = "windows")]
@@ -358,9 +684,30 @@ fn winget_action_command(
 fn run_winget_action(
     manifest: DesktopAppManifest,
     action: DesktopLifecycleAction,
+    cancellation: &AtomicBool,
 ) -> Result<(), String> {
     let mut command = winget_action_command(manifest, action)?;
-    command_output(&mut command, "desktop lifecycle action").map(|_| ())
+    command_output_cancellable(&mut command, "desktop lifecycle action", cancellation).map(|_| ())
+}
+
+#[cfg(target_os = "windows")]
+fn run_winget_uninstall(
+    manifest: DesktopAppManifest,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    let mut command = Command::new("winget.exe");
+    command.args([
+        "uninstall",
+        "--id",
+        manifest.winget_id,
+        "--exact",
+        "--source",
+        manifest.winget_source,
+        "--silent",
+        "--disable-interactivity",
+    ]);
+    command_output_cancellable(&mut command, "desktop application uninstall", cancellation)
+        .map(|_| ())
 }
 
 pub(crate) fn plan_registered_desktop_install(
@@ -382,20 +729,29 @@ pub(crate) fn plan_registered_desktop_install(
             manifest.display_name
         ));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     return Err(format!(
-        "{} 的 AI 辅助桌面安装当前仅支持 Windows",
+        "{} 的 AI 辅助桌面安装当前不支持此平台",
         manifest.display_name
     ));
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     Ok(RegisteredDesktopAssistantInstall {
         app_id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
         version: "latest".to_string(),
-        official_source: if manifest.id == "codex-desktop" {
-            "https://apps.microsoft.com/detail/9PLM9XGG6VKS".to_string()
-        } else {
-            "https://claude.ai/download".to_string()
+        official_source: {
+            #[cfg(target_os = "windows")]
+            {
+                if manifest.id == "codex-desktop" {
+                    "https://apps.microsoft.com/detail/9PLM9XGG6VKS".to_string()
+                } else {
+                    "https://claude.ai/download".to_string()
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                format!("https://formulae.brew.sh/cask/{}", manifest.macos_cask)
+            }
         },
     })
 }
@@ -416,9 +772,21 @@ pub(crate) fn spawn_registered_desktop_install(
             .spawn()
             .map_err(|error| format!("无法启动 {} 安装器: {error}", manifest.display_name));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("brew");
+        command
+            .args(["install", "--cask", manifest.macos_cask])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        return command
+            .spawn()
+            .map_err(|error| format!("无法启动 {} 安装器: {error}", manifest.display_name));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     Err(format!(
-        "{} 的 AI 辅助桌面安装当前仅支持 Windows",
+        "{} 的 AI 辅助桌面安装当前不支持此平台",
         manifest.display_name
     ))
 }
@@ -440,7 +808,11 @@ pub(crate) fn verify_registered_desktop_install(
 }
 
 #[cfg(target_os = "windows")]
-fn uninstall_appx(manifest: DesktopAppManifest, package_identity: &str) -> Result<(), String> {
+fn uninstall_appx(
+    manifest: DesktopAppManifest,
+    package_identity: &str,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
     let valid_identity = package_identity
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character));
@@ -451,7 +823,18 @@ fn uninstall_appx(manifest: DesktopAppManifest, package_identity: &str) -> Resul
         "$pkg = Get-AppxPackage -Name '{}'; if ($null -eq $pkg) {{ exit 0 }}; $pkg | Where-Object {{ $_.PackageFullName -eq '{}' }} | Remove-AppxPackage -ErrorAction Stop",
         manifest.windows_package_name, package_identity
     );
-    powershell_output(&script, "desktop application uninstall").map(|_| ())
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
+    command_output_cancellable(&mut command, "desktop application uninstall", cancellation)
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -477,81 +860,281 @@ pub async fn check_desktop_app_updates(app: String) -> Result<DesktopAppStatus, 
 
 #[tauri::command]
 pub async fn run_desktop_app_lifecycle_action(
+    state: State<'_, AppState>,
+    operations: State<'_, DesktopLifecycleOperationState>,
     app: String,
     action: String,
+    #[allow(non_snake_case)] jobId: Option<String>,
 ) -> Result<DesktopAppStatus, String> {
     let manifest = manifest(&app)?;
     let action = DesktopLifecycleAction::parse(&action)?;
-    tokio::task::spawn_blocking(move || {
-        let before = detect_desktop_app(manifest)?;
-        match action {
-            DesktopLifecycleAction::Install => {
-                if before.installed {
-                    return Err(format!("{} is already installed", manifest.display_name));
-                }
-                #[cfg(target_os = "windows")]
-                run_winget_action(manifest, action)?;
-                #[cfg(not(target_os = "windows"))]
-                return Err("Automatic desktop installation is supported on Windows only".to_string());
-            }
-            DesktopLifecycleAction::Update => {
-                if !before.installed {
-                    return Err(format!("{} is not installed", manifest.display_name));
-                }
-                let latest = latest_winget_version(manifest)?;
-                let current = before.version.as_deref().unwrap_or_default();
-                if !version_is_newer(&latest, current) {
-                    let mut current_status = before;
-                    current_status.latest_version = Some(latest);
-                    return Ok(current_status);
-                }
-                #[cfg(target_os = "windows")]
-                run_winget_action(manifest, action)?;
-                #[cfg(not(target_os = "windows"))]
-                return Err("Automatic desktop updates are supported on Windows only".to_string());
-            }
-            DesktopLifecycleAction::Uninstall => {
-                if !before.installed {
-                    return Ok(before);
-                }
-                #[cfg(target_os = "windows")]
-                uninstall_appx(
-                    manifest,
-                    before
-                        .package_identity
-                        .as_deref()
-                        .ok_or_else(|| "Desktop package identity is unavailable".to_string())?,
-                )?;
-                #[cfg(not(target_os = "windows"))]
-                return Err("Automatic desktop uninstall is supported on Windows only".to_string());
-            }
+    let _guard = operations.lock(&app).await;
+    let db = state.db.clone();
+    let job_id = jobId.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(existing) = state
+        .db
+        .get_lifecycle_job(&job_id)
+        .map_err(|error| error.to_string())?
+    {
+        let existing = job_from_record(existing)?;
+        if let Some(status) = existing.post_probe {
+            return Ok(status);
         }
-
-        let after = detect_desktop_app(manifest)?;
-        match action {
-            DesktopLifecycleAction::Install if !after.installed => Err(format!(
-                "{} installer completed but the application was not detected",
-                manifest.display_name
-            )),
-            DesktopLifecycleAction::Update
-                if !after.installed
-                    || before.version.is_some()
-                        && after.version.as_deref() == before.version.as_deref() =>
-            {
-                Err(format!(
-                    "{} update completed but the installed version did not change",
-                    manifest.display_name
-                ))
-            }
-            DesktopLifecycleAction::Uninstall if after.installed => Err(format!(
-                "{} uninstall completed but the package is still installed",
-                manifest.display_name
-            )),
-            _ => Ok(after),
-        }
+        return Err(existing
+            .error_message
+            .unwrap_or_else(|| "相同请求仍在处理中，请稍后重试".to_string()));
+    }
+    let cancellation = operations.register_job(&job_id).await;
+    let result = tokio::task::spawn_blocking({
+        let job_id = job_id.clone();
+        move || run_lifecycle_job(db, job_id, manifest, action, cancellation)
     })
     .await
-    .map_err(|error| format!("Desktop lifecycle task failed: {error}"))?
+    .map_err(|error| format!("Desktop lifecycle task failed: {error}"))?;
+    operations.finish_job(&job_id).await;
+    result
+}
+
+fn save_job(db: &crate::database::Database, job: &DesktopLifecycleJob) -> Result<(), String> {
+    db.save_lifecycle_job(&job_record(job)?)
+        .map_err(|error| error.to_string())
+}
+
+fn fail_job(
+    db: &crate::database::Database,
+    job: &mut DesktopLifecycleJob,
+    code: &str,
+    message: String,
+) -> String {
+    job.state = "failed".to_string();
+    job.error_code = Some(code.to_string());
+    job.error_message = Some(message.clone());
+    job.completed_at = Some(now());
+    if let Err(error) = save_job(db, job) {
+        return format!("{message} (and failed to persist job: {error})");
+    }
+    message
+}
+
+fn run_lifecycle_job(
+    db: Arc<crate::database::Database>,
+    job_id: String,
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    cancellation: Arc<AtomicBool>,
+) -> Result<DesktopAppStatus, String> {
+    let created_at = now();
+    let mut job = DesktopLifecycleJob {
+        id: job_id,
+        app_id: manifest.id.to_string(),
+        component: "desktop".to_string(),
+        action: action.as_str().to_string(),
+        state: "queued".to_string(),
+        pre_probe: None,
+        post_probe: None,
+        error_code: None,
+        error_message: None,
+        created_at,
+        started_at: None,
+        completed_at: None,
+    };
+    save_job(&db, &job)?;
+    job.state = "running".to_string();
+    job.started_at = Some(now());
+    save_job(&db, &job)?;
+
+    let before = match detect_desktop_app(manifest) {
+        Ok(status) => status,
+        Err(error) => return Err(fail_job(&db, &mut job, "APP_PROBE_FAILED", error)),
+    };
+    job.pre_probe = Some(before.clone());
+    if let Err(error) = save_job(&db, &job) {
+        return Err(fail_job(&db, &mut job, "JOB_PERSIST_FAILED", error));
+    }
+
+    let execute_result = match action {
+        DesktopLifecycleAction::Install => {
+            if before.installed {
+                Err(format!("{} is already installed", manifest.display_name))
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    run_winget_action(manifest, action, &cancellation)
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    run_macos_action(manifest, action, &cancellation)
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    Err(
+                        "Automatic desktop installation is not supported on this platform"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        DesktopLifecycleAction::Update => {
+            if !before.installed {
+                Err(format!("{} is not installed", manifest.display_name))
+            } else {
+                match latest_winget_version(manifest) {
+                    Ok(latest) => {
+                        let current = before.version.as_deref().unwrap_or_default();
+                        if !version_is_newer(&latest, current) {
+                            let mut current_status = before.clone();
+                            current_status.latest_version = Some(latest);
+                            job.post_probe = Some(current_status.clone());
+                            job.state = "succeeded".to_string();
+                            job.completed_at = Some(now());
+                            save_job(&db, &job)?;
+                            return Ok(current_status);
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            run_winget_action(manifest, action, &cancellation)
+                        }
+                        #[cfg(target_os = "macos")]
+                        {
+                            run_macos_action(manifest, action, &cancellation)
+                        }
+                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                        {
+                            Err(
+                                "Automatic desktop updates are not supported on this platform"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        DesktopLifecycleAction::Uninstall => {
+            if !before.installed {
+                job.post_probe = Some(before.clone());
+                job.state = "succeeded".to_string();
+                job.completed_at = Some(now());
+                save_job(&db, &job)?;
+                return Ok(before);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(identity) = before.package_identity.as_deref() {
+                    uninstall_appx(manifest, identity, &cancellation)
+                } else {
+                    run_winget_uninstall(manifest, &cancellation)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                run_macos_action(manifest, action, &cancellation)
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                Err("Automatic desktop uninstall is not supported on this platform".to_string())
+            }
+        }
+    };
+    if let Err(error) = execute_result {
+        let code = if error == "JOB_CANCELLED" {
+            "JOB_CANCELLED"
+        } else {
+            "LIFECYCLE_EXECUTION_FAILED"
+        };
+        if code == "JOB_CANCELLED" {
+            job.state = "cancelled".to_string();
+            job.error_code = Some(code.to_string());
+            job.error_message = Some("操作已停止".to_string());
+            job.completed_at = Some(now());
+            save_job(&db, &job)?;
+            return Err("操作已停止".to_string());
+        }
+        return Err(fail_job(&db, &mut job, code, error));
+    }
+
+    job.state = "verifying".to_string();
+    save_job(&db, &job)?;
+    let after = match detect_after_action(manifest, action, &before) {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(fail_job(
+                &db,
+                &mut job,
+                "POST_INSTALL_VERIFICATION_FAILED",
+                error,
+            ))
+        }
+    };
+    job.post_probe = Some(after.clone());
+    let verification_error = match action {
+        DesktopLifecycleAction::Install if !after.installed => Some(format!(
+            "{} installer completed but the application was not detected",
+            manifest.display_name
+        )),
+        DesktopLifecycleAction::Update
+            if !after.installed
+                || before.version.is_some()
+                    && after.version.as_deref() == before.version.as_deref() =>
+        {
+            Some(format!(
+                "{} update completed but the installed version did not change",
+                manifest.display_name
+            ))
+        }
+        DesktopLifecycleAction::Uninstall if after.installed => Some(format!(
+            "{} uninstall completed but the package is still installed",
+            manifest.display_name
+        )),
+        _ => None,
+    };
+    if let Some(error) = verification_error {
+        return Err(fail_job(
+            &db,
+            &mut job,
+            "POST_INSTALL_VERIFICATION_FAILED",
+            error,
+        ));
+    }
+    job.state = "succeeded".to_string();
+    job.completed_at = Some(now());
+    save_job(&db, &job)?;
+    Ok(after)
+}
+
+#[tauri::command]
+pub async fn cancel_desktop_lifecycle_job(
+    operations: State<'_, DesktopLifecycleOperationState>,
+    #[allow(non_snake_case)] jobId: String,
+) -> Result<bool, String> {
+    Ok(operations.cancel_job(&jobId).await)
+}
+
+#[tauri::command]
+pub async fn get_desktop_lifecycle_job(
+    state: State<'_, AppState>,
+    #[allow(non_snake_case)] jobId: String,
+) -> Result<Option<DesktopLifecycleJob>, String> {
+    state
+        .db
+        .get_lifecycle_job(&jobId)
+        .map_err(|error| error.to_string())?
+        .map(job_from_record)
+        .transpose()
+}
+
+#[tauri::command]
+pub async fn list_desktop_lifecycle_jobs(
+    state: State<'_, AppState>,
+    app: Option<String>,
+) -> Result<Vec<DesktopLifecycleJob>, String> {
+    state
+        .db
+        .list_lifecycle_jobs(app.as_deref(), 20)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(job_from_record)
+        .collect()
 }
 
 #[tauri::command]
@@ -565,32 +1148,33 @@ pub async fn launch_desktop_app(app: String) -> Result<(), String> {
 
         #[cfg(target_os = "windows")]
         {
-            let package_identity = status
-                .package_identity
-                .as_deref()
-                .ok_or_else(|| "Desktop package identity is unavailable".to_string())?;
-            let family_name = package_identity
-                .split('_')
-                .next()
-                .and_then(|_| {
+            if status.package_identity.is_some() {
+                let family_name = {
                     let script = format!(
                         "(Get-AppxPackage -Name '{}').PackageFamilyName",
                         manifest.windows_package_name
                     );
                     powershell_output(&script, "desktop package family lookup").ok()
-                })
+                }
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| "Desktop package family name is unavailable".to_string())?;
-            let app_user_model_id = format!(
-                "{}!{}",
-                family_name.trim(),
-                manifest.windows_app_id_suffix
-            );
-            let mut command = Command::new("explorer.exe");
-            command.arg(format!("shell:AppsFolder\\{app_user_model_id}"));
-            command
-                .spawn()
-                .map_err(|error| format!("Failed to launch {}: {error}", manifest.display_name))?;
+                let app_user_model_id =
+                    format!("{}!{}", family_name.trim(), manifest.windows_app_id_suffix);
+                let mut command = Command::new("explorer.exe");
+                command.arg(format!("shell:AppsFolder\\{app_user_model_id}"));
+                command.spawn().map_err(|error| {
+                    format!("Failed to launch {}: {error}", manifest.display_name)
+                })?;
+            } else {
+                let target = status
+                    .launch_target
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| "Desktop executable is unavailable".to_string())?;
+                Command::new(target).spawn().map_err(|error| {
+                    format!("Failed to launch {}: {error}", manifest.display_name)
+                })?;
+            }
             return Ok(());
         }
 

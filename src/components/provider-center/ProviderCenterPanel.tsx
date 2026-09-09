@@ -160,6 +160,8 @@ export function ProviderCenterPanel() {
   const [formOpen, setFormOpen] = useState(false);
   const [form, setForm] = useState<ProviderFormState>(() => emptyForm(["codex"]));
   const [importsOpen, setImportsOpen] = useState(false);
+  const [importSessionId, setImportSessionId] = useState<string | null>(null);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
   const [candidates, setCandidates] = useState<ImportCandidate[]>([]);
   const [importApps, setImportApps] = useState<Record<string, string[]>>({});
   const [preview, setPreview] = useState<ProviderApplyPreview | null>(null);
@@ -239,7 +241,7 @@ export function ProviderCenterPanel() {
       toast.error("请填写名称和请求地址");
       return;
     }
-    if (form.credentialAction === "replace" && !form.apiKey.trim()) {
+    if (form.protocol !== "ollama" && form.credentialAction === "replace" && !form.apiKey.trim()) {
       toast.error("请输入新的 API Key");
       return;
     }
@@ -252,8 +254,8 @@ export function ProviderCenterPanel() {
       models: uniqueModels(form.models),
       notes: form.notes,
       enabled: form.enabled,
-      credentialAction: form.credentialAction,
-      apiKey: form.credentialAction === "replace" ? form.apiKey : undefined,
+      credentialAction: form.protocol === "ollama" ? "clear" : form.credentialAction,
+      apiKey: form.protocol !== "ollama" && form.credentialAction === "replace" ? form.apiKey : undefined,
       appTypes: form.appTypes,
     };
     setBusy(true);
@@ -272,9 +274,11 @@ export function ProviderCenterPanel() {
   const openImports = async () => {
     setBusy(true);
     try {
-      const next = await providerCenterApi.scanImports();
-      setCandidates(next);
-      setImportApps(Object.fromEntries(next.map((candidate) => [candidate.sourceRef, availableApps[0] ? [availableApps[0].id] : []])));
+      const session = await providerCenterApi.startImportSession();
+      setImportSessionId(session.id);
+      setImportErrors(session.errors);
+      setCandidates(session.candidates);
+      setImportApps(Object.fromEntries(session.candidates.map((candidate) => [candidate.sourceRef, availableApps[0] ? [availableApps[0].id] : []])));
       setImportsOpen(true);
     } catch (error) {
       toast.error(`扫描本机配置失败：${String(error)}`);
@@ -286,7 +290,17 @@ export function ProviderCenterPanel() {
   const importCandidate = async (candidate: ImportCandidate) => {
     setBusy(true);
     try {
-      await providerCenterApi.importCandidate(candidate.sourceRef, importApps[candidate.sourceRef] ?? []);
+      if (importSessionId && candidate.id) {
+        await providerCenterApi.commitImportCandidate(
+          importSessionId,
+          candidate.id,
+          importApps[candidate.sourceRef] ?? [],
+        );
+        const session = await providerCenterApi.getImportSession(importSessionId);
+        setCandidates(session.candidates);
+      } else {
+        await providerCenterApi.importCandidate(candidate.sourceRef, importApps[candidate.sourceRef] ?? []);
+      }
       await load();
       toast.success(`已复制“${candidate.name}”，来源配置没有被修改`);
     } catch (error) {
@@ -531,7 +545,7 @@ export function ProviderCenterPanel() {
 
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button size="sm" onClick={() => void prepareApply(definition)} disabled={busy || !definition.enabled}><Link2 className="mr-2 h-4 w-4" />预览并应用</Button>
-                  <Button size="sm" variant="outline" onClick={() => void discoverModels(definition)} disabled={busy || !definition.credentialConfigured}><RefreshCw className="mr-2 h-4 w-4" />获取模型</Button>
+                  <Button size="sm" variant="outline" onClick={() => void discoverModels(definition)} disabled={busy || (definition.protocol !== "ollama" && !definition.credentialConfigured)}><RefreshCw className="mr-2 h-4 w-4" />获取模型</Button>
                   <Button size="sm" variant="ghost" onClick={() => openEdit(definition)}><Pencil className="mr-2 h-4 w-4" />编辑</Button>
                   <Button size="sm" variant="ghost" onClick={() => void duplicate(definition)}><Copy className="mr-2 h-4 w-4" />复制</Button>
                   <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setDeleteTarget(definition)}><Trash2 className="mr-2 h-4 w-4" />删除</Button>
@@ -557,10 +571,13 @@ export function ProviderCenterPanel() {
             <div className="space-y-2"><Label htmlFor="provider-url">请求地址</Label><Input id="provider-url" value={form.baseUrl} onChange={(event) => setForm((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://api.example.com/v1" /></div>
             <div className="space-y-2">
               <Label>API Key</Label>
+              {form.protocol === "ollama" && <p className="text-xs text-muted-foreground">本机 Ollama 默认不需要 API Key。</p>}
+              {form.protocol !== "ollama" && <>
               {form.id && <div className="flex flex-wrap gap-2"><Button type="button" size="sm" variant={form.credentialAction === "keep" ? "default" : "outline"} onClick={() => setForm((current) => ({ ...current, credentialAction: "keep", apiKey: "" }))}>保留现有密钥</Button><Button type="button" size="sm" variant={form.credentialAction === "replace" ? "default" : "outline"} onClick={() => setForm((current) => ({ ...current, credentialAction: "replace" }))}>替换密钥</Button><Button type="button" size="sm" variant={form.credentialAction === "clear" ? "destructive" : "outline"} onClick={() => setForm((current) => ({ ...current, credentialAction: "clear", apiKey: "" }))}>清除密钥</Button></div>}
               {form.credentialAction === "replace" && <Input type="password" autoComplete="new-password" value={form.apiKey} onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))} placeholder="密钥只会写入系统安全存储" />}
               {form.credentialAction === "keep" && <p className="text-xs text-muted-foreground">现有密钥保持不变，前端无法读取其明文。</p>}
               {form.credentialAction === "clear" && <p className="text-xs text-destructive">保存后将从安全存储删除该服务的密钥。</p>}
+              </>}
             </div>
             <div className="space-y-2"><div className="flex items-center justify-between"><Label htmlFor="provider-models">模型 ID</Label><span className="text-xs text-muted-foreground">每行一个，也可用逗号分隔</span></div><Textarea id="provider-models" value={form.models} onChange={(event) => setForm((current) => ({ ...current, models: event.target.value }))} placeholder={'gpt-5\ngpt-5-mini'} rows={4} /></div>
             <div className="space-y-2"><Label htmlFor="provider-notes">备注</Label><Textarea id="provider-notes" value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="例如：仅用于开发环境" rows={2} /></div>
@@ -575,6 +592,7 @@ export function ProviderCenterPanel() {
         <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
           <DialogHeader><DialogTitle>导入本机模型服务</DialogTitle><DialogDescription>导入只复制，不修改来源应用。共发现 {candidates.length} 项配置，其中 {importSummary} 项包含可安全迁移的密钥。</DialogDescription></DialogHeader>
           <div className="space-y-3 py-2">
+            {importErrors.length > 0 && <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">部分应用配置无法读取：{importErrors.join("；")}</div>}
             {candidates.length === 0 ? <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">没有找到可导入的配置。你仍可手动添加模型服务。</div> : candidates.map((candidate) => (
               <section key={candidate.sourceRef} className="rounded-xl border border-border/70 p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

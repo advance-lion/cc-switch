@@ -5,6 +5,7 @@
 //! 应用级 Provider。这样原有的单应用自定义仍然是唯一的最终写入路径。
 
 use crate::app_config::AppType;
+use crate::database::{ProviderImportCandidateRecord, ProviderImportSessionRecord};
 use crate::error::AppError;
 use crate::provider::{
     ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, Provider, UniversalProvider,
@@ -26,6 +27,7 @@ const BINDINGS_KEY: &str = "provider_center_bindings_v1";
 const SECRETS_KEY: &str = "provider_center_dpapi_secrets_v1";
 const TRANSACTIONS_KEY: &str = "provider_center_transactions_v1";
 const SNAPSHOTS_KEY: &str = "provider_center_transaction_snapshots_v1";
+const SQLITE_MIGRATED_KEY: &str = "provider_center_sqlite_migrated_v1";
 
 fn default_true() -> bool {
     true
@@ -131,6 +133,10 @@ pub struct SaveProviderDefinitionInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportCandidate {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
     pub source_ref: String,
     pub source_app: String,
     pub name: String,
@@ -141,6 +147,18 @@ pub struct ImportCandidate {
     pub credential_configured: bool,
     /// 只显示安全尾码，帮助区分条目；绝不返回密钥。
     pub credential_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportSession {
+    pub id: String,
+    pub state: String,
+    pub candidates: Vec<ImportCandidate>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +199,7 @@ pub struct ProviderApplyPreviewTarget {
     pub compatible: bool,
     pub drifted: bool,
     pub current_provider_id: Option<String>,
+    pub live_fingerprint: Option<String>,
     pub message: Option<String>,
 }
 
@@ -251,14 +270,70 @@ type Bindings = Vec<ProviderBinding>;
 type EncryptedSecrets = HashMap<String, String>;
 type EncryptedSnapshots = HashMap<String, String>;
 
+fn ensure_sqlite_migrated(state: &AppState) -> Result<(), AppError> {
+    if state.db.get_bool_flag(SQLITE_MIGRATED_KEY)? {
+        return Ok(());
+    }
+
+    // Only seed an empty v19 store. This makes the migration idempotent even
+    // if the process exits after committing SQLite but before writing the
+    // marker. The legacy settings remain as a read-only rollback artifact.
+    if !state.db.provider_center_has_definitions()? {
+        let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+        let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+        state
+            .db
+            .save_provider_center_core(&definitions, &bindings)?;
+        let transactions: Vec<ProviderApplyTransaction> = read_json(state, TRANSACTIONS_KEY)?;
+        for transaction in &transactions {
+            state.db.upsert_provider_center_transaction(transaction)?;
+        }
+    }
+    state.db.set_setting(SQLITE_MIGRATED_KEY, "true")
+}
+
+fn load_definitions(state: &AppState) -> Result<Definitions, AppError> {
+    ensure_sqlite_migrated(state)?;
+    let mut definitions = state.db.load_provider_center_definitions()?;
+    for definition in &mut definitions {
+        let (configured, hint) = secret_metadata(state, &definition.id)?;
+        definition.credential_configured = configured;
+        definition.credential_hint = hint;
+    }
+    Ok(definitions)
+}
+
+fn load_bindings(state: &AppState) -> Result<Bindings, AppError> {
+    ensure_sqlite_migrated(state)?;
+    state.db.load_provider_center_bindings()
+}
+
+fn save_core(
+    state: &AppState,
+    definitions: &[ProviderDefinition],
+    bindings: &[ProviderBinding],
+) -> Result<(), AppError> {
+    state.db.save_provider_center_core(definitions, bindings)
+}
+
+fn load_transactions(state: &AppState) -> Result<Vec<ProviderApplyTransaction>, AppError> {
+    ensure_sqlite_migrated(state)?;
+    state.db.load_provider_center_transactions()
+}
+
 /// Serializes Provider Center writes that touch the same application.
 /// Multi-app operations acquire locks in sorted order to avoid deadlocks.
 #[derive(Default)]
 pub struct ProviderCenterOperationState {
+    data_lock: Arc<Mutex<()>>,
     locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ProviderCenterOperationState {
+    pub async fn lock_data(&self) -> OwnedMutexGuard<()> {
+        self.data_lock.clone().lock_owned().await
+    }
+
     async fn lock_for(&self, app_type: &str) -> Arc<Mutex<()>> {
         if let Some(lock) = self.locks.read().await.get(app_type).cloned() {
             return lock;
@@ -378,31 +453,21 @@ fn unprotect_secret(blob: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::Message("已保存的 API Key 不是有效文本".to_string()))
 }
 
-#[cfg(not(target_os = "windows"))]
-fn protect_secret(_: &str) -> Result<String, AppError> {
-    Err(AppError::Message(
-        "当前平台尚未接入系统安全存储".to_string(),
-    ))
-}
-#[cfg(not(target_os = "windows"))]
-fn unprotect_secret(_: &str) -> Result<String, AppError> {
-    Err(AppError::Message(
-        "当前平台尚未接入系统安全存储".to_string(),
-    ))
-}
-
+#[cfg(target_os = "windows")]
 fn save_secret(state: &AppState, id: &str, secret: &str) -> Result<(), AppError> {
     let mut secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
     secrets.insert(id.to_string(), protect_secret(secret)?);
     write_json(state, SECRETS_KEY, &secrets)
 }
 
+#[cfg(target_os = "windows")]
 fn remove_secret(state: &AppState, id: &str) -> Result<(), AppError> {
     let mut secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
     secrets.remove(id);
     write_json(state, SECRETS_KEY, &secrets)
 }
 
+#[cfg(target_os = "windows")]
 fn secret_metadata(state: &AppState, id: &str) -> Result<(bool, Option<String>), AppError> {
     let secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
     let Some(blob) = secrets.get(id) else {
@@ -412,12 +477,54 @@ fn secret_metadata(state: &AppState, id: &str) -> Result<(bool, Option<String>),
     Ok((true, secret_hint(&secret)))
 }
 
+#[cfg(target_os = "windows")]
 fn get_secret(state: &AppState, id: &str) -> Result<String, AppError> {
     let secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
     let blob = secrets
         .get(id)
         .ok_or_else(|| AppError::Message("该模型服务没有可用的 API Key".to_string()))?;
     unprotect_secret(blob)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secure_entry(id: &str) -> Result<keyring::Entry, AppError> {
+    keyring::Entry::new("com.ccswitch.provider-center", id)
+        .map_err(|error| AppError::Message(format!("无法访问系统安全存储: {error}")))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn save_secret(_: &AppState, id: &str, secret: &str) -> Result<(), AppError> {
+    secure_entry(id)?
+        .set_password(secret)
+        .map_err(|error| AppError::Message(format!("无法写入系统安全存储: {error}")))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remove_secret(_: &AppState, id: &str) -> Result<(), AppError> {
+    match secure_entry(id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(AppError::Message(format!("无法清除系统安全存储: {error}"))),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secret_metadata(_: &AppState, id: &str) -> Result<(bool, Option<String>), AppError> {
+    match secure_entry(id)?.get_password() {
+        Ok(secret) => Ok((true, secret_hint(&secret))),
+        Err(keyring::Error::NoEntry) => Ok((false, None)),
+        Err(error) => Err(AppError::Message(format!("无法读取系统安全存储: {error}"))),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_secret(_: &AppState, id: &str) -> Result<String, AppError> {
+    match secure_entry(id)?.get_password() {
+        Ok(secret) => Ok(secret),
+        Err(keyring::Error::NoEntry) => Err(AppError::Message(
+            "该模型服务没有可用的 API Key".to_string(),
+        )),
+        Err(error) => Err(AppError::Message(format!("无法读取系统安全存储: {error}"))),
+    }
 }
 
 fn refresh_binding_states(
@@ -480,9 +587,7 @@ fn refresh_binding_states(
                 continue;
             }
         };
-        let actual = state
-            .db
-            .get_provider_by_id(&projected.id, app.as_str())?;
+        let actual = state.db.get_provider_by_id(&projected.id, app.as_str())?;
         let actual_fingerprint = actual.as_ref().map(provider_fingerprint).transpose()?;
         if actual_fingerprint.as_ref() != binding.expected_fingerprint.as_ref() {
             binding.status = "drifted".to_string();
@@ -495,15 +600,15 @@ fn refresh_binding_states(
 }
 
 pub fn state(state: &AppState) -> Result<ProviderCenterState, AppError> {
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let definitions = load_definitions(state)?;
+    let mut bindings = load_bindings(state)?;
     if refresh_binding_states(state, &definitions, &mut bindings)? {
-        write_json(state, BINDINGS_KEY, &bindings)?;
+        save_core(state, &definitions, &bindings)?;
     }
     Ok(ProviderCenterState {
         definitions,
         bindings,
-        transactions: read_json(state, TRANSACTIONS_KEY)?,
+        transactions: load_transactions(state)?,
     })
 }
 
@@ -522,8 +627,8 @@ pub fn unified_model_catalog(
         .map(|app| app.as_str().to_string())
         .collect::<HashSet<_>>();
     let includes = |app: &str| requested.is_empty() || requested.contains(app);
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
-    let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let definitions = load_definitions(state)?;
+    let bindings = load_bindings(state)?;
     let mut entries = Vec::new();
 
     for binding in bindings.iter().filter(|binding| {
@@ -555,10 +660,7 @@ pub fn unified_model_catalog(
             Ok(projected) => projected,
             Err(_) => continue,
         };
-        let Some(actual) = state
-            .db
-            .get_provider_by_id(&projected.id, app.as_str())?
-        else {
+        let Some(actual) = state.db.get_provider_by_id(&projected.id, app.as_str())? else {
             continue;
         };
         let actual_fingerprint = provider_fingerprint(&actual)?;
@@ -573,7 +675,10 @@ pub fn unified_model_catalog(
         models.dedup();
         for (index, model_id) in models.into_iter().enumerate() {
             entries.push(UnifiedModelCatalogEntry {
-                id: format!("api-key:{}:{}:{}", binding.app_type, definition.id, model_id),
+                id: format!(
+                    "api-key:{}:{}:{}",
+                    binding.app_type, definition.id, model_id
+                ),
                 app_type: binding.app_type.clone(),
                 provider_id: definition.id.clone(),
                 provider_name: definition.name.clone(),
@@ -592,8 +697,7 @@ pub fn unified_model_catalog(
             Err(_) => continue,
         };
         for provider in providers.values().filter(|provider| {
-            provider.category.as_deref() == Some("official")
-                || provider.uses_managed_account_auth()
+            provider.category.as_deref() == Some("official") || provider.uses_managed_account_auth()
         }) {
             let models = models_from_settings(&provider.settings_config);
             for model_id in models {
@@ -612,12 +716,18 @@ pub fn unified_model_catalog(
     }
 
     entries.sort_by(|left, right| {
-        (&left.app_type, &left.source_type, &left.provider_name, &left.model_id).cmp(&(
-            &right.app_type,
-            &right.source_type,
-            &right.provider_name,
-            &right.model_id,
-        ))
+        (
+            &left.app_type,
+            &left.source_type,
+            &left.provider_name,
+            &left.model_id,
+        )
+            .cmp(&(
+                &right.app_type,
+                &right.source_type,
+                &right.provider_name,
+                &right.model_id,
+            ))
     });
     entries.dedup_by(|left, right| left.id == right.id);
     Ok(UnifiedModelCatalog {
@@ -632,7 +742,7 @@ pub fn unified_model_catalog(
 /// an actionable, durable warning instead of displaying a stale in-progress
 /// state forever.
 pub fn reconcile_interrupted_transactions(state: &AppState) -> Result<usize, AppError> {
-    let mut transactions: Vec<ProviderApplyTransaction> = read_json(state, TRANSACTIONS_KEY)?;
+    let mut transactions = load_transactions(state)?;
     let mut changed = 0;
     for transaction in &mut transactions {
         if matches!(transaction.status.as_str(), "running" | "restoring") {
@@ -642,7 +752,9 @@ pub fn reconcile_interrupted_transactions(state: &AppState) -> Result<usize, App
         }
     }
     if changed > 0 {
-        write_json(state, TRANSACTIONS_KEY, &transactions)?;
+        for transaction in &transactions {
+            state.db.upsert_provider_center_transaction(transaction)?;
+        }
     }
     Ok(changed)
 }
@@ -656,10 +768,13 @@ pub fn save_definition(
             "请填写模型服务名称和请求地址".to_string(),
         ));
     }
-    let mut definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let mut definitions = load_definitions(state)?;
+    let mut bindings = load_bindings(state)?;
     let timestamp = now();
-    let id = input.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let id = input
+        .id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let existing = definitions.iter().find(|item| item.id == id).cloned();
     if let (Some(expected), Some(current)) = (input.expected_revision, existing.as_ref()) {
         if expected != current.revision {
@@ -670,7 +785,11 @@ pub fn save_definition(
         }
     }
     let credential_action = input.credential_action.as_deref().unwrap_or_else(|| {
-        if input.api_key.as_ref().is_some_and(|key| !key.trim().is_empty()) {
+        if input
+            .api_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+        {
             "replace"
         } else {
             "keep"
@@ -780,8 +899,7 @@ pub fn save_definition(
             });
         }
     }
-    write_json(state, DEFINITIONS_KEY, &definitions)?;
-    write_json(state, BINDINGS_KEY, &bindings)?;
+    save_core(state, &definitions, &bindings)?;
     Ok(definition)
 }
 
@@ -825,6 +943,8 @@ fn candidate_from_provider(
         return None;
     }
     Some(ImportCandidate {
+        id: String::new(),
+        session_id: String::new(),
         source_ref,
         source_app: app.as_str().to_string(),
         name: provider.name.clone(),
@@ -868,6 +988,201 @@ pub fn scan_imports(state: &AppState) -> Result<Vec<ImportCandidate>, AppError> 
     candidates.sort_by(|left, right| left.source_ref.cmp(&right.source_ref));
     candidates.dedup_by(|left, right| left.source_ref == right.source_ref);
     Ok(candidates)
+}
+
+fn import_candidate_fingerprint(provider: &Provider) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(provider)
+        .map_err(|error| AppError::Message(format!("无法校验来源配置: {error}")))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn cleanup_expired_import_sessions(state: &AppState) -> Result<(), AppError> {
+    for secret_ref in state.db.expire_provider_import_sessions(now())? {
+        remove_secret(state, &secret_ref)?;
+    }
+    Ok(())
+}
+
+pub fn start_import_session(
+    state: &AppState,
+    requested_apps: Vec<String>,
+) -> Result<ProviderImportSession, AppError> {
+    cleanup_expired_import_sessions(state)?;
+    let requested = requested_apps
+        .into_iter()
+        .filter(|app| AppType::from_str(app).is_ok())
+        .collect::<Vec<_>>();
+    let session_id = Uuid::new_v4().to_string();
+    let created_at = now();
+    let expires_at = created_at + 30 * 60 * 1_000;
+    let mut errors = Vec::new();
+    let mut candidates = Vec::new();
+    let mut records = Vec::new();
+
+    for mut candidate in scan_imports(state)? {
+        if !requested.is_empty() && !requested.contains(&candidate.source_app) {
+            continue;
+        }
+        let candidate_id = Uuid::new_v4().to_string();
+        let source = match source_provider(state, &candidate.source_ref) {
+            Ok((_, provider)) => provider,
+            Err(error) => {
+                errors.push(format!("{}: {error}", candidate.source_app));
+                continue;
+            }
+        };
+        let fingerprint = import_candidate_fingerprint(&source)?;
+        let (_, api_key) =
+            source.resolve_usage_credentials(&AppType::from_str(&candidate.source_app)?);
+        let temporary_secret_ref = if api_key.trim().is_empty() {
+            None
+        } else {
+            let reference = format!("import:{session_id}:{candidate_id}");
+            save_secret(state, &reference, api_key.trim())?;
+            Some(reference)
+        };
+        candidate.id = candidate_id.clone();
+        candidate.session_id = session_id.clone();
+        records.push(ProviderImportCandidateRecord {
+            id: candidate_id,
+            session_id: session_id.clone(),
+            source_app_type: candidate.source_app.clone(),
+            source_provider_id: Some(candidate.source_ref.clone()),
+            source_locator: Some(candidate.source_ref.clone()),
+            normalized_json: serde_json::to_string(&candidate)
+                .map_err(|error| AppError::Database(error.to_string()))?,
+            models_json: serde_json::to_string(&candidate.models)
+                .map_err(|error| AppError::Database(error.to_string()))?,
+            temporary_secret_ref,
+            credential_configured: candidate.credential_configured,
+            fingerprint,
+            conflict_json: None,
+        });
+        candidates.push(candidate);
+    }
+
+    let state_name = if errors.is_empty() {
+        "ready"
+    } else {
+        "readyWithErrors"
+    };
+    state.db.save_provider_import_session(
+        &ProviderImportSessionRecord {
+            id: session_id.clone(),
+            state: state_name.to_string(),
+            requested_apps_json: serde_json::to_string(&requested)
+                .map_err(|error| AppError::Database(error.to_string()))?,
+            error_summary_json: serde_json::to_string(&errors)
+                .map_err(|error| AppError::Database(error.to_string()))?,
+            created_at,
+            expires_at,
+            completed_at: None,
+        },
+        &records,
+    )?;
+    Ok(ProviderImportSession {
+        id: session_id,
+        state: state_name.to_string(),
+        candidates,
+        errors,
+        created_at,
+        expires_at,
+    })
+}
+
+pub fn get_import_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<ProviderImportSession, AppError> {
+    cleanup_expired_import_sessions(state)?;
+    let session = state
+        .db
+        .get_provider_import_session(session_id)?
+        .ok_or_else(|| AppError::Message("导入会话不存在".to_string()))?;
+    if session.expires_at <= now() || session.state == "expired" {
+        return Err(AppError::Message("导入会话已过期，请重新扫描".to_string()));
+    }
+    let candidates = state
+        .db
+        .list_provider_import_candidates(session_id)?
+        .into_iter()
+        .map(|record| {
+            serde_json::from_str::<ImportCandidate>(&record.normalized_json)
+                .map_err(|error| AppError::Database(format!("导入候选已损坏: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProviderImportSession {
+        id: session.id,
+        state: session.state,
+        candidates,
+        errors: serde_json::from_str(&session.error_summary_json)
+            .map_err(|error| AppError::Database(format!("导入错误摘要已损坏: {error}")))?,
+        created_at: session.created_at,
+        expires_at: session.expires_at,
+    })
+}
+
+pub fn commit_import_session_candidate(
+    state: &AppState,
+    session_id: &str,
+    candidate_id: &str,
+    app_types: Vec<String>,
+) -> Result<ProviderDefinition, AppError> {
+    let session = state
+        .db
+        .get_provider_import_session(session_id)?
+        .ok_or_else(|| AppError::Message("导入会话不存在".to_string()))?;
+    if session.expires_at <= now() || session.state == "expired" {
+        cleanup_expired_import_sessions(state)?;
+        return Err(AppError::Message("导入会话已过期，请重新扫描".to_string()));
+    }
+    let record = state
+        .db
+        .list_provider_import_candidates(session_id)?
+        .into_iter()
+        .find(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| AppError::Message("导入候选不存在或已经处理".to_string()))?;
+    let candidate: ImportCandidate = serde_json::from_str(&record.normalized_json)
+        .map_err(|error| AppError::Database(format!("导入候选已损坏: {error}")))?;
+    let (_, current_source) = source_provider(state, &candidate.source_ref)?;
+    if import_candidate_fingerprint(&current_source)? != record.fingerprint {
+        return Err(AppError::Message(
+            "来源配置在扫描后发生变化，请重新扫描再导入".to_string(),
+        ));
+    }
+    let api_key = record
+        .temporary_secret_ref
+        .as_deref()
+        .map(|reference| get_secret(state, reference))
+        .transpose()?;
+    let result = save_definition(
+        state,
+        SaveProviderDefinitionInput {
+            id: None,
+            name: candidate.name,
+            protocol: candidate.protocol,
+            base_url: candidate.base_url,
+            models: candidate.models,
+            notes: String::new(),
+            enabled: Some(true),
+            expected_revision: None,
+            credential_action: api_key.as_ref().map(|_| "replace".to_string()),
+            source: Some(ProviderSource {
+                source_app: candidate.source_app,
+                source_ref: candidate.source_ref,
+                imported_at: now(),
+            }),
+            api_key,
+            app_types,
+        },
+    )?;
+    if let Some(reference) = record.temporary_secret_ref.as_deref() {
+        remove_secret(state, reference)?;
+    }
+    state
+        .db
+        .complete_provider_import_candidate(session_id, candidate_id, now())?;
+    Ok(result)
 }
 
 fn source_provider(state: &AppState, source_ref: &str) -> Result<(AppType, Provider), AppError> {
@@ -934,24 +1249,19 @@ pub fn import_candidate(
 }
 
 pub fn delete_definition(state: &AppState, provider_id: &str) -> Result<(), AppError> {
-    let mut definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
-    let before = definitions.len();
-    definitions.retain(|item| item.id != provider_id);
-    if definitions.len() == before {
+    let definitions = load_definitions(state)?;
+    if !definitions.iter().any(|item| item.id == provider_id) {
         return Err(AppError::Message("模型服务不存在".to_string()));
     }
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
-    bindings.retain(|item| item.provider_id != provider_id);
     remove_secret(state, provider_id)?;
-    write_json(state, DEFINITIONS_KEY, &definitions)?;
-    write_json(state, BINDINGS_KEY, &bindings)
+    state.db.delete_provider_center_definition(provider_id)
 }
 
 pub fn duplicate_definition(
     state: &AppState,
     provider_id: &str,
 ) -> Result<ProviderDefinition, AppError> {
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+    let definitions = load_definitions(state)?;
     let source = definitions
         .iter()
         .find(|item| item.id == provider_id)
@@ -1031,7 +1341,7 @@ pub async fn discover_models(
     state: &AppState,
     provider_id: &str,
 ) -> Result<ModelDiscoveryResult, AppError> {
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+    let definitions = load_definitions(state)?;
     let definition = definitions
         .iter()
         .find(|item| item.id == provider_id)
@@ -1089,7 +1399,8 @@ pub async fn discover_models(
     }
     .await;
 
-    let mut definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+    let mut definitions = load_definitions(state)?;
+    let bindings = load_bindings(state)?;
     let current = definitions
         .iter_mut()
         .find(|item| item.id == provider_id)
@@ -1120,7 +1431,7 @@ pub async fn discover_models(
             }
         }
     };
-    write_json(state, DEFINITIONS_KEY, &definitions)?;
+    save_core(state, &definitions, &bindings)?;
     Ok(result)
 }
 
@@ -1239,7 +1550,7 @@ pub fn apply_target_app_types(
     provider_id: &str,
     requested: Vec<String>,
 ) -> Result<Vec<String>, AppError> {
-    let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let bindings = load_bindings(state)?;
     Ok(selected_targets(&bindings, provider_id, requested))
 }
 
@@ -1271,7 +1582,7 @@ pub fn preview_apply(
     provider_id: &str,
     app_types: Vec<String>,
 ) -> Result<ProviderApplyPreview, AppError> {
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+    let definitions = load_definitions(state)?;
     let definition = definitions
         .iter()
         .find(|item| item.id == provider_id)
@@ -1280,8 +1591,12 @@ pub fn preview_apply(
     if !definition.enabled {
         return Err(AppError::Message("模型服务已停用，不能应用".to_string()));
     }
-    let secret = get_secret(state, provider_id)?;
-    let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let secret = if definition.protocol == "ollama" {
+        String::new()
+    } else {
+        get_secret(state, provider_id)?
+    };
+    let bindings = load_bindings(state)?;
     let targets = selected_targets(&bindings, provider_id, app_types);
     if targets.is_empty() {
         return Err(AppError::Message("没有可应用的目标应用".to_string()));
@@ -1297,6 +1612,7 @@ pub fn preview_apply(
                     compatible: false,
                     drifted: false,
                     current_provider_id: None,
+                    live_fingerprint: None,
                     message: Some("应用类型无效".to_string()),
                 });
                 continue;
@@ -1311,16 +1627,14 @@ pub fn preview_apply(
                     compatible: false,
                     drifted: false,
                     current_provider_id: None,
+                    live_fingerprint: None,
                     message: Some(error.to_string()),
                 });
                 continue;
             }
         };
         let existing = state.db.get_provider_by_id(&projected.id, app.as_str())?;
-        let current_fingerprint = existing
-            .as_ref()
-            .map(provider_fingerprint)
-            .transpose()?;
+        let current_fingerprint = existing.as_ref().map(provider_fingerprint).transpose()?;
         let expected = bindings
             .iter()
             .find(|binding| binding.provider_id == provider_id && binding.app_type == app_name)
@@ -1329,11 +1643,18 @@ pub fn preview_apply(
         let current_id = ProviderService::current(state, app.clone())?;
         previews.push(ProviderApplyPreviewTarget {
             app_type: app_name,
-            operation: if existing.is_some() { "update" } else { "create" }.to_string(),
+            operation: if existing.is_some() {
+                "update"
+            } else {
+                "create"
+            }
+            .to_string(),
             compatible: true,
             drifted,
             current_provider_id: (!current_id.is_empty()).then_some(current_id),
-            message: drifted.then(|| "目标配置已在 CC Switch 外部发生变化，需要先确认冲突".to_string()),
+            live_fingerprint: current_fingerprint,
+            message: drifted
+                .then(|| "目标配置已在 CC Switch 外部发生变化，需要先确认冲突".to_string()),
         });
     }
     let token = preview_token(provider_id, definition.revision, &previews)?;
@@ -1350,16 +1671,10 @@ fn save_transaction(
     state: &AppState,
     transaction: ProviderApplyTransaction,
 ) -> Result<(), AppError> {
-    let mut transactions: Vec<ProviderApplyTransaction> = read_json(state, TRANSACTIONS_KEY)?;
-    if let Some(index) = transactions.iter().position(|item| item.id == transaction.id) {
-        transactions[index] = transaction;
-    } else {
-        transactions.insert(0, transaction);
-        transactions.truncate(100);
-    }
-    write_json(state, TRANSACTIONS_KEY, &transactions)
+    state.db.upsert_provider_center_transaction(&transaction)
 }
 
+#[cfg(target_os = "windows")]
 fn save_snapshots(
     state: &AppState,
     transaction_id: &str,
@@ -1372,6 +1687,7 @@ fn save_snapshots(
     write_json(state, SNAPSHOTS_KEY, &all)
 }
 
+#[cfg(target_os = "windows")]
 fn load_snapshots(
     state: &AppState,
     transaction_id: &str,
@@ -1381,6 +1697,35 @@ fn load_snapshots(
         .get(transaction_id)
         .ok_or_else(|| AppError::Message("恢复快照不存在".to_string()))?;
     let serialized = unprotect_secret(encrypted)?;
+    serde_json::from_str(&serialized)
+        .map_err(|error| AppError::Message(format!("恢复快照已损坏: {error}")))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn save_snapshots(
+    state: &AppState,
+    transaction_id: &str,
+    snapshots: &[ProjectionSnapshot],
+) -> Result<(), AppError> {
+    let serialized = serde_json::to_string(snapshots)
+        .map_err(|error| AppError::Message(format!("无法创建恢复快照: {error}")))?;
+    let reference = format!("snapshot:{transaction_id}");
+    save_secret(state, &reference, &serialized)?;
+    let mut all: EncryptedSnapshots = read_json(state, SNAPSHOTS_KEY)?;
+    all.insert(transaction_id.to_string(), reference);
+    write_json(state, SNAPSHOTS_KEY, &all)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_snapshots(
+    state: &AppState,
+    transaction_id: &str,
+) -> Result<Vec<ProjectionSnapshot>, AppError> {
+    let all: EncryptedSnapshots = read_json(state, SNAPSHOTS_KEY)?;
+    let reference = all
+        .get(transaction_id)
+        .ok_or_else(|| AppError::Message("恢复快照不存在".to_string()))?;
+    let serialized = get_secret(state, reference)?;
     serde_json::from_str(&serialized)
         .map_err(|error| AppError::Message(format!("恢复快照已损坏: {error}")))
 }
@@ -1415,7 +1760,11 @@ fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(
         }
         None => {
             if let Some(previous) = snapshot.previous_current_provider_id.as_deref() {
-                if state.db.get_provider_by_id(previous, app.as_str())?.is_some() {
+                if state
+                    .db
+                    .get_provider_by_id(previous, app.as_str())?
+                    .is_some()
+                {
                     ProviderService::switch(state, app.clone(), previous)?;
                 }
             } else if !app.is_additive_mode() {
@@ -1437,7 +1786,11 @@ fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(
         }
     }
     if let Some(previous) = snapshot.previous_current_provider_id.as_deref() {
-        if state.db.get_provider_by_id(previous, app.as_str())?.is_some() {
+        if state
+            .db
+            .get_provider_by_id(previous, app.as_str())?
+            .is_some()
+        {
             ProviderService::switch(state, app, previous)?;
         }
     } else if !app.is_additive_mode() {
@@ -1452,24 +1805,51 @@ pub fn apply_transaction(
     provider_id: &str,
     app_types: Vec<String>,
     preview_token_value: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<ProviderApplyTransaction, AppError> {
+    if let Some(key) = idempotency_key {
+        if key.len() > 128
+            || key.is_empty()
+            || !key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_:".contains(character))
+        {
+            return Err(AppError::Message("无效的幂等请求标识".to_string()));
+        }
+        if let Some(existing) = load_transactions(state)?
+            .into_iter()
+            .find(|transaction| transaction.id == key)
+        {
+            return Ok(existing);
+        }
+    }
     let preview = preview_apply(state, provider_id, app_types.clone())?;
     if preview.token != preview_token_value {
         return Err(AppError::Message("应用预览已过期，请重新预览".to_string()));
     }
-    if preview.targets.iter().any(|target| !target.compatible || target.drifted) {
+    if preview
+        .targets
+        .iter()
+        .any(|target| !target.compatible || target.drifted)
+    {
         return Err(AppError::Message(
             "存在不兼容或已被外部修改的目标，未执行任何写入".to_string(),
         ));
     }
-    let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
+    let definitions = load_definitions(state)?;
     let definition = definitions
         .iter()
         .find(|item| item.id == provider_id)
         .cloned()
         .ok_or_else(|| AppError::Message("模型服务不存在".to_string()))?;
-    let secret = get_secret(state, provider_id)?;
-    let transaction_id = Uuid::new_v4().to_string();
+    let secret = if definition.protocol == "ollama" {
+        String::new()
+    } else {
+        get_secret(state, provider_id)?
+    };
+    let transaction_id = idempotency_key
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mut transaction = ProviderApplyTransaction {
         id: transaction_id.clone(),
         provider_id: provider_id.to_string(),
@@ -1494,10 +1874,7 @@ pub fn apply_transaction(
         let app = AppType::from_str(&target.app_type)?;
         let projected = projection(&definition, secret.clone(), &target.app_type)?;
         let previous = state.db.get_provider_by_id(&projected.id, app.as_str())?;
-        let before_fingerprint = previous
-            .as_ref()
-            .map(provider_fingerprint)
-            .transpose()?;
+        let before_fingerprint = previous.as_ref().map(provider_fingerprint).transpose()?;
         let current = ProviderService::current(state, app)?;
         snapshots.push(ProjectionSnapshot {
             app_type: target.app_type.clone(),
@@ -1510,7 +1887,7 @@ pub fn apply_transaction(
     }
     save_snapshots(state, &transaction_id, &snapshots)?;
 
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let mut bindings = load_bindings(state)?;
     let mut succeeded = Vec::new();
     let mut failed = false;
     for (index, snapshot) in snapshots.iter().enumerate() {
@@ -1588,7 +1965,7 @@ pub fn apply_transaction(
         transaction.status = "applied".to_string();
     }
     transaction.completed_at = Some(now());
-    write_json(state, BINDINGS_KEY, &bindings)?;
+    save_core(state, &definitions, &bindings)?;
     save_transaction(state, transaction.clone())?;
     Ok(transaction)
 }
@@ -1598,7 +1975,7 @@ pub fn restore_transaction(
     transaction_id: &str,
 ) -> Result<ProviderApplyTransaction, AppError> {
     let snapshots = load_snapshots(state, transaction_id)?;
-    let transactions: Vec<ProviderApplyTransaction> = read_json(state, TRANSACTIONS_KEY)?;
+    let transactions = load_transactions(state)?;
     let source = transactions
         .iter()
         .find(|item| item.id == transaction_id)
@@ -1636,20 +2013,34 @@ pub fn restore_transaction(
             }
         }
     }
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let definitions = load_definitions(state)?;
+    let mut bindings = load_bindings(state)?;
     for binding in bindings
         .iter_mut()
         .filter(|binding| binding.provider_id == source.provider_id)
     {
-        if snapshots.iter().any(|item| item.app_type == binding.app_type) {
-            binding.status = if binding.enabled { "pending" } else { "detached" }.to_string();
+        if snapshots
+            .iter()
+            .any(|item| item.app_type == binding.app_type)
+        {
+            binding.status = if binding.enabled {
+                "pending"
+            } else {
+                "detached"
+            }
+            .to_string();
             binding.applied_revision = None;
             binding.last_transaction_id = Some(restore_id.clone());
             binding.updated_at = now();
         }
     }
-    write_json(state, BINDINGS_KEY, &bindings)?;
-    result.status = if failed { "recoveryRequired" } else { "restored" }.to_string();
+    save_core(state, &definitions, &bindings)?;
+    result.status = if failed {
+        "recoveryRequired"
+    } else {
+        "restored"
+    }
+    .to_string();
     result.completed_at = Some(now());
     save_transaction(state, result.clone())?;
     Ok(result)
@@ -1673,6 +2064,7 @@ pub fn apply_bindings(
             .map(|target| target.app_type.clone())
             .collect(),
         &preview.token,
+        None,
     )?;
     if transaction.status != "applied" {
         return Err(AppError::Message(format!(
@@ -1680,7 +2072,7 @@ pub fn apply_bindings(
             transaction.status
         )));
     }
-    let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let bindings = load_bindings(state)?;
     Ok(bindings
         .into_iter()
         .filter(|item| item.provider_id == provider_id)
@@ -1693,7 +2085,8 @@ pub fn set_binding_override(
     app_type: &str,
     enabled: bool,
 ) -> Result<(), AppError> {
-    let mut bindings: Bindings = read_json(state, BINDINGS_KEY)?;
+    let definitions = load_definitions(state)?;
+    let mut bindings = load_bindings(state)?;
     let binding = bindings
         .iter_mut()
         .find(|item| item.provider_id == provider_id && item.app_type == app_type)
@@ -1705,5 +2098,84 @@ pub fn set_binding_override(
         "pending".to_string()
     };
     binding.updated_at = now();
-    write_json(state, BINDINGS_KEY, &bindings)
+    save_core(state, &definitions, &bindings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn definition(protocol: &str) -> ProviderDefinition {
+        ProviderDefinition {
+            id: "shared".to_string(),
+            name: "Shared".to_string(),
+            protocol: protocol.to_string(),
+            base_url: "https://api.example.test/v1".to_string(),
+            models: vec!["model-a".to_string()],
+            discovered_models: Vec::new(),
+            notes: String::new(),
+            enabled: true,
+            revision: 1,
+            source: None,
+            credential_configured: true,
+            credential_hint: Some("…1234".to_string()),
+            last_discovery_at: None,
+            last_discovery_error: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn provider_definition_dto_never_contains_plaintext_secret_or_secret_reference() {
+        let json = serde_json::to_string(&definition("openai-chat")).unwrap();
+        assert!(!json.contains("sk-secret"));
+        assert!(!json.contains("secretRef"));
+        assert!(json.contains("credentialConfigured"));
+    }
+
+    #[test]
+    fn registered_app_projections_are_deterministic() {
+        for app in [
+            "claude",
+            "codex",
+            "gemini",
+            "grokbuild",
+            "opencode",
+            "openclaw",
+            "hermes",
+            "pi",
+        ] {
+            let protocol = match app {
+                "claude" => "anthropic",
+                "gemini" => "gemini",
+                _ => "openai-chat",
+            };
+            let first = projection(&definition(protocol), "sk-secret".to_string(), app)
+                .unwrap_or_else(|error| panic!("{app}: {error}"));
+            let second = projection(&definition(protocol), "sk-secret".to_string(), app)
+                .unwrap_or_else(|error| panic!("{app}: {error}"));
+            assert_eq!(
+                provider_fingerprint(&first).unwrap(),
+                provider_fingerprint(&second).unwrap()
+            );
+            assert_eq!(first.id, format!("provider-center-{app}-shared"));
+        }
+    }
+
+    #[test]
+    fn claude_desktop_rejects_incompatible_protocols() {
+        assert!(projection(
+            &definition("openai-chat"),
+            "sk-secret".to_string(),
+            "claude-desktop"
+        )
+        .is_err());
+        assert!(projection(
+            &definition("anthropic"),
+            "sk-secret".to_string(),
+            "claude-desktop"
+        )
+        .is_ok());
+    }
 }

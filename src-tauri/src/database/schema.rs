@@ -430,6 +430,8 @@ impl Database {
             [],
         );
 
+        Self::create_provider_center_tables(conn)?;
+
         Ok(())
     }
 
@@ -548,6 +550,11 @@ impl Database {
                         log::info!("迁移数据库从 v17 到 v18（会话日志字节游标列）");
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（统一 Provider 与应用生命周期）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1597,6 +1604,150 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    fn create_provider_center_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_definitions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_kind TEXT NOT NULL DEFAULT 'api_key',
+                protocol TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                secret_ref TEXT,
+                website_url TEXT,
+                notes TEXT,
+                icon TEXT,
+                icon_color TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provider_models (
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                display_name TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                input_modalities_json TEXT NOT NULL DEFAULT '[]',
+                output_modalities_json TEXT NOT NULL DEFAULT '[]',
+                reasoning_levels_json TEXT NOT NULL DEFAULT '[]',
+                context_window INTEGER,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider_id, model_id),
+                FOREIGN KEY (provider_id) REFERENCES provider_definitions(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS provider_bindings (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                adapter_version INTEGER NOT NULL DEFAULT 1,
+                projected_provider_id TEXT,
+                overrides_json TEXT NOT NULL DEFAULT '{}',
+                desired_revision INTEGER NOT NULL,
+                applied_revision INTEGER,
+                projection_digest TEXT,
+                last_apply_transaction_id TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (provider_id, app_type),
+                FOREIGN KEY (provider_id) REFERENCES provider_definitions(id) ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS idx_provider_bindings_app_state
+             ON provider_bindings(app_type, state);
+             CREATE TABLE IF NOT EXISTS provider_sources (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                source_app_type TEXT NOT NULL,
+                source_provider_id TEXT,
+                source_locator TEXT,
+                source_fingerprint TEXT NOT NULL,
+                imported_at INTEGER NOT NULL,
+                last_observed_at INTEGER,
+                FOREIGN KEY (provider_id) REFERENCES provider_definitions(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_provider_sources_app
+             ON provider_sources(source_app_type);
+             CREATE TABLE IF NOT EXISTS provider_import_sessions (
+                id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                requested_apps_json TEXT NOT NULL,
+                error_summary_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                completed_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_provider_import_sessions_expiry
+             ON provider_import_sessions(expires_at);
+             CREATE TABLE IF NOT EXISTS provider_import_candidates (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                source_app_type TEXT NOT NULL,
+                source_provider_id TEXT,
+                source_locator TEXT,
+                normalized_json TEXT NOT NULL,
+                models_json TEXT NOT NULL DEFAULT '[]',
+                temporary_secret_ref TEXT,
+                credential_configured INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL,
+                conflict_json TEXT,
+                FOREIGN KEY (session_id) REFERENCES provider_import_sessions(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS provider_apply_transactions (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                provider_revision INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                state TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS provider_apply_transaction_targets (
+                transaction_id TEXT NOT NULL,
+                binding_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                before_fingerprint TEXT,
+                after_fingerprint TEXT,
+                snapshot_ref TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                PRIMARY KEY (transaction_id, binding_id),
+                FOREIGN KEY (transaction_id) REFERENCES provider_apply_transactions(id) ON DELETE CASCADE,
+                FOREIGN KEY (binding_id) REFERENCES provider_bindings(id) ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS lifecycle_jobs (
+                id TEXT PRIMARY KEY,
+                app_id TEXT NOT NULL,
+                component TEXT NOT NULL,
+                action TEXT NOT NULL,
+                state TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                pre_probe_json TEXT,
+                post_probe_json TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_lifecycle_jobs_state_created
+             ON lifecycle_jobs(state, created_at);",
+        )
+        .map_err(|error| {
+            AppError::Database(format!("创建统一 Provider 与应用生命周期表失败: {error}"))
+        })
+    }
+
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        Self::create_provider_center_tables(conn)
     }
 
     /// 插入默认模型定价数据
@@ -3709,6 +3860,33 @@ mod tests {
         )?;
         assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
         assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_creates_provider_center_and_lifecycle_tables() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in [
+            "provider_definitions",
+            "provider_models",
+            "provider_bindings",
+            "provider_sources",
+            "provider_import_sessions",
+            "provider_import_candidates",
+            "provider_apply_transactions",
+            "provider_apply_transaction_targets",
+            "lifecycle_jobs",
+        ] {
+            assert!(
+                Database::table_exists(&conn, table)?,
+                "missing table {table}"
+            );
+        }
         Ok(())
     }
 }

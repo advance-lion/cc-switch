@@ -61,6 +61,8 @@ export interface ProviderCenterState {
 }
 
 export interface ImportCandidate {
+  id: string;
+  sessionId: string;
   sourceRef: string;
   sourceApp: string;
   name: string;
@@ -69,6 +71,15 @@ export interface ImportCandidate {
   models: string[];
   credentialConfigured: boolean;
   credentialHint?: string;
+}
+
+export interface ProviderImportSession {
+  id: string;
+  state: "ready" | "readyWithErrors" | "completed" | "expired" | string;
+  candidates: ImportCandidate[];
+  errors: string[];
+  createdAt: number;
+  expiresAt: number;
 }
 
 export interface SaveProviderDefinitionInput {
@@ -115,6 +126,7 @@ export interface ProviderApplyPreviewTarget {
   compatible: boolean;
   drifted: boolean;
   currentProviderId?: string;
+  liveFingerprint?: string;
   message?: string;
 }
 
@@ -156,6 +168,20 @@ export const providerCenterApi = {
     invoke("discover_provider_center_models", { providerId }),
   scanImports: (): Promise<ImportCandidate[]> =>
     invoke("scan_provider_center_imports"),
+  startImportSession: (appTypes: string[] = []): Promise<ProviderImportSession> =>
+    invoke("start_provider_center_import_session", { appTypes }),
+  getImportSession: (sessionId: string): Promise<ProviderImportSession> =>
+    invoke("get_provider_center_import_session", { sessionId }),
+  commitImportCandidate: (
+    sessionId: string,
+    candidateId: string,
+    appTypes: string[],
+  ): Promise<ProviderDefinition> =>
+    invoke("commit_provider_center_import_candidate", {
+      sessionId,
+      candidateId,
+      appTypes,
+    }),
   importCandidate: (
     sourceRef: string,
     appTypes: string[],
@@ -172,11 +198,13 @@ export const providerCenterApi = {
     providerId: string,
     appTypes: string[],
     previewToken: string,
+    idempotencyKey = crypto.randomUUID(),
   ): Promise<ProviderApplyTransaction> =>
     invoke("apply_provider_center_transaction", {
       providerId,
       appTypes,
       previewToken,
+      idempotencyKey,
     }),
   restoreTransaction: (
     transactionId: string,

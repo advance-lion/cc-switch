@@ -21,11 +21,14 @@
 //! object must keep `type: "object"`, which the Chat transform guarantees).
 //!
 //! Scope is deliberately narrow: only the Responses → Chat path, and only when
-//! the resolved upstream host is Moonshot/Kimi. Their Anthropic-compatible
-//! endpoint accepts the original shape (probed the same day), and every other
-//! provider keeps byte-identical tool schemas so prompt-cache prefixes are not
-//! disturbed. Relays that forward to Moonshot under their own host are not
-//! matched; extend [`MOONSHOT_HOST_SUFFIXES`] if such a report shows up.
+//! the route is known to face Moonshot's validator — either the resolved
+//! upstream host matches [`MOONSHOT_HOST_SUFFIXES`], or the request's upstream
+//! model id names a Kimi/Moonshot model ([`model_requires_ref_sibling_all_of`]).
+//! The model id is the signal that remains when a relay (NewAPI, one-api, a
+//! corporate gateway) forwards to Moonshot under its own host, where the host
+//! check alone never matches. Their Anthropic-compatible endpoint accepts the
+//! original shape (probed the same day), and unrelated providers keep
+//! byte-identical tool schemas so prompt-cache prefixes are not disturbed.
 
 use serde_json::{json, Map, Value};
 use url::Url;
@@ -33,6 +36,11 @@ use url::Url;
 /// Upstream hosts whose Chat Completions validator rejects `$ref` siblings.
 /// Matched as the host itself or any subdomain of it.
 const MOONSHOT_HOST_SUFFIXES: &[&str] = &["moonshot.cn", "moonshot.ai", "kimi.com"];
+
+/// Model-id prefixes whose serving stack is Moonshot's Chat Completions
+/// validator. Matched on the final `/`-separated segment, lowercased, with a
+/// `-` boundary so lookalikes (`kimiwo`) stay out.
+const MOONSHOT_MODEL_PREFIXES: &[&str] = &["kimi", "moonshot"];
 
 /// Keywords whose value is a single schema (or, for draft-07 `items`, a tuple
 /// of schemas). Boolean schemas (`additionalProperties: false`) are skipped by
@@ -84,6 +92,25 @@ pub fn upstream_requires_ref_sibling_all_of(base_url: &str) -> bool {
             || host
                 .strip_suffix(suffix)
                 .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Whether the request's upstream model id names a Moonshot / Kimi model. This
+/// is the relay case: a NewAPI/one-api/corporate gateway fronts Moonshot under
+/// its own host, so the host check can never match it and the model id is the
+/// only Moonshot signal left. `kimi-k3`, `moonshotai/kimi-k3`, the bare `k3`
+/// alias Kimi For Coding reports, and `moonshot-v1-*` all match.
+pub fn model_requires_ref_sibling_all_of(model: &str) -> bool {
+    let base = model.rsplit('/').next().unwrap_or(model).trim();
+    let base = base.to_ascii_lowercase();
+    if base == "k3" || base.starts_with("k3-") {
+        return true;
+    }
+    MOONSHOT_MODEL_PREFIXES.iter().any(|prefix| {
+        base == *prefix
+            || base
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('-'))
     })
 }
 
@@ -212,6 +239,36 @@ mod tests {
             "",
         ] {
             assert!(!upstream_requires_ref_sibling_all_of(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn gate_matches_moonshot_model_ids_behind_relays() {
+        for model in [
+            "kimi-k3",
+            "KIMI-K3",
+            "kimi-k2.7-code",
+            "kimi-for-coding",
+            "moonshotai/kimi-k3",
+            "k3",
+            "k3-256k",
+            "moonshot-v1-8k",
+            "openai/moonshot-v1-32k",
+            " kimi-k3 ",
+        ] {
+            assert!(model_requires_ref_sibling_all_of(model), "{model}");
+        }
+        for model in [
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "qwen3.7-max",
+            "gpt-5.5",
+            "kimiwo",
+            "ak3",
+            "some/k3s",
+            "",
+        ] {
+            assert!(!model_requires_ref_sibling_all_of(model), "{model}");
         }
     }
 

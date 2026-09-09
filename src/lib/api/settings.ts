@@ -81,10 +81,12 @@ export interface DesktopAppStatus {
   version: string | null;
   latest_version: string | null;
   path: string | null;
+  launch_target: string | null;
   package_identity: string | null;
   installation_source:
     | "microsoft_store"
     | "official_appx"
+    | "official_exe"
     | "application_bundle"
     | "not_installed"
     | "unsupported_platform"
@@ -94,6 +96,28 @@ export interface DesktopAppStatus {
   can_uninstall: boolean;
   can_launch: boolean;
   reason: string | null;
+}
+
+export interface DesktopLifecycleJob {
+  id: string;
+  appId: DesktopAppId;
+  component: "desktop";
+  action: DesktopLifecycleAction;
+  state:
+    | "queued"
+    | "running"
+    | "verifying"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+  preProbe: DesktopAppStatus | null;
+  postProbe: DesktopAppStatus | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
 }
 
 /**
@@ -258,14 +282,34 @@ export const settingsApi = {
   async runDesktopAppLifecycleAction(
     app: DesktopAppId,
     action: DesktopLifecycleAction,
+    jobId?: string,
   ): Promise<DesktopAppStatus> {
     if (isCodexAssistantWebBridgeActive()) {
       return await webAssistantRequest<DesktopAppStatus>(
         "/desktop-app-action",
-        { app, action },
+        { app, action, jobId },
       );
     }
-    return await invoke("run_desktop_app_lifecycle_action", { app, action });
+    return await invoke("run_desktop_app_lifecycle_action", { app, action, jobId });
+  },
+
+  async cancelDesktopLifecycleJob(jobId: string): Promise<boolean> {
+    if (isCodexAssistantWebBridgeActive()) return false;
+    return await invoke("cancel_desktop_lifecycle_job", { jobId });
+  },
+
+  async getDesktopLifecycleJob(
+    jobId: string,
+  ): Promise<DesktopLifecycleJob | null> {
+    if (isCodexAssistantWebBridgeActive()) return null;
+    return await invoke("get_desktop_lifecycle_job", { jobId });
+  },
+
+  async listDesktopLifecycleJobs(
+    app?: DesktopAppId,
+  ): Promise<DesktopLifecycleJob[]> {
+    if (isCodexAssistantWebBridgeActive()) return [];
+    return await invoke("list_desktop_lifecycle_jobs", { app });
   },
 
   async launchDesktopApp(app: DesktopAppId): Promise<void> {
