@@ -1,8 +1,8 @@
 # Provider 中心与应用管理增强补丁：完整实现设计
 
-> 状态：实施设计稿  
-> 目标分支：`feat/runtime-lifecycle`  
-> 基线数据库版本：18  
+> 状态：实施设计稿
+> 目标分支：`feat/runtime-lifecycle`
+> 基线数据库版本：18
 > 对应需求：`PATCH_REQUIREMENTS_PROVIDER_AND_APP_MANAGEMENT_ZH.md`
 
 ## 1. 设计目标
@@ -980,4 +980,3 @@ src/types/lifecycle.ts
 6. Codex 助手只能触发登记动作，不能把自然语言转换成任意 Shell 直接执行；
 7. Windows、macOS、Linux 的核心路径通过测试，旧 v18 数据可无损迁移；
 8. 所有新增用户界面不出现 `Runtime`，新手流程不要求理解 Provider/Binding 的内部实现。
-
