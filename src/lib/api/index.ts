@@ -1,8 +1,26 @@
 export type { AppId } from "./types";
 export { piApi } from "./pi";
 export { providersApi, universalProvidersApi } from "./providers";
+export { providerCenterApi } from "./providerCenter";
+export type {
+  ImportCandidate,
+  ProviderBinding as ProviderCenterBinding,
+  ProviderCenterState,
+  ProviderDefinition as ProviderCenterDefinition,
+} from "./providerCenter";
 export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
+export { isCodexAssistantWebBridgeActive } from "./settings";
+export type {
+  CodexAssistantEvent,
+  CodexAssistantPlan,
+  CodexAssistantPlanStep,
+  CodexDesktopStatus,
+  DesktopAppId,
+  DesktopAppStatus,
+  DesktopLifecycleAction,
+  ToolLifecycleCapabilities,
+} from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";
 export { promptsApi } from "./prompts";

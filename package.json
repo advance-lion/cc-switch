@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
+    "dev:desktop": "set \"CC_SWITCH_TEST_HOME=%LOCALAPPDATA%\\CC Switch Dev Sandbox\" && pnpm tauri dev --config src-tauri/tauri.dev.conf.json",
     "build": "pnpm tauri build",
     "tauri": "tauri",
     "dev:renderer": "vite",

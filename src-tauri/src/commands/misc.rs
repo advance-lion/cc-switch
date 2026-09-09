@@ -111,6 +111,35 @@ pub struct ToolVersion {
     wsl_distro: Option<String>,
 }
 
+/// A deliberately small, source-aware contract for the application-management
+/// card.  The frontend must not infer destructive capabilities merely from a
+/// tool being detected: an executable could have come from an official
+/// installer, a package manager, or a manually copied binary.
+#[derive(serde::Serialize)]
+pub struct ToolLifecycleCapabilities {
+    name: String,
+    can_install: bool,
+    can_update: bool,
+    can_uninstall: bool,
+    can_launch: bool,
+    /// `managed_npm_prefix`, `global_npm`, `other_or_unknown`, or
+    /// `not_installed`.  This is informational; it is never accepted back as
+    /// a command argument.
+    installation_source: String,
+    /// A user-facing explanation when an automatic action is deliberately not
+    /// available.  In particular, no guessed file deletion is ever offered.
+    reason: Option<String>,
+}
+
+/// Codex 桌面应用的发现结果。它与 `codex --version`（命令行）分开返回，避免
+/// 前端把任一组件的安装状态误解成另一组件已经可用。
+#[derive(serde::Serialize)]
+pub struct CodexDesktopStatus {
+    installed: bool,
+    version: Option<String>,
+    path: Option<String>,
+}
+
 const VALID_TOOLS: [&str; 8] = [
     "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
 ];
@@ -171,10 +200,77 @@ pub async fn get_tool_versions(
         let tool_wsl_shell = pref.and_then(|p| p.wsl_shell.as_deref());
         let tool_wsl_shell_flag = pref.and_then(|p| p.wsl_shell_flag.as_deref());
 
-        results.push(get_single_tool_version_impl(tool, tool_wsl_shell, tool_wsl_shell_flag).await);
+        results.push(
+            get_single_tool_version_impl(tool, tool_wsl_shell, tool_wsl_shell_flag, false).await,
+        );
     }
 
     Ok(results)
+}
+
+/// Explicit remote version check. Local application detection deliberately
+/// stays offline; registry / GitHub requests happen only when the user asks to
+/// check updates, or after a lifecycle operation needs verification.
+#[tauri::command]
+pub async fn check_tool_updates(
+    tools: Vec<String>,
+    wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
+) -> Result<Vec<ToolVersion>, String> {
+    let requested = normalize_requested_tools(&tools);
+    let mut results = Vec::new();
+    for tool in requested {
+        let pref = wsl_shell_by_tool.as_ref().and_then(|m| m.get(tool));
+        results.push(
+            get_single_tool_version_impl(
+                tool,
+                pref.and_then(|p| p.wsl_shell.as_deref()),
+                pref.and_then(|p| p.wsl_shell_flag.as_deref()),
+                true,
+            )
+            .await,
+        );
+    }
+    Ok(results)
+}
+
+/// Report only lifecycle operations that the backend can carry out safely for
+/// the *actual* installation source.  This is queried independently of the
+/// version probe so a stale UI can never turn an arbitrary detected binary
+/// into an automatic uninstall target.
+#[tauri::command]
+pub async fn get_tool_lifecycle_capabilities(
+    tools: Vec<String>,
+) -> Result<Vec<ToolLifecycleCapabilities>, String> {
+    let requested = normalize_requested_tools(&tools);
+    tokio::task::spawn_blocking(move || {
+        requested
+            .into_iter()
+            .map(tool_lifecycle_capabilities_for)
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|error| format!("tool lifecycle capability task join error: {error}"))?
+}
+
+/// Compatibility wrapper kept for older renderer builds. New code uses the
+/// generic desktop component API in `desktop_lifecycle`.
+#[tauri::command]
+pub async fn get_codex_desktop_status() -> Result<CodexDesktopStatus, String> {
+    let status = super::desktop_lifecycle::get_desktop_app_status(
+        "codex-desktop".to_string(),
+    )
+    .await?;
+    Ok(CodexDesktopStatus {
+        installed: status.installed,
+        version: status.version,
+        path: status.path,
+    })
+}
+
+/// Compatibility wrapper kept for older renderer builds.
+#[tauri::command]
+pub async fn launch_codex_desktop() -> Result<(), String> {
+    super::desktop_lifecycle::launch_desktop_app("codex-desktop".to_string()).await
 }
 
 #[tauri::command]
@@ -183,6 +279,23 @@ pub async fn run_tool_lifecycle_action(
     action: String,
     wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
 ) -> Result<(), String> {
+    if crate::config::is_test_sandbox() {
+        let _action = ToolLifecycleAction::from_str(&action)?;
+        let requested = normalize_requested_tools(&tools);
+        if requested.len() != 1 {
+            return Err("开发沙箱一次只能测试一个受支持应用。".to_string());
+        }
+        let tool = requested[0];
+        return tokio::task::spawn_blocking(move || {
+            let install_dir = sandbox_managed_install_dir(tool)?;
+            // Both install and update use the fixed package mapping and npm's
+            // `--prefix` argument.  No global npm directory is ever touched.
+            update_managed_assistant_install(tool, &install_dir)?;
+            save_managed_assistant_install_dir(tool, &install_dir)
+        })
+        .await
+        .map_err(|e| format!("sandbox lifecycle task join error: {e}"))?;
+    }
     let action = ToolLifecycleAction::from_str(&action)?;
     let requested = normalize_requested_tools(&tools);
     if requested.is_empty() {
@@ -197,12 +310,198 @@ pub async fn run_tool_lifecycle_action(
     // build 阶段含锚定探测（对每个工具跑 `--version` 定位命令行实际命中那处），
     // 与执行一并放进 blocking 线程，避免阻塞 async runtime。
     tokio::task::spawn_blocking(move || {
+        if requested.len() == 1 && matches!(action, ToolLifecycleAction::Update) {
+            if let Some(install_dir) = managed_assistant_install_dir(requested[0]) {
+                return update_managed_assistant_install(requested[0], &install_dir);
+            }
+        }
         let command_line =
             build_tool_lifecycle_command(&requested, action, wsl_shell_by_tool.as_ref())?;
         run_tool_lifecycle_silently(&command_line, label)
     })
     .await
     .map_err(|e| format!("tool lifecycle task join error: {e}"))?
+}
+
+/// 在用户首选终端中启动一个已登记的 Runtime。
+///
+/// 这里刻意不接受前端传入的命令行或参数：Runtime 名称先经过白名单校验，最终执行的
+/// 命令也只会是该 Runtime 固定的 CLI 名称。这样页面上的“启动”不会扩大成任意 Shell
+/// 执行入口；CLI 的运行态本身也不被误报为常驻服务。
+#[tauri::command]
+pub async fn launch_tool_terminal(tool: String) -> Result<(), String> {
+    let requested = normalize_requested_tools(&[tool]);
+    if requested.len() != 1 {
+        return Err("Unsupported runtime".to_string());
+    }
+
+    let tool = requested[0];
+    let label = format!("{} CLI", tool_display_name(tool));
+    tokio::task::spawn_blocking(move || launch_terminal_running(tool, &label))
+        .await
+        .map_err(|e| format!("runtime launch task join error: {e}"))?
+}
+
+/// 卸载由 npm 全局安装的 Runtime。
+///
+/// 仅为有明确 npm 包映射的 Runtime 开放。没有可靠、可逆的卸载器映射（例如 Hermes
+/// 官方安装器）的 Runtime 必须由其上游安装器处理，避免猜测路径后删除用户文件。
+/// Provider、账号和 CC Switch 的配置不会被读取或修改。
+#[tauri::command]
+pub async fn uninstall_tool_runtime(tool: String) -> Result<(), String> {
+    if crate::config::is_test_sandbox() {
+        let requested = normalize_requested_tools(&[tool]);
+        if requested.len() != 1 {
+            return Err("Unsupported runtime".to_string());
+        }
+        let tool = requested[0];
+        return tokio::task::spawn_blocking(move || {
+            let sandbox_dir = sandbox_managed_install_dir(tool)?;
+            let registered = managed_assistant_install_dir(tool)
+                .ok_or_else(|| "该应用不是由开发沙箱安装，拒绝卸载。".to_string())?;
+            if registered != sandbox_dir {
+                return Err("开发沙箱只能卸载其自身目录中的应用。".to_string());
+            }
+            uninstall_managed_assistant_install(tool, &sandbox_dir)
+        })
+        .await
+        .map_err(|e| format!("sandbox uninstall task join error: {e}"))?;
+    }
+    let requested = normalize_requested_tools(&[tool]);
+    if requested.len() != 1 {
+        return Err("Unsupported runtime".to_string());
+    }
+    let tool = requested[0];
+    if let Some(install_dir) = managed_assistant_install_dir(tool) {
+        return tokio::task::spawn_blocking(move || {
+            uninstall_managed_assistant_install(tool, &install_dir)
+        })
+        .await
+        .map_err(|e| format!("managed runtime uninstall task join error: {e}"))?;
+    }
+    let package = npm_package_for(tool).ok_or_else(|| {
+        format!(
+            "{} does not have a safe automatic uninstall mapping",
+            tool_display_name(tool)
+        )
+    })?;
+
+    // A detected executable is not evidence that npm owns it.  For example,
+    // Windows' standalone Codex installer and a manually copied binary can
+    // both be on PATH.  Re-check ownership immediately before the destructive
+    // action instead of relying on a capability response rendered earlier.
+    let npm_owns_install =
+        tokio::task::spawn_blocking(move || global_npm_package_is_installed(tool, package))
+            .await
+            .map_err(|e| format!("npm ownership probe task join error: {e}"))??;
+    if !npm_owns_install {
+        return Err(format!(
+            "{} 不是由可验证的 npm 全局安装管理；请通过原安装器卸载",
+            tool_display_name(tool)
+        ));
+    }
+
+    let command = build_tool_uninstall_command(tool, package)?;
+    tokio::task::spawn_blocking(move || run_tool_lifecycle_silently(&command, "tool_uninstall"))
+        .await
+        .map_err(|e| format!("runtime uninstall task join error: {e}"))?
+}
+
+fn tool_lifecycle_capabilities_for(tool: &str) -> Result<ToolLifecycleCapabilities, String> {
+    let can_install = tool_action_shell_command(tool, ToolLifecycleAction::Install).is_some();
+    let can_update = tool_action_shell_command(tool, ToolLifecycleAction::Update).is_some();
+    let source: String;
+    let mut can_uninstall = false;
+    let mut reason = None;
+
+    if crate::config::is_test_sandbox() {
+        let managed = managed_assistant_install_dir(tool);
+        let can_manage = npm_package_for(tool).is_some();
+        return Ok(ToolLifecycleCapabilities {
+            name: tool.to_string(),
+            can_install: can_manage,
+            can_update: can_manage,
+            can_uninstall: can_manage && managed.is_some(),
+            can_launch: true,
+            installation_source: "sandbox_npm_prefix".to_string(),
+            reason: (!can_manage).then(|| "该应用没有 npm 沙箱安装器。".to_string()),
+        });
+    }
+
+    if managed_assistant_install_dir(tool).is_some() {
+        source = "managed_npm_prefix".to_string();
+        can_uninstall = npm_package_for(tool).is_some();
+        if !can_uninstall {
+            reason = Some("该应用没有已登记的安全卸载器。".to_string());
+        }
+    } else if let Some(package) = npm_package_for(tool) {
+        match global_npm_package_is_installed(tool, package) {
+            Ok(true) => {
+                source = "global_npm".to_string();
+                can_uninstall = true;
+            }
+            Ok(false) => {
+                // The CLI can still be present through an official installer
+                // or another manager.  Do not offer npm uninstall for it.
+                source = "other_or_unknown".to_string();
+                reason =
+                    Some("未能验证该应用由 npm 全局安装管理；请通过原安装器卸载。".to_string());
+            }
+            Err(error) => {
+                source = "other_or_unknown".to_string();
+                reason = Some(format!("无法验证安装来源，已禁用自动卸载：{error}"));
+            }
+        }
+    } else {
+        source = "other_or_unknown".to_string();
+        reason = Some("该应用没有已登记的安全卸载器；请通过原安装器卸载。".to_string());
+    }
+
+    Ok(ToolLifecycleCapabilities {
+        name: tool.to_string(),
+        can_install,
+        can_update,
+        can_uninstall,
+        can_launch: true,
+        installation_source: source,
+        reason,
+    })
+}
+
+/// Verifies ownership using a fixed package from `npm_package_for`; neither
+/// the package nor the executable path comes from the renderer.  The WSL case
+/// is run inside the configured distribution, matching the existing lifecycle
+/// command builder.
+fn global_npm_package_is_installed(tool: &str, package: &str) -> Result<bool, String> {
+    let mut command = {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(distro) = wsl_distro_for_tool(tool) {
+                let mut command = std::process::Command::new("wsl.exe");
+                command.args(["-d", &distro, "--", "npm", "ls", "-g", "--depth=0", package]);
+                command
+            } else {
+                let mut command = std::process::Command::new("npm");
+                command.args(["ls", "-g", "--depth=0", package]);
+                command
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut command = std::process::Command::new("npm");
+            command.args(["ls", "-g", "--depth=0", package]);
+            command
+        }
+    };
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().map_err(|error| {
+        format!(
+            "无法调用 npm 验证 {} 的安装来源: {error}",
+            tool_display_name(tool)
+        )
+    })?;
+    Ok(output.status.success())
 }
 
 /// 静默执行工具安装/更新脚本：直接捕获子进程输出并阻塞到命令真正结束，
@@ -364,6 +663,436 @@ fn normalize_requested_tools(tools: &[String]) -> Vec<&'static str> {
 enum ToolLifecycleAction {
     Install,
     Update,
+}
+
+/// 由 Codex 助手调用的、已经过登记校验的安装动作。
+///
+/// 这不是前端或 AI 传入的 shell 命令：`tool` 必须来自 `VALID_TOOLS`，包名由
+/// `npm_package_for` 固定映射，版本和安装目录也会在构造时校验。这样 AI 只能解释和
+/// 选择方案，不能扩大 CC Switch 原有的执行范围。
+#[derive(Debug, Clone)]
+pub(super) struct RegisteredAssistantInstall {
+    pub tool: String,
+    pub display_name: String,
+    pub version: String,
+    pub install_dir: Option<PathBuf>,
+    pub official_source: String,
+    installer: RegisteredAssistantInstaller,
+}
+
+/// An installer is selected exclusively from CC Switch's own registry. The
+/// npm branch is invoked with argument vectors (never through a shell), which
+/// keeps a user-selected directory from becoming shell syntax.
+#[derive(Debug, Clone)]
+enum RegisteredAssistantInstaller {
+    Npm { package: String },
+    Standard { command_line: String },
+}
+
+/// 带有临时批处理文件清理信息的受控安装进程。
+pub(super) struct RegisteredAssistantInstallChild {
+    pub child: std::process::Child,
+    cleanup_file: Option<PathBuf>,
+}
+
+impl RegisteredAssistantInstallChild {
+    pub fn into_parts(self) -> (std::process::Child, Option<PathBuf>) {
+        (self.child, self.cleanup_file)
+    }
+}
+
+fn normalize_assistant_install_version(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() || value == "stable" || value == "latest" {
+        return Ok("latest".to_string());
+    }
+    // npm version / dist-tag is deliberately limited to a small literal set.
+    // It is later embedded in a registered package argument, never interpreted
+    // as a command fragment.
+    if value.len() > 80
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err("指定版本只能包含字母、数字、点、连字符或下划线".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn managed_assistant_install_registry_path() -> PathBuf {
+    crate::config::get_app_config_dir()
+        .join("codex-assistant")
+        .join("managed-installs.json")
+}
+
+fn managed_assistant_install_dirs() -> HashMap<String, String> {
+    let path = managed_assistant_install_registry_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_managed_assistant_install_dir(tool: &str, install_dir: &Path) -> Result<(), String> {
+    let path = managed_assistant_install_registry_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法保存 AI 安装位置".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 AI 安装记录目录: {error}"))?;
+    let mut entries = managed_assistant_install_dirs();
+    entries.insert(tool.to_string(), install_dir.display().to_string());
+    let serialized = serde_json::to_string_pretty(&entries)
+        .map_err(|error| format!("无法保存 AI 安装位置: {error}"))?;
+    std::fs::write(path, serialized).map_err(|error| format!("无法写入 AI 安装位置: {error}"))
+}
+
+fn remove_managed_assistant_install_dir(tool: &str) -> Result<(), String> {
+    let path = managed_assistant_install_registry_path();
+    let mut entries = managed_assistant_install_dirs();
+    if entries.remove(tool).is_none() {
+        return Ok(());
+    }
+    let serialized = serde_json::to_string_pretty(&entries)
+        .map_err(|error| format!("无法更新 AI 安装位置: {error}"))?;
+    std::fs::write(path, serialized).map_err(|error| format!("无法写入 AI 安装位置: {error}"))
+}
+
+fn managed_assistant_install_dir(tool: &str) -> Option<PathBuf> {
+    let raw = managed_assistant_install_dirs()
+        .get(tool)?
+        .trim()
+        .to_string();
+    let path = PathBuf::from(raw);
+    path.is_dir().then_some(path)
+}
+
+fn assistant_install_bin_dir(install_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        install_dir.to_path_buf()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        install_dir.join("bin")
+    }
+}
+
+/// The development build may exercise the same lifecycle code, but only in
+/// this fixed subtree of its isolated home.  The renderer never supplies it.
+pub(super) fn sandbox_managed_install_dir(tool: &str) -> Result<PathBuf, String> {
+    if !crate::config::is_test_sandbox() {
+        return Err("当前不是开发沙箱。".to_string());
+    }
+    if !VALID_TOOLS.contains(&tool) || npm_package_for(tool).is_none() {
+        return Err(format!("{} 没有 npm 沙箱安装器。", tool_display_name(tool)));
+    }
+    let path = crate::config::get_home_dir()
+        .join("agent-installs")
+        .join(tool);
+    std::fs::create_dir_all(&path).map_err(|error| format!("无法创建开发沙箱安装目录: {error}"))?;
+    Ok(path)
+}
+
+/// Update a CLI that the assistant installed into a user-selected npm prefix.
+/// The registry provides only the install directory; the executable package is
+/// still resolved from the immutable supported-tool mapping.
+fn update_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<(), String> {
+    let package = npm_package_for(tool)
+        .ok_or_else(|| format!("{} 没有受支持的自定义目录更新器", tool_display_name(tool)))?;
+    let output = std::process::Command::new("npm")
+        .args(["install", "--global", "--prefix"])
+        .arg(install_dir)
+        .arg(format!("{package}@latest"))
+        .output()
+        .map_err(|error| format!("无法启动自定义目录更新进程: {error}"))?;
+    finish_lifecycle_output(&output)?;
+    let install = RegisteredAssistantInstall {
+        tool: tool.to_string(),
+        display_name: tool_display_name(tool).to_string(),
+        version: "latest".to_string(),
+        install_dir: Some(install_dir.to_path_buf()),
+        official_source: format!("https://www.npmjs.com/package/{package}"),
+        installer: RegisteredAssistantInstaller::Npm {
+            package: package.to_string(),
+        },
+    };
+    verify_registered_assistant_install(&install).map(|_| ())
+}
+
+/// Uninstall a CLI from the exact npm prefix previously chosen in the AI flow.
+/// We verify that the registered executable disappeared before forgetting the
+/// directory, so a successful npm exit code alone cannot create a false UI
+/// success state.
+fn uninstall_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<(), String> {
+    let package = npm_package_for(tool)
+        .ok_or_else(|| format!("{} 没有受支持的自定义目录卸载器", tool_display_name(tool)))?;
+    let output = std::process::Command::new("npm")
+        .args(["uninstall", "--global", "--prefix"])
+        .arg(install_dir)
+        .arg(package)
+        .output()
+        .map_err(|error| format!("无法启动自定义目录卸载进程: {error}"))?;
+    finish_lifecycle_output(&output)?;
+
+    let bin_dir = assistant_install_bin_dir(install_dir);
+    if tool_executable_candidates(tool, &bin_dir)
+        .iter()
+        .any(|candidate| candidate.is_file())
+    {
+        return Err("卸载命令已结束，但所选目录仍检测到命令行".to_string());
+    }
+    remove_managed_assistant_install_dir(tool)
+}
+
+/// Builds a fixed install command from the existing CC Switch registry. A
+/// custom directory uses npm's documented `--prefix` mode and is therefore
+/// available only to tools with an explicit npm package mapping.
+pub(super) fn plan_registered_assistant_install(
+    tool: &str,
+    install_dir: Option<&Path>,
+    requested_version: &str,
+) -> Result<RegisteredAssistantInstall, String> {
+    if !VALID_TOOLS.contains(&tool) {
+        return Err("当前应用不支持 AI 辅助安装".to_string());
+    }
+    let version = normalize_assistant_install_version(requested_version)?;
+    let display_name = tool_display_name(tool).to_string();
+
+    let (installer, official_source) = if install_dir.is_some() {
+        let package = npm_package_for(tool)
+            .ok_or_else(|| format!("{} 暂不支持自定义安装位置，请使用标准安装", display_name))?;
+        (
+            RegisteredAssistantInstaller::Npm {
+                package: package.to_string(),
+            },
+            format!("https://www.npmjs.com/package/{package}"),
+        )
+    } else {
+        if version != "latest" {
+            return Err(format!(
+                "{} 的标准安装不支持指定版本；请选择稳定版或最新版，或改用自定义位置",
+                display_name
+            ));
+        }
+        (
+            RegisteredAssistantInstaller::Standard {
+                command_line: build_tool_lifecycle_command(
+                    &[tool],
+                    ToolLifecycleAction::Install,
+                    None,
+                )?,
+            },
+            npm_package_for(tool)
+                .map(|package| format!("https://www.npmjs.com/package/{package}"))
+                .unwrap_or_else(|| "CC Switch 已登记的官方安装器".to_string()),
+        )
+    };
+
+    Ok(RegisteredAssistantInstall {
+        tool: tool.to_string(),
+        display_name,
+        version,
+        install_dir: install_dir.map(Path::to_path_buf),
+        official_source,
+        installer,
+    })
+}
+
+/// Spawn only a command line manufactured by `plan_registered_assistant_install`.
+/// Its stdout/stderr are piped so the assistant can show observable progress.
+pub(super) fn spawn_registered_assistant_install(
+    install: &RegisteredAssistantInstall,
+) -> Result<RegisteredAssistantInstallChild, String> {
+    if crate::config::is_test_sandbox() {
+        let expected = sandbox_managed_install_dir(&install.tool)?;
+        if install.install_dir.as_deref() != Some(expected.as_path()) {
+            return Err("开发沙箱只允许安装到其受控测试目录。".to_string());
+        }
+    }
+    use std::process::{Command, Stdio};
+
+    if let RegisteredAssistantInstaller::Npm { package } = &install.installer {
+        let mut command = Command::new("npm");
+        command.arg("install").arg("--global");
+        if let Some(dir) = &install.install_dir {
+            command.arg("--prefix").arg(dir);
+            command.current_dir(dir);
+        }
+        command
+            .arg(format!("{package}@{}", install.version))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| format!("无法启动受控安装进程: {error}"))?;
+        return Ok(RegisteredAssistantInstallChild {
+            child,
+            cleanup_file: None,
+        });
+    }
+
+    let RegisteredAssistantInstaller::Standard { command_line } = &install.installer else {
+        unreachable!("all registered installers are handled above")
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new("bash");
+        command
+            .args(["-c", command_line])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(login_path) = login_shell_path() {
+            let inherited = std::env::var("PATH").unwrap_or_default();
+            command.env("PATH", merge_path_segments(&login_path, &inherited));
+        }
+        if let Some(dir) = &install.install_dir {
+            command.current_dir(dir);
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| format!("无法启动受控安装进程: {error}"))?;
+        return Ok(RegisteredAssistantInstallChild {
+            child,
+            cleanup_file: None,
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let file = std::env::temp_dir().join(format!(
+            "cc_switch_ai_install_{}_{}.bat",
+            install.tool,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&file, command_line)
+            .map_err(|error| format!("无法写入受控安装脚本: {error}"))?;
+        let mut command = Command::new("cmd");
+        command
+            .args(["/D", "/S", "/C"])
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Some(dir) = &install.install_dir {
+            command.current_dir(dir);
+        }
+        let child = command.spawn().map_err(|error| {
+            let _ = std::fs::remove_file(&file);
+            format!("无法启动受控安装进程: {error}")
+        })?;
+        return Ok(RegisteredAssistantInstallChild {
+            child,
+            cleanup_file: Some(file),
+        });
+    }
+}
+
+/// Re-detects the actual executable after an AI installation. For managed npm
+/// prefix installs, the selected directory becomes a documented search path so
+/// later CC Switch status probes and launches discover the same installation.
+pub(super) fn verify_registered_assistant_install(
+    install: &RegisteredAssistantInstall,
+) -> Result<String, String> {
+    if let Some(dir) = &install.install_dir {
+        let bin_dir = assistant_install_bin_dir(dir);
+        let current_path = {
+            #[cfg(target_os = "windows")]
+            {
+                format!("{};{}", bin_dir.display(), effective_path_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let current = effective_path_os().unwrap_or_default();
+                prepend_search_dir_to_path(&bin_dir, &current)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        for candidate in tool_executable_candidates(&install.tool, &bin_dir) {
+            if !candidate.is_file() {
+                continue;
+            }
+            #[cfg(target_os = "windows")]
+            let output = run_windows_tool_version_command(&candidate, &current_path);
+            #[cfg(not(target_os = "windows"))]
+            let output = std::process::Command::new(&candidate)
+                .arg("--version")
+                .env("PATH", &current_path)
+                .output();
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let stdout = decode_command_output(&output.stdout);
+                    let stderr = decode_command_output(&output.stderr);
+                    let version = extract_version(if stdout.trim().is_empty() {
+                        stderr.trim()
+                    } else {
+                        stdout.trim()
+                    });
+                    if !version.is_empty() {
+                        save_managed_assistant_install_dir(&install.tool, dir)?;
+                        return Ok(version);
+                    }
+                }
+            }
+        }
+        return Err("安装命令已结束，但在所选位置未检测到可运行的命令行".to_string());
+    }
+
+    let probe = {
+        #[cfg(target_os = "windows")]
+        {
+            match probe_path_default_version(&install.tool) {
+                ShellProbe::NotFound(_) => scan_cli_version(&install.tool),
+                probe => probe,
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            match try_get_version(&install.tool) {
+                ShellProbe::NotFound(_) => scan_cli_version(&install.tool),
+                probe => probe,
+            }
+        }
+    };
+    match probe {
+        ShellProbe::Found(version) => Ok(version),
+        ShellProbe::FoundButFailed(detail) => Err(format!("安装后命令无法运行: {detail}")),
+        ShellProbe::NotFound(_) => Err("安装命令已结束，但未检测到可运行的命令行".to_string()),
+    }
+}
+
+fn build_tool_uninstall_command(tool: &str, package: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(distro) = wsl_distro_for_tool(tool) {
+            return build_wsl_tool_action_line(
+                &distro,
+                &format!("npm uninstall -g {package}"),
+                None,
+                None,
+            );
+        }
+        // npm.cmd 必须通过 call 执行，否则批处理脚本会在 npm.cmd 退出后直接结束。
+        return Ok(format!("call npm uninstall -g {package}"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = tool;
+        Ok(format!("npm uninstall -g {package}"))
+    }
 }
 
 impl FromStr for ToolLifecycleAction {
@@ -750,6 +1479,7 @@ async fn get_single_tool_version_impl(
     tool: &str,
     wsl_shell: Option<&str>,
     wsl_shell_flag: Option<&str>,
+    include_latest: bool,
 ) -> ToolVersion {
     debug_assert!(
         VALID_TOOLS.contains(&tool),
@@ -758,9 +1488,6 @@ async fn get_single_tool_version_impl(
 
     // 判断该工具的运行环境 & WSL distro（如有）
     let (env_type, wsl_distro) = tool_env_type_and_wsl_distro(tool);
-
-    // 使用全局 HTTP 客户端（已包含代理配置）
-    let client = crate::proxy::http_client::get();
 
     // 1. 获取本地版本
     let probe = if let Some(distro) = wsl_distro.as_deref() {
@@ -804,28 +1531,36 @@ async fn get_single_tool_version_impl(
     // 2. 获取远程最新版本（npm 工具在本地领先 latest 时会按预发布通道补查，见
     //    fetch_npm_latest_for_tool / npm_prerelease_tags）
     let local = local_version.as_deref();
-    let latest_version = match tool {
-        "claude" => {
-            fetch_npm_latest_for_tool(&client, "@anthropic-ai/claude-code", tool, local).await
-        }
-        "codex" => fetch_npm_latest_for_tool(&client, "@openai/codex", tool, local).await,
-        "gemini" => fetch_npm_latest_for_tool(&client, "@google/gemini-cli", tool, local).await,
-        "grok" => fetch_npm_latest_for_tool(&client, "@xai-official/grok", tool, local).await,
-        "opencode" => {
-            if let Some(version) =
-                fetch_npm_latest_for_tool(&client, "opencode-ai", tool, local).await
-            {
-                Some(version)
-            } else {
-                fetch_github_latest_version(&client, "anomalyco/opencode").await
+    let latest_version = if include_latest {
+        // The shared client carries the current proxy configuration, but it is
+        // intentionally created only for the explicit network check.
+        let client = crate::proxy::http_client::get();
+        match tool {
+            "claude" => {
+                fetch_npm_latest_for_tool(&client, "@anthropic-ai/claude-code", tool, local).await
             }
+            "codex" => fetch_npm_latest_for_tool(&client, "@openai/codex", tool, local).await,
+            "gemini" => fetch_npm_latest_for_tool(&client, "@google/gemini-cli", tool, local).await,
+            "grok" => fetch_npm_latest_for_tool(&client, "@xai-official/grok", tool, local).await,
+            "opencode" => {
+                if let Some(version) =
+                    fetch_npm_latest_for_tool(&client, "opencode-ai", tool, local).await
+                {
+                    Some(version)
+                } else {
+                    fetch_github_latest_version(&client, "anomalyco/opencode").await
+                }
+            }
+            "openclaw" => fetch_npm_latest_for_tool(&client, "openclaw", tool, local).await,
+            "hermes" => fetch_hermes_latest_version(&client, local).await,
+            "pi" => {
+                fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local)
+                    .await
+            }
+            _ => None,
         }
-        "openclaw" => fetch_npm_latest_for_tool(&client, "openclaw", tool, local).await,
-        "hermes" => fetch_hermes_latest_version(&client, local).await,
-        "pi" => {
-            fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local).await
-        }
-        _ => None,
+    } else {
+        None
     };
 
     ToolVersion {
@@ -1751,6 +2486,14 @@ fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
 
     // 常见的安装路径（原生安装优先）
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
+    // AI 辅助安装在用户明确选择目录时使用 npm --prefix。该目录由本模块在
+    // 后置校验成功后登记，和 PATH/常见目录一起参与统一探测，避免“已安装但卡片仍
+    // 显示未安装”。登记文件不包含命令、密钥或任意可执行路径，只保存受支持工具的
+    // 安装根目录。
+    if let Some(raw) = managed_assistant_install_dirs().get(tool) {
+        let root = PathBuf::from(raw);
+        push_unique_path(&mut search_paths, assistant_install_bin_dir(&root));
+    }
     if tool == "grok" {
         let extra_paths = grok_extra_search_paths(&home, std::env::var_os("GROK_BIN_DIR"));
         for path in extra_paths {
@@ -2359,6 +3102,22 @@ fn resolve_path_default(
     let preferred =
         windows_runnable_sibling_for_extensionless_tool(path).unwrap_or_else(|| path.to_path_buf());
     Ok(std::fs::canonicalize(preferred).ok())
+}
+
+/// Resolve a Runtime executable for a GUI-launched process. Windows apps can
+/// inherit a PATH that is missing the user's registry entries after install or
+/// self-update, so use the same merged-PATH resolver as Runtime detection.
+#[cfg(target_os = "windows")]
+pub(super) fn resolve_tool_executable_for_gui(tool: &str) -> std::path::PathBuf {
+    resolve_path_default(tool, None)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| std::path::PathBuf::from(tool))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(super) fn resolve_tool_executable_for_gui(tool: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(tool)
 }
 
 /// 升级预检/冲突诊断的单条子进程探测预算。枚举会对每个工具开一次登录 shell、对每处
@@ -4943,6 +5702,15 @@ mod tests {
         assert_eq!(extract_version("claude 1.0.20"), "1.0.20");
         assert_eq!(extract_version("v2.3.4-beta.1"), "2.3.4-beta.1");
         assert_eq!(extract_version("no version here"), "no version here");
+    }
+
+    #[test]
+    fn runtime_uninstall_only_uses_registered_npm_packages() {
+        assert_eq!(npm_package_for("codex"), Some("@openai/codex"));
+        assert_eq!(npm_package_for("claude"), Some("@anthropic-ai/claude-code"));
+        // Hermes 使用官方安装器；在没有可靠卸载器映射前不能猜路径或执行删除。
+        assert_eq!(npm_package_for("hermes"), None);
+        assert_eq!(npm_package_for("unknown"), None);
     }
 
     #[test]

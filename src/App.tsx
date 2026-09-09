@@ -65,6 +65,11 @@ import {
 import { AppSwitcher } from "@/components/AppSwitcher";
 import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
+import { RuntimeLifecycleCard } from "@/components/runtime/RuntimeLifecycleCard";
+import {
+  CodexAssistantDock,
+  type CodexAssistantInstallIntent,
+} from "@/components/assistant/CodexAssistantDock";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -91,8 +96,9 @@ import UnifiedSkillsPanel, {
 } from "@/components/skills/UnifiedSkillsPanel";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+import { QuickStartOnboarding } from "@/components/onboarding/QuickStartOnboarding";
 import { AgentsPanel } from "@/components/agents/AgentsPanel";
-import { UniversalProviderPanel } from "@/components/universal";
+import { ProviderCenterPanel } from "@/components/provider-center";
 import { McpIcon } from "@/components/BrandIcons";
 import { Button } from "@/components/ui/button";
 import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
@@ -185,6 +191,11 @@ function App() {
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [codexAssistantOpenRequest, setCodexAssistantOpenRequest] = useState(0);
+  const [codexAssistantInstallIntent, setCodexAssistantInstallIntent] =
+    useState<CodexAssistantInstallIntent | null>(null);
+  const [appLifecycleRefreshRequest, setAppLifecycleRefreshRequest] =
+    useState(0);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
@@ -294,8 +305,11 @@ function App() {
   const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
     isProxyRunning: currentAppUsesProxy && isProxyRunning,
   });
+  const { data: codexProviderData } = useProvidersQuery("codex");
   const { data: piCurrentState } = usePiCurrentState(activeApp === "pi");
   const providers = useMemo(() => data?.providers ?? {}, [data]);
+  const codexProviderReady =
+    Object.keys(codexProviderData?.providers ?? {}).length > 0;
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
     activeApp === "openclaw" &&
@@ -1068,7 +1082,7 @@ function App() {
         case "universal":
           return (
             <div className="px-6 pt-4">
-              <UniversalProviderPanel />
+              <ProviderCenterPanel />
             </div>
           );
 
@@ -1100,6 +1114,15 @@ function App() {
                     transition={{ duration: 0.15 }}
                     className="space-y-4"
                   >
+                    <RuntimeLifecycleCard
+                      appId={activeApp}
+                      isConfigured={Object.keys(providers).length > 0}
+                      refreshRequestId={appLifecycleRefreshRequest}
+                      onAiInstall={(intent) => {
+                        setCodexAssistantInstallIntent(intent);
+                        setCodexAssistantOpenRequest((current) => current + 1);
+                      }}
+                    />
                     <ProviderList
                       providers={providers}
                       currentProviderId={currentProviderId}
@@ -1406,6 +1429,10 @@ function App() {
                   activeApp={activeApp}
                   onSwitch={setActiveApp}
                   visibleApps={visibleApps}
+                  onAddCustomAgent={() => {
+                    setCodexAssistantInstallIntent(null);
+                    setCodexAssistantOpenRequest((current) => current + 1);
+                  }}
                 />
               )}
             </div>
@@ -1752,6 +1779,20 @@ function App() {
         {renderContent()}
       </main>
 
+      <CodexAssistantDock
+        providerReady={codexProviderReady}
+        openRequestId={codexAssistantOpenRequest}
+        installIntent={codexAssistantInstallIntent}
+        onInstallationCompleted={() =>
+          setAppLifecycleRefreshRequest((current) => current + 1)
+        }
+        onDismiss={() => setCodexAssistantInstallIntent(null)}
+        onOpenCodexConfiguration={() => {
+          setActiveApp("codex");
+          setCurrentView("providers");
+        }}
+      />
+
       <AddProviderDialog
         open={isAddOpen}
         onOpenChange={setIsAddOpen}
@@ -1822,6 +1863,12 @@ function App() {
       />
 
       <DeepLinkImportDialog />
+      <QuickStartOnboarding
+        onComplete={() => {
+          setActiveApp("codex");
+          setCurrentView("providers");
+        }}
+      />
       <FirstRunNoticeDialog />
     </div>
   );

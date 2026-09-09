@@ -394,6 +394,8 @@ export interface Settings {
   failoverConfirmed?: boolean;
   // User has confirmed the first-run welcome notice
   firstRunNoticeConfirmed?: boolean;
+  // One-time beginner onboarding for the embedded Codex assistant
+  quickStartOnboardingCompleted?: boolean;
   // User has confirmed the auto-sync traffic warning
   autoSyncConfirmed?: boolean;
   // User has confirmed the common config first-run notice

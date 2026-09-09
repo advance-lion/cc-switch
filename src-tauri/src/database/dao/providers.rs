@@ -408,6 +408,21 @@ impl Database {
         Ok(())
     }
 
+    /// Clear the current-provider marker for one application.
+    ///
+    /// This is intentionally separate from `set_current_provider`: recovery
+    /// code must be able to restore the exact pre-transaction state where an
+    /// application had no selected provider, without relying on a fake ID.
+    pub fn clear_current_provider(&self, app_type: &str) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
+            params![app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn update_provider_settings_config(
         &self,
         app_type: &str,

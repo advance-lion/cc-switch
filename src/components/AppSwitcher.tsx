@@ -9,7 +9,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import { Monitor, MoreHorizontal, Terminal } from "lucide-react";
+import { Monitor, MoreHorizontal, Plus, Terminal } from "lucide-react";
 import { APP_IDS } from "@/config/appConfig";
 
 const APP_BADGE_ICON: Partial<
@@ -23,6 +23,8 @@ interface AppSwitcherProps {
   activeApp: AppId;
   onSwitch: (app: AppId) => void;
   visibleApps?: VisibleApps;
+  /** Opens the controlled Codex-assisted custom-Agent flow. */
+  onAddCustomAgent?: () => void;
 }
 
 const STORAGE_KEY = "cc-switch-last-app";
@@ -91,6 +93,7 @@ export function AppSwitcher({
   activeApp,
   onSwitch,
   visibleApps,
+  onAddCustomAgent,
 }: AppSwitcherProps) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement>(null);
@@ -130,7 +133,10 @@ export function AppSwitcher({
         (parseFloat(rootStyle.paddingLeft) || 0) +
         (parseFloat(rootStyle.paddingRight) || 0);
       const available = slot.clientWidth;
-      const widthAll = padding + appCount * itemWidth + (appCount - 1) * gap;
+      // 始终为“更多 / 添加自定义 Agent”保留一个槽位。即使所有内置 Agent 都放得下，
+      // 用户仍然能从同一入口找到添加动作，而不是只能在窗口变窄时才出现。
+      const widthAll =
+        padding + appCount * itemWidth + (appCount - 1) * gap + itemWidth + gap;
       if (widthAll <= available) {
         setVisibleCount(appCount);
         return;
@@ -181,46 +187,69 @@ export function AppSwitcher({
           </button>
         );
       })}
-      {overflowList.length > 0 && (
-        <Popover open={moreOpen} onOpenChange={setMoreOpen}>
-          <PopoverTrigger asChild>
+      <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            title={t("appSwitcher.more")}
+            aria-label={t("appSwitcher.more")}
+            className={cn(
+              "inline-flex items-center px-3 h-8 rounded-md transition-all duration-200",
+              moreOpen
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground hover:bg-background/50",
+            )}
+          >
+            <MoreHorizontal size={20} className="shrink-0" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          side="bottom"
+          align="end"
+          sideOffset={6}
+          className="z-[100] w-56 p-1"
+        >
+          {overflowList.map((app) => (
+            <button
+              key={app}
+              type="button"
+              onClick={() => {
+                setMoreOpen(false);
+                handleSwitch(app);
+              }}
+              className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <AppGlyph app={app} isActive={false} />
+              <span className="truncate">{APP_DISPLAY_NAME[app]}</span>
+            </button>
+          ))}
+          <div
+            className={cn(
+              "mt-1 border-t border-border/70 pt-1",
+              overflowList.length === 0 && "mt-0 border-t-0 pt-0",
+            )}
+          >
             <button
               type="button"
-              title={t("appSwitcher.more")}
-              aria-label={t("appSwitcher.more")}
-              className={cn(
-                "inline-flex items-center px-3 h-8 rounded-md transition-all duration-200",
-                moreOpen
-                  ? "bg-background text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground hover:bg-background/50",
-              )}
+              onClick={() => {
+                setMoreOpen(false);
+                onAddCustomAgent?.();
+              }}
+              className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm font-medium text-primary transition-colors hover:bg-primary/10"
             >
-              <MoreHorizontal size={20} className="shrink-0" />
+              <span className="flex h-5 w-5 items-center justify-center rounded-md border border-primary/30 bg-primary/10">
+                <Plus className="h-3.5 w-3.5" strokeWidth={2.5} />
+              </span>
+              <span className="min-w-0">
+                <span className="block">{t("appSwitcher.addCustomAgent")}</span>
+                <span className="block truncate text-[11px] font-normal text-muted-foreground group-hover:text-primary/70">
+                  {t("appSwitcher.addCustomAgentHint")}
+                </span>
+              </span>
             </button>
-          </PopoverTrigger>
-          <PopoverContent
-            side="bottom"
-            align="end"
-            sideOffset={6}
-            className="z-[100] w-56 p-1"
-          >
-            {overflowList.map((app) => (
-              <button
-                key={app}
-                type="button"
-                onClick={() => {
-                  setMoreOpen(false);
-                  handleSwitch(app);
-                }}
-                className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-              >
-                <AppGlyph app={app} isActive={false} />
-                <span className="truncate">{APP_DISPLAY_NAME[app]}</span>
-              </button>
-            ))}
-          </PopoverContent>
-        </Popover>
-      )}
+          </div>
+        </PopoverContent>
+      </Popover>
     </div>
   );
 }

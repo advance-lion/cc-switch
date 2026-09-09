@@ -406,6 +406,9 @@ pub struct AppSettings {
     /// User has confirmed the first-run welcome notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_run_notice_confirmed: Option<bool>,
+    /// User has completed (or skipped) the one-time beginner quick-start flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_start_onboarding_completed: Option<bool>,
     /// User has confirmed the common config first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_config_confirmed: Option<bool>,
@@ -539,6 +542,7 @@ impl Default for AppSettings {
             unify_codex_migrate_existing: None,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
+            quick_start_onboarding_completed: None,
             common_config_confirmed: None,
             language: None,
             visible_apps: None,

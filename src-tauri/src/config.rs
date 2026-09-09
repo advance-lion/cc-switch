@@ -33,6 +33,24 @@ pub fn get_home_dir() -> PathBuf {
     })
 }
 
+/// Returns true when CC Switch runs with an explicitly isolated home directory.
+///
+/// This is used by the development desktop profile. The profile must never
+/// restore or take over live Agent configuration on the host machine.
+pub fn is_test_sandbox() -> bool {
+    std::env::var("CC_SWITCH_TEST_HOME")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// 编译为独立开发安装包时，仅隔离 CC Switch 自己的数据库和日志。
+///
+/// 这与 `CC_SWITCH_TEST_HOME` 不同：开发安装包仍可在用户明确操作后读取或同步
+/// 本机 Agent 配置，但不会复用正式版的 `~/.cc-switch` 数据库。
+fn is_dev_package() -> bool {
+    option_env!("CC_SWITCH_PACKAGE_FLAVOR") == Some("dev")
+}
+
 /// 获取 Claude Code 配置目录路径
 pub fn get_claude_config_dir() -> PathBuf {
     if let Some(custom) = crate::settings::get_claude_override_dir() {
@@ -203,6 +221,13 @@ pub fn get_claude_settings_path() -> PathBuf {
 pub fn get_app_config_dir() -> PathBuf {
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
+    }
+
+    if is_dev_package() {
+        return dirs::data_local_dir()
+            .unwrap_or_else(get_home_dir)
+            .join("CC Switch Dev")
+            .join("data");
     }
 
     let default_dir = get_home_dir().join(".cc-switch");

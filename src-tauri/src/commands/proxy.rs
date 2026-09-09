@@ -17,11 +17,22 @@ fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, Strin
     Ok(app)
 }
 
+fn reject_test_sandbox_proxy_mutation() -> Result<(), String> {
+    if crate::config::is_test_sandbox() {
+        return Err(
+            "开发沙箱已禁用代理启动、接管和恢复，避免影响本机原版 CC Switch 与 Agent 配置。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
 #[tauri::command]
 pub async fn start_proxy_server(
     state: tauri::State<'_, AppState>,
 ) -> Result<ProxyServerInfo, String> {
+    reject_test_sandbox_proxy_mutation()?;
     state.proxy_service.start().await
 }
 
@@ -47,6 +58,7 @@ pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), 
 /// 停止代理服务器（恢复 Live 配置）
 #[tauri::command]
 pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    reject_test_sandbox_proxy_mutation()?;
     state.proxy_service.stop_with_restore().await
 }
 
@@ -65,6 +77,7 @@ pub async fn set_proxy_takeover_for_app(
     app_type: String,
     enabled: bool,
 ) -> Result<(), String> {
+    reject_test_sandbox_proxy_mutation()?;
     state
         .proxy_service
         .set_takeover_for_app(&app_type, enabled)

@@ -29,6 +29,7 @@ mod pi_config;
 mod prompt;
 mod prompt_files;
 mod provider;
+mod provider_center;
 mod proxy;
 mod services;
 mod session_manager;
@@ -722,9 +723,36 @@ pub fn run() {
             let fresh_install_at_startup =
                 app_state.db.is_providers_empty().unwrap_or(false);
 
-            for app_type in
-                crate::app_config::AppType::all().filter(|t| !t.is_additive_mode())
+            // The quick-start is deliberately only for a genuinely fresh install.
+            // Existing users upgrading to a version that introduces this field must
+            // not be interrupted by a beginner-only full-screen flow.
+            if !fresh_install_at_startup
+                && crate::settings::get_settings()
+                    .quick_start_onboarding_completed
+                    .is_none()
             {
+                let mut settings = crate::settings::get_settings();
+                settings.quick_start_onboarding_completed = Some(true);
+                if let Err(error) = crate::settings::update_settings(settings) {
+                    log::warn!("Failed to mark quick-start as complete for existing install: {error}");
+                }
+            }
+
+            if crate::config::is_test_sandbox() {
+                log::info!(
+                    "开发沙箱：跳过启动期本机配置、MCP 和提示词导入，仅初始化隔离 Provider 数据"
+                );
+                match app_state.db.init_default_official_providers() {
+                    Ok(count) if count > 0 => {
+                        log::info!("✓ 已在开发沙箱初始化 {count} 个官方 Provider");
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("✗ 开发沙箱初始化官方 Provider 失败: {e}"),
+                }
+            } else {
+                for app_type in
+                    crate::app_config::AppType::all().filter(|t| !t.is_additive_mode())
+                {
                 if !crate::services::provider::should_import_default_config_on_startup(
                     &app_state,
                     &app_type,
@@ -755,7 +783,7 @@ pub fn run() {
                         app_type.as_str()
                     ),
                 }
-            }
+                }
 
             match app_state.db.init_default_official_providers() {
                 Ok(count) if count > 0 => {
@@ -977,7 +1005,7 @@ pub fn run() {
             }
 
             // 4. 导入提示词文件（表空时触发）
-            if app_state.db.is_prompts_table_empty().unwrap_or(false) {
+                if app_state.db.is_prompts_table_empty().unwrap_or(false) {
                 log::info!("Prompts table empty, importing from live configurations...");
 
                 for app in [
@@ -1000,6 +1028,7 @@ pub fn run() {
                         Ok(_) => log::debug!("○ No prompt file found for {}", app.as_str()),
                         Err(e) => log::warn!("✗ Failed to import prompt for {}: {e}", app.as_str()),
                     }
+                }
                 }
             }
 
@@ -1129,8 +1158,18 @@ pub fn run() {
                 app_state.db.clone(),
                 app.handle().clone(),
             );
+            match provider_center::reconcile_interrupted_transactions(&app_state) {
+                Ok(0) => {}
+                Ok(count) => log::warn!(
+                    "Provider Center marked {count} interrupted transaction(s) as requiring recovery"
+                ),
+                Err(error) => log::error!(
+                    "Failed to reconcile interrupted Provider Center transactions: {error}"
+                ),
+            }
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
+            app.manage(provider_center::ProviderCenterOperationState::default());
 
             // 初始化 SkillService
             let skill_service = SkillService::new();
@@ -1205,6 +1244,13 @@ pub fn run() {
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
+
+                if crate::config::is_test_sandbox() {
+                    log::info!(
+                        "开发沙箱：跳过 Live 配置恢复、自动导入与代理自动恢复，避免访问主机 Agent 配置"
+                    );
+                    return;
+                }
 
                 // 检查是否有 Live 备份（表示上次异常退出时可能处于接管状态）
                 let has_backups = match state.db.has_any_live_backup().await {
@@ -1619,8 +1665,22 @@ pub fn run() {
             commands::delete_sessions,
             commands::launch_session_terminal,
             commands::get_tool_versions,
+            commands::check_tool_updates,
+            commands::get_tool_lifecycle_capabilities,
+            commands::get_desktop_app_status,
+            commands::check_desktop_app_updates,
+            commands::run_desktop_app_lifecycle_action,
+            commands::launch_desktop_app,
+            commands::get_codex_desktop_status,
             commands::run_tool_lifecycle_action,
             commands::probe_tool_installations,
+            commands::launch_tool_terminal,
+            commands::launch_codex_desktop,
+            commands::uninstall_tool_runtime,
+            // Guarded Codex CLI assistant automation
+            commands::start_codex_assistant_plan,
+            commands::execute_codex_assistant_plan,
+            commands::cancel_codex_assistant_run,
             // Provider terminal
             commands::open_provider_terminal,
             // Universal Provider management
@@ -1629,6 +1689,20 @@ pub fn run() {
             commands::upsert_universal_provider,
             commands::delete_universal_provider,
             commands::sync_universal_provider,
+            // Provider Center (incremental shared definitions + explicit bindings)
+            commands::get_provider_center,
+            commands::get_provider_center_model_catalog,
+            commands::save_provider_center_definition,
+            commands::delete_provider_center_definition,
+            commands::duplicate_provider_center_definition,
+            commands::discover_provider_center_models,
+            commands::scan_provider_center_imports,
+            commands::import_provider_center_candidate,
+            commands::apply_provider_center_bindings,
+            commands::preview_provider_center_apply,
+            commands::apply_provider_center_transaction,
+            commands::restore_provider_center_transaction,
+            commands::set_provider_center_binding_override,
             // OpenCode specific
             commands::import_opencode_providers_from_live,
             commands::get_opencode_live_provider_ids,
@@ -1883,6 +1957,15 @@ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
 
+        if crate::config::is_test_sandbox() {
+            if proxy_service.is_running().await {
+                if let Err(e) = proxy_service.stop().await {
+                    log::error!("开发沙箱退出时停止本地代理失败: {e}");
+                }
+            }
+            return;
+        }
+
         // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。
         let has_backups = match state.db.has_any_live_backup().await {
             Ok(v) => v,
@@ -1961,6 +2044,11 @@ async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static 
 }
 
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
+    if crate::config::is_test_sandbox() {
+        log::info!("开发沙箱：跳过代理状态自动恢复");
+        return;
+    }
+
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
     let apps_to_restore = enabled_proxy_apps_on_startup(&state.db).await;
 

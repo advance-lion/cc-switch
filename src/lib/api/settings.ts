@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Settings,
   WebDavSyncSettings,
@@ -28,6 +29,105 @@ export interface CodexUnifyHistoryRestoreResult {
 
 export interface WebDavSyncResult {
   status: string;
+}
+
+export interface CodexAssistantPlanStep {
+  label: string;
+  description: string;
+  requiresNetwork: boolean;
+}
+
+export interface CodexAssistantPlan {
+  title: string;
+  summary: string;
+  sources: string[];
+  steps: CodexAssistantPlanStep[];
+  limitations: string[];
+  executable: boolean;
+  install?: CodexAssistantInstallSummary | null;
+}
+
+export interface CodexAssistantInstallSummary {
+  tool: string;
+  displayName: string;
+  version: string;
+  installLocation: string;
+  usesDefaultLocation: boolean;
+  officialSource: string;
+}
+
+export interface CodexAssistantEvent {
+  runId: string;
+  kind: "started" | "log" | "stderr" | "plan" | "finished";
+  message?: string | null;
+  planId?: string | null;
+  plan?: CodexAssistantPlan | null;
+  success?: boolean | null;
+}
+
+export interface CodexDesktopStatus {
+  installed: boolean;
+  version: string | null;
+  path: string | null;
+}
+
+export type DesktopAppId = "codex-desktop" | "claude-desktop";
+export type DesktopLifecycleAction = "install" | "update" | "uninstall";
+
+export interface DesktopAppStatus {
+  id: DesktopAppId;
+  display_name: string;
+  installed: boolean;
+  version: string | null;
+  latest_version: string | null;
+  path: string | null;
+  package_identity: string | null;
+  installation_source:
+    | "microsoft_store"
+    | "official_appx"
+    | "application_bundle"
+    | "not_installed"
+    | "unsupported_platform"
+    | string;
+  can_install: boolean;
+  can_update: boolean;
+  can_uninstall: boolean;
+  can_launch: boolean;
+  reason: string | null;
+}
+
+/**
+ * 后端按实际安装来源给出的操作能力。前端不得从“已检测到命令行”推断可以卸载：
+ * 官方安装器、商店和手动安装的文件均可能出现在 PATH 中。
+ */
+export interface ToolLifecycleCapabilities {
+  name: string;
+  can_install: boolean;
+  can_update: boolean;
+  can_uninstall: boolean;
+  can_launch: boolean;
+  installation_source: string;
+  reason: string | null;
+}
+
+const WEB_ASSISTANT_BRIDGE_BASE = "/__cc-switch-dev/codex-assistant";
+
+export const isCodexAssistantWebBridgeActive = () =>
+  import.meta.env.DEV && !isTauri();
+
+async function webAssistantRequest<T>(
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<T> {
+  const response = await fetch(`${WEB_ASSISTANT_BRIDGE_BASE}${path}`, {
+    method: body ? "POST" : "GET",
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = (await response.json()) as T & { error?: string };
+  if (!response.ok)
+    throw new Error(payload.error || "Web assistant bridge failed");
+  return payload;
 }
 
 export const settingsApi = {
@@ -75,6 +175,122 @@ export const settingsApi = {
 
   async pickDirectory(defaultPath?: string): Promise<string | null> {
     return await invoke("pick_directory", { defaultPath });
+  },
+
+  async startCodexAssistantPlan(
+    request: string,
+    targetDir: string,
+    options?: {
+      tool?: string;
+      requestedVersion?: string;
+      customInstallLocation?: boolean;
+    },
+  ): Promise<string> {
+    const body = {
+      request,
+      targetDir,
+      tool: options?.tool,
+      requestedVersion: options?.requestedVersion,
+      customInstallLocation: options?.customInstallLocation,
+    };
+    if (isCodexAssistantWebBridgeActive()) {
+      const result = await webAssistantRequest<{ runId: string }>(
+        "/plan",
+        body,
+      );
+      return result.runId;
+    }
+    return await invoke("start_codex_assistant_plan", body);
+  },
+
+  async executeCodexAssistantPlan(planId: string): Promise<string> {
+    if (isCodexAssistantWebBridgeActive()) {
+      const result = await webAssistantRequest<{ runId: string }>("/execute", {
+        planId,
+      });
+      return result.runId;
+    }
+    return await invoke("execute_codex_assistant_plan", { planId });
+  },
+
+  async cancelCodexAssistantRun(runId: string): Promise<boolean> {
+    if (isCodexAssistantWebBridgeActive()) {
+      await webAssistantRequest<{ cancelled: boolean }>("/cancel", { runId });
+      return true;
+    }
+    return await invoke("cancel_codex_assistant_run", { runId });
+  },
+
+  async getCodexDesktopStatus(): Promise<CodexDesktopStatus> {
+    if (isCodexAssistantWebBridgeActive()) {
+      return await webAssistantRequest<CodexDesktopStatus>("/desktop-status");
+    }
+    return await invoke("get_codex_desktop_status");
+  },
+
+  async launchCodexDesktop(): Promise<void> {
+    if (isCodexAssistantWebBridgeActive()) {
+      await webAssistantRequest<{ launched: boolean }>("/launch-desktop", {});
+      return;
+    }
+    await invoke("launch_codex_desktop");
+  },
+
+  async getDesktopAppStatus(app: DesktopAppId): Promise<DesktopAppStatus> {
+    if (isCodexAssistantWebBridgeActive()) {
+      return await webAssistantRequest<DesktopAppStatus>(
+        `/desktop-app-status?app=${encodeURIComponent(app)}`,
+      );
+    }
+    return await invoke("get_desktop_app_status", { app });
+  },
+
+  async checkDesktopAppUpdates(app: DesktopAppId): Promise<DesktopAppStatus> {
+    if (isCodexAssistantWebBridgeActive()) {
+      return await webAssistantRequest<DesktopAppStatus>(
+        "/desktop-app-check-updates",
+        { app },
+      );
+    }
+    return await invoke("check_desktop_app_updates", { app });
+  },
+
+  async runDesktopAppLifecycleAction(
+    app: DesktopAppId,
+    action: DesktopLifecycleAction,
+  ): Promise<DesktopAppStatus> {
+    if (isCodexAssistantWebBridgeActive()) {
+      return await webAssistantRequest<DesktopAppStatus>(
+        "/desktop-app-action",
+        { app, action },
+      );
+    }
+    return await invoke("run_desktop_app_lifecycle_action", { app, action });
+  },
+
+  async launchDesktopApp(app: DesktopAppId): Promise<void> {
+    if (isCodexAssistantWebBridgeActive()) {
+      await webAssistantRequest<{ launched: boolean }>(
+        "/desktop-app-launch",
+        { app },
+      );
+      return;
+    }
+    await invoke("launch_desktop_app", { app });
+  },
+
+  async onCodexAssistantEvent(
+    handler: (event: CodexAssistantEvent) => void,
+  ): Promise<UnlistenFn> {
+    if (isCodexAssistantWebBridgeActive()) {
+      const stream = new EventSource(`${WEB_ASSISTANT_BRIDGE_BASE}/events`);
+      stream.onmessage = (event) =>
+        handler(JSON.parse(event.data) as CodexAssistantEvent);
+      return () => stream.close();
+    }
+    return await listen("codex-assistant-event", (event) => {
+      handler(event.payload as CodexAssistantEvent);
+    });
   },
 
   async selectConfigDirectory(defaultPath?: string): Promise<string | null> {
@@ -250,7 +466,67 @@ export const settingsApi = {
       wsl_distro: string | null;
     }>
   > {
+    if (isCodexAssistantWebBridgeActive() && tools?.length === 1) {
+      const tool = tools[0];
+      const status =
+        tool === "codex"
+          ? await webAssistantRequest<{
+              available: boolean;
+              version: string | null;
+            }>("/status")
+          : { available: false, version: null };
+      return [
+        {
+          name: tool,
+          version: status.available ? status.version : null,
+          latest_version: null,
+          error: status.available ? null : "Codex CLI unavailable",
+          installed_but_broken: false,
+          env_type: "windows",
+          wsl_distro: null,
+        },
+      ];
+    }
     return await invoke("get_tool_versions", { tools, wslShellByTool });
+  },
+
+  async getToolLifecycleCapabilities(
+    tools: string[],
+  ): Promise<ToolLifecycleCapabilities[]> {
+    // 浏览器预览没有 Tauri 后端；保持界面可演示，但不把它伪装成一次真实的
+    // 安装来源验证。桌面端始终走 Rust 的受控探测。
+    if (isCodexAssistantWebBridgeActive()) {
+      return tools.map((name) => ({
+        name,
+        can_install: true,
+        can_update: true,
+        can_uninstall: false,
+        can_launch: true,
+        installation_source: "web_preview",
+        reason: "浏览器预览无法验证本机安装来源。",
+      }));
+    }
+    return await invoke("get_tool_lifecycle_capabilities", { tools });
+  },
+
+  /** 只有用户明确点“检查更新”时才访问远程版本源。 */
+  async checkToolUpdates(
+    tools: string[],
+  ): Promise<
+    Array<{
+      name: string;
+      version: string | null;
+      latest_version: string | null;
+      error: string | null;
+      installed_but_broken: boolean;
+      env_type: "windows" | "wsl" | "macos" | "linux" | "unknown";
+      wsl_distro: string | null;
+    }>
+  > {
+    if (isCodexAssistantWebBridgeActive()) {
+      return await settingsApi.getToolVersions(tools);
+    }
+    return await invoke("check_tool_updates", { tools });
   },
 
   async runToolLifecycleAction(
@@ -266,6 +542,16 @@ export const settingsApi = {
       action,
       wslShellByTool,
     });
+  },
+
+  /** 在用户首选终端中启动已登记 Runtime 的 CLI。后端只接受受支持的工具名。 */
+  async launchToolTerminal(tool: string): Promise<void> {
+    await invoke("launch_tool_terminal", { tool });
+  },
+
+  /** 卸载有明确 npm 包映射的 Runtime；不会变更 Provider 或账号配置。 */
+  async uninstallToolRuntime(tool: string): Promise<void> {
+    await invoke("uninstall_tool_runtime", { tool });
   },
 
   /** 探测各工具安装分布：枚举所有安装、标记冲突、生成锚定升级命令。
