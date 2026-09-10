@@ -27,7 +27,7 @@ const BINDINGS_KEY: &str = "provider_center_bindings_v1";
 const SECRETS_KEY: &str = "provider_center_dpapi_secrets_v1";
 const TRANSACTIONS_KEY: &str = "provider_center_transactions_v1";
 const SNAPSHOTS_KEY: &str = "provider_center_transaction_snapshots_v1";
-const SQLITE_MIGRATED_KEY: &str = "provider_center_sqlite_migrated_v1";
+const SQLITE_MIGRATED_KEY: &str = "provider_center_sqlite_migrated_v2";
 
 fn default_true() -> bool {
     true
@@ -44,6 +44,10 @@ pub struct ProviderSource {
     pub source_ref: String,
     #[serde(default)]
     pub imported_at: i64,
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
+    #[serde(default)]
+    pub last_observed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +274,104 @@ type Bindings = Vec<ProviderBinding>;
 type EncryptedSecrets = HashMap<String, String>;
 type EncryptedSnapshots = HashMap<String, String>;
 
+fn legacy_universal_source_ref(universal_id: &str) -> String {
+    format!("universal:{universal_id}")
+}
+
+fn migrated_legacy_universal_id(
+    definitions: &[ProviderDefinition],
+    universal_id: &str,
+) -> Option<String> {
+    let source_ref = legacy_universal_source_ref(universal_id);
+    definitions.iter().find_map(|definition| {
+        definition
+            .source
+            .as_ref()
+            .filter(|source| source.source_app == "cc-switch" && source.source_ref == source_ref)
+            .map(|_| definition.id.clone())
+    })
+}
+
+fn convert_legacy_universal(
+    universal: &UniversalProvider,
+    id: String,
+    timestamp: i64,
+) -> (ProviderDefinition, Vec<ProviderBinding>) {
+    let mut models = Vec::new();
+    if let Some(config) = &universal.models.claude {
+        models.extend(
+            [
+                config.model.clone(),
+                config.haiku_model.clone(),
+                config.sonnet_model.clone(),
+                config.opus_model.clone(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    if let Some(config) = &universal.models.codex {
+        models.extend(config.model.clone());
+    }
+    if let Some(config) = &universal.models.gemini {
+        models.extend(config.model.clone());
+    }
+    models.retain(|model| !model.trim().is_empty());
+    models.sort();
+    models.dedup();
+
+    let definition = ProviderDefinition {
+        id: id.clone(),
+        name: universal.name.clone(),
+        protocol: match universal.provider_type.as_str() {
+            "openai-responses" | "openai-chat" | "anthropic" | "gemini" | "ollama" => {
+                universal.provider_type.clone()
+            }
+            _ => "openai-chat".to_string(),
+        },
+        base_url: universal.base_url.trim_end_matches('/').to_string(),
+        models,
+        discovered_models: Vec::new(),
+        notes: universal.notes.clone().unwrap_or_default(),
+        enabled: true,
+        revision: 1,
+        source: Some(ProviderSource {
+            source_app: "cc-switch".to_string(),
+            source_ref: legacy_universal_source_ref(&universal.id),
+            imported_at: timestamp,
+            source_fingerprint: None,
+            last_observed_at: None,
+        }),
+        credential_configured: !universal.api_key.trim().is_empty(),
+        credential_hint: secret_hint(&universal.api_key),
+        last_discovery_at: None,
+        last_discovery_error: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+    };
+    let bindings = [
+        ("claude", universal.apps.claude),
+        ("codex", universal.apps.codex),
+        ("gemini", universal.apps.gemini),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(app_type, _)| ProviderBinding {
+        provider_id: id.clone(),
+        app_type: app_type.to_string(),
+        status: "pending".to_string(),
+        enabled: true,
+        override_enabled: false,
+        applied_revision: None,
+        expected_fingerprint: None,
+        last_error: None,
+        last_transaction_id: None,
+        updated_at: timestamp,
+    })
+    .collect();
+    (definition, bindings)
+}
+
 fn ensure_sqlite_migrated(state: &AppState) -> Result<(), AppError> {
     if state.db.get_bool_flag(SQLITE_MIGRATED_KEY)? {
         return Ok(());
@@ -278,16 +380,61 @@ fn ensure_sqlite_migrated(state: &AppState) -> Result<(), AppError> {
     // Only seed an empty v19 store. This makes the migration idempotent even
     // if the process exits after committing SQLite but before writing the
     // marker. The legacy settings remain as a read-only rollback artifact.
-    if !state.db.provider_center_has_definitions()? {
-        let definitions: Definitions = read_json(state, DEFINITIONS_KEY)?;
-        let bindings: Bindings = read_json(state, BINDINGS_KEY)?;
-        state
-            .db
-            .save_provider_center_core(&definitions, &bindings)?;
+    let had_sqlite_definitions = state.db.provider_center_has_definitions()?;
+    let mut definitions = if had_sqlite_definitions {
+        state.db.load_provider_center_definitions()?
+    } else {
+        read_json(state, DEFINITIONS_KEY)?
+    };
+    let mut bindings = if had_sqlite_definitions {
+        state.db.load_provider_center_bindings()?
+    } else {
+        read_json(state, BINDINGS_KEY)?
+    };
+    let legacy_universal = state.db.get_all_universal_providers()?;
+    let mut migrated_universal_ids = Vec::new();
+    for universal in legacy_universal.values() {
+        if let Some(id) = migrated_legacy_universal_id(&definitions, &universal.id) {
+            // A previous run may have committed v19 and then stopped before
+            // deleting the plaintext legacy row. Re-store the secret and
+            // finish cleanup without creating a second definition.
+            if !universal.api_key.trim().is_empty() {
+                save_secret(state, &id, universal.api_key.trim())?;
+            }
+            migrated_universal_ids.push(universal.id.clone());
+            continue;
+        }
+        let mut id = universal.id.clone();
+        if definitions.iter().any(|definition| definition.id == id) {
+            id = format!("legacy-universal-{}", universal.id);
+        }
+        if definitions.iter().any(|definition| definition.id == id) {
+            let suffix = Uuid::new_v4().simple().to_string();
+            id = format!("legacy-universal-{}-{}", universal.id, &suffix[..8]);
+        }
+        if !universal.api_key.trim().is_empty() {
+            save_secret(state, &id, universal.api_key.trim())?;
+        }
+        let timestamp = universal.created_at.unwrap_or_else(now);
+        let (definition, migrated_bindings) = convert_legacy_universal(universal, id, timestamp);
+        definitions.push(definition);
+        bindings.extend(migrated_bindings);
+        migrated_universal_ids.push(universal.id.clone());
+    }
+
+    state
+        .db
+        .save_provider_center_core(&definitions, &bindings)?;
+    if !had_sqlite_definitions {
         let transactions: Vec<ProviderApplyTransaction> = read_json(state, TRANSACTIONS_KEY)?;
         for transaction in &transactions {
             state.db.upsert_provider_center_transaction(transaction)?;
         }
+    }
+    // Remove the legacy plaintext definitions only after the v19 rows and
+    // secure-store entries have committed successfully.
+    for id in migrated_universal_ids {
+        state.db.delete_universal_provider(&id)?;
     }
     state.db.set_setting(SQLITE_MIGRATED_KEY, "true")
 }
@@ -768,6 +915,30 @@ pub fn save_definition(
             "请填写模型服务名称和请求地址".to_string(),
         ));
     }
+    let protocol = if input.protocol.trim().is_empty() {
+        "openai-chat".to_string()
+    } else {
+        input.protocol.trim().to_string()
+    };
+    if !matches!(
+        protocol.as_str(),
+        "openai-responses" | "openai-chat" | "anthropic" | "gemini" | "ollama"
+    ) {
+        return Err(AppError::Message("不支持的接口协议".to_string()));
+    }
+    let parsed_url = url::Url::parse(input.base_url.trim())
+        .map_err(|_| AppError::Message("请求地址不是有效的 URL".to_string()))?;
+    if !matches!(parsed_url.scheme(), "http" | "https")
+        || parsed_url.host_str().is_none()
+        || !parsed_url.username().is_empty()
+        || parsed_url.password().is_some()
+        || parsed_url.query().is_some()
+        || parsed_url.fragment().is_some()
+    {
+        return Err(AppError::Message(
+            "请求地址必须是无账号、查询参数和片段的 HTTP(S) 地址".to_string(),
+        ));
+    }
     let mut definitions = load_definitions(state)?;
     let mut bindings = load_bindings(state)?;
     let timestamp = now();
@@ -819,11 +990,7 @@ pub fn save_definition(
     let definition = ProviderDefinition {
         id: id.clone(),
         name: input.name.trim().to_string(),
-        protocol: if input.protocol.trim().is_empty() {
-            "openai-chat".to_string()
-        } else {
-            input.protocol.trim().to_string()
-        },
+        protocol,
         base_url: input.base_url.trim().trim_end_matches('/').to_string(),
         models: input
             .models
@@ -907,6 +1074,9 @@ fn models_from_settings(settings: &serde_json::Value) -> Vec<String> {
     let mut models = Vec::new();
     for pointer in [
         "/env/ANTHROPIC_MODEL",
+        "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
         "/env/GEMINI_MODEL",
         "/model",
         "/options/model",
@@ -920,6 +1090,45 @@ fn models_from_settings(settings: &serde_json::Value) -> Vec<String> {
             }
         }
     }
+    if let Some(value) = settings.get("models") {
+        match value {
+            serde_json::Value::Object(items) => models.extend(items.keys().cloned()),
+            serde_json::Value::Array(items) => models.extend(items.iter().filter_map(|item| {
+                item.get("id")
+                    .or_else(|| item.get("model"))
+                    .or_else(|| item.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })),
+            _ => {}
+        }
+    }
+    if let Some(config) = settings.get("config").and_then(serde_json::Value::as_str) {
+        if let Ok(value) = toml::from_str::<toml::Value>(config) {
+            fn collect(value: &toml::Value, models: &mut Vec<String>) {
+                match value {
+                    toml::Value::Table(table) => {
+                        for (key, value) in table {
+                            if matches!(key.as_str(), "model" | "default_model") {
+                                if let Some(model) = value.as_str() {
+                                    models.push(model.to_string());
+                                }
+                            } else {
+                                collect(value, models);
+                            }
+                        }
+                    }
+                    toml::Value::Array(items) => {
+                        for item in items {
+                            collect(item, models);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            collect(&value, &mut models);
+        }
+    }
     models.sort();
     models.dedup();
     models
@@ -931,6 +1140,68 @@ fn protocol_for(app: &AppType) -> &'static str {
         AppType::Gemini => "gemini",
         _ => "openai-chat",
     }
+}
+
+fn protocol_from_provider(app: &AppType, provider: &Provider) -> String {
+    let api = provider
+        .settings_config
+        .get("api")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|models| models.first())
+                .and_then(|model| model.get("api"))
+                .and_then(serde_json::Value::as_str)
+        });
+    if let Some(api) = api {
+        return match api {
+            "openai-responses" => "openai-responses",
+            "anthropic" | "anthropic-messages" => "anthropic",
+            "gemini" | "google-generative-ai" => "gemini",
+            _ => "openai-chat",
+        }
+        .to_string();
+    }
+    if matches!(app, AppType::Codex) {
+        if let Some(config) = provider
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|config| toml::from_str::<toml::Value>(config).ok())
+        {
+            let provider_name = config.get("model_provider").and_then(toml::Value::as_str);
+            let wire_api = provider_name
+                .and_then(|name| config.get("model_providers")?.get(name))
+                .and_then(|value| value.get("wire_api"))
+                .and_then(toml::Value::as_str);
+            return if wire_api == Some("chat") {
+                "openai-chat"
+            } else {
+                "openai-responses"
+            }
+            .to_string();
+        }
+    }
+    if matches!(app, AppType::OpenCode) {
+        let npm = provider
+            .settings_config
+            .get("npm")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if npm.contains("anthropic") {
+            return "anthropic".to_string();
+        }
+        if npm.contains("google") || npm.contains("gemini") {
+            return "gemini".to_string();
+        }
+        if npm.contains("ollama") {
+            return "ollama".to_string();
+        }
+    }
+    protocol_for(app).to_string()
 }
 
 fn candidate_from_provider(
@@ -948,7 +1219,7 @@ fn candidate_from_provider(
         source_ref,
         source_app: app.as_str().to_string(),
         name: provider.name.clone(),
-        protocol: protocol_for(app).to_string(),
+        protocol: protocol_from_provider(app, provider),
         base_url,
         models: models_from_settings(&provider.settings_config),
         credential_configured: !key.trim().is_empty(),
@@ -956,9 +1227,15 @@ fn candidate_from_provider(
     })
 }
 
-pub fn scan_imports(state: &AppState) -> Result<Vec<ImportCandidate>, AppError> {
+fn scan_imports_for_apps(
+    state: &AppState,
+    requested_apps: &HashSet<String>,
+) -> Result<Vec<ImportCandidate>, AppError> {
     let mut candidates = Vec::new();
     for app in AppType::all() {
+        if !requested_apps.is_empty() && !requested_apps.contains(app.as_str()) {
+            continue;
+        }
         // 一个应用的损坏配置不能遮蔽其他应用的可导入结果。
         if let Ok(providers) = ProviderService::list(state, app.clone()) {
             for provider in providers.values() {
@@ -990,10 +1267,12 @@ pub fn scan_imports(state: &AppState) -> Result<Vec<ImportCandidate>, AppError> 
     Ok(candidates)
 }
 
+pub fn scan_imports(state: &AppState) -> Result<Vec<ImportCandidate>, AppError> {
+    scan_imports_for_apps(state, &HashSet::new())
+}
+
 fn import_candidate_fingerprint(provider: &Provider) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(provider)
-        .map_err(|error| AppError::Message(format!("无法校验来源配置: {error}")))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    provider_fingerprint(provider)
 }
 
 fn cleanup_expired_import_sessions(state: &AppState) -> Result<(), AppError> {
@@ -1012,6 +1291,7 @@ pub fn start_import_session(
         .into_iter()
         .filter(|app| AppType::from_str(app).is_ok())
         .collect::<Vec<_>>();
+    let requested_set = requested.iter().cloned().collect::<HashSet<_>>();
     let session_id = Uuid::new_v4().to_string();
     let created_at = now();
     let expires_at = created_at + 30 * 60 * 1_000;
@@ -1019,10 +1299,7 @@ pub fn start_import_session(
     let mut candidates = Vec::new();
     let mut records = Vec::new();
 
-    for mut candidate in scan_imports(state)? {
-        if !requested.is_empty() && !requested.contains(&candidate.source_app) {
-            continue;
-        }
+    for mut candidate in scan_imports_for_apps(state, &requested_set)? {
         let candidate_id = Uuid::new_v4().to_string();
         let source = match source_provider(state, &candidate.source_ref) {
             Ok((_, provider)) => provider,
@@ -1158,7 +1435,10 @@ pub fn commit_import_session_candidate(
     let result = save_definition(
         state,
         SaveProviderDefinitionInput {
-            id: None,
+            // The import candidate is already a unique, persisted identity.
+            // Reusing it makes a retry idempotent if the process stops after
+            // saving the definition but before completing session cleanup.
+            id: Some(format!("import-{candidate_id}")),
             name: candidate.name,
             protocol: candidate.protocol,
             base_url: candidate.base_url,
@@ -1171,35 +1451,47 @@ pub fn commit_import_session_candidate(
                 source_app: candidate.source_app,
                 source_ref: candidate.source_ref,
                 imported_at: now(),
+                source_fingerprint: Some(record.fingerprint.clone()),
+                last_observed_at: Some(now()),
             }),
-            api_key,
+            api_key: api_key.clone(),
             app_types,
         },
     )?;
     if let Some(reference) = record.temporary_secret_ref.as_deref() {
         remove_secret(state, reference)?;
     }
-    state
+    if let Err(error) = state
         .db
-        .complete_provider_import_candidate(session_id, candidate_id, now())?;
+        .complete_provider_import_candidate(session_id, candidate_id, now())
+    {
+        // Keep the persisted session retryable if its database cleanup fails.
+        if let (Some(reference), Some(secret)) =
+            (record.temporary_secret_ref.as_deref(), api_key.as_deref())
+        {
+            let _ = save_secret(state, reference, secret);
+        }
+        return Err(error);
+    }
     Ok(result)
 }
 
 fn source_provider(state: &AppState, source_ref: &str) -> Result<(AppType, Provider), AppError> {
-    let parts: Vec<&str> = source_ref.split(':').collect();
-    match parts.as_slice() {
-        ["saved", app, id] => {
+    if let Some(rest) = source_ref.strip_prefix("saved:") {
+        if let Some((app, id)) = rest.split_once(':') {
             let app = AppType::from_str(app)?;
             let provider = state
                 .db
                 .get_provider_by_id(id, app.as_str())?
                 .ok_or_else(|| AppError::Message("来源配置已不存在".to_string()))?;
-            Ok((app, provider))
+            return Ok((app, provider));
         }
-        ["live", app] => {
+    }
+    if let Some(app) = source_ref.strip_prefix("live:") {
+        if !app.contains(':') {
             let app = AppType::from_str(app)?;
             let settings = ProviderService::read_live_settings(app.clone())?;
-            Ok((
+            return Ok((
                 app.clone(),
                 Provider::with_id(
                     "live".to_string(),
@@ -1207,10 +1499,10 @@ fn source_provider(state: &AppState, source_ref: &str) -> Result<(AppType, Provi
                     settings,
                     None,
                 ),
-            ))
+            ));
         }
-        _ => Err(AppError::Message("无效的导入来源".to_string())),
     }
+    Err(AppError::Message("无效的导入来源".to_string()))
 }
 
 pub fn import_candidate(
@@ -1225,12 +1517,14 @@ pub fn import_candidate(
             "来源配置没有可导入的请求地址".to_string(),
         ));
     }
+    let source_fingerprint = import_candidate_fingerprint(&provider)?;
+    let source_protocol = protocol_from_provider(&source_app, &provider);
     save_definition(
         state,
         SaveProviderDefinitionInput {
             id: None,
             name: provider.name,
-            protocol: protocol_for(&source_app).to_string(),
+            protocol: source_protocol,
             base_url,
             models: models_from_settings(&provider.settings_config),
             api_key: (!api_key.trim().is_empty()).then_some(api_key),
@@ -1243,6 +1537,8 @@ pub fn import_candidate(
                 source_app: source_app.as_str().to_string(),
                 source_ref: source_ref.to_string(),
                 imported_at: now(),
+                source_fingerprint: Some(source_fingerprint),
+                last_observed_at: Some(now()),
             }),
         },
     )
@@ -1253,8 +1549,8 @@ pub fn delete_definition(state: &AppState, provider_id: &str) -> Result<(), AppE
     if !definitions.iter().any(|item| item.id == provider_id) {
         return Err(AppError::Message("模型服务不存在".to_string()));
     }
-    remove_secret(state, provider_id)?;
-    state.db.delete_provider_center_definition(provider_id)
+    state.db.delete_provider_center_definition(provider_id)?;
+    remove_secret(state, provider_id)
 }
 
 pub fn duplicate_definition(
@@ -1356,10 +1652,19 @@ pub async fn discover_models(
         return Err(AppError::Message("请先配置 API Key".to_string()));
     }
     let endpoint = match definition.protocol.as_str() {
-        "anthropic" => model_endpoint(&definition.base_url, "/v1/models"),
-        "gemini" => model_endpoint(&definition.base_url, "/models"),
+        "anthropic" | "openai-chat" | "openai-responses" => {
+            model_endpoint(&definition.base_url, "/v1/models")
+        }
+        "gemini" => {
+            let base = definition.base_url.trim().trim_end_matches('/');
+            if base.ends_with("/v1") || base.ends_with("/v1beta") {
+                format!("{base}/models")
+            } else {
+                format!("{base}/v1beta/models")
+            }
+        }
         "ollama" => model_endpoint(&definition.base_url, "/api/tags"),
-        _ => model_endpoint(&definition.base_url, "/models"),
+        _ => unreachable!("protocol validated when the definition is saved"),
     };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1439,11 +1744,50 @@ fn toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn openai_compatible_base_url(definition: &ProviderDefinition) -> String {
+    let base = definition.base_url.trim_end_matches('/');
+    if definition.protocol == "ollama" && !base.ends_with("/v1") {
+        format!("{base}/v1")
+    } else {
+        base.to_string()
+    }
+}
+
+fn native_api_name(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "openai-chat" | "ollama" => Some("openai-completions"),
+        "openai-responses" => Some("openai-responses"),
+        "anthropic" => Some("anthropic-messages"),
+        "gemini" => Some("google-generative-ai"),
+        _ => None,
+    }
+}
+
+fn validate_projection_protocol(app: &str, protocol: &str) -> Result<(), AppError> {
+    let supported = match app {
+        "claude" | "claude-desktop" => protocol == "anthropic",
+        "codex" => protocol == "openai-responses",
+        "gemini" => protocol == "gemini",
+        "grokbuild" => protocol == "openai-chat",
+        "opencode" | "hermes" => matches!(protocol, "openai-chat" | "ollama"),
+        "openclaw" | "pi" => native_api_name(protocol).is_some(),
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "{app} 当前不能直接使用 {protocol} 协议；请保留单应用配置或选择兼容协议"
+        )))
+    }
+}
+
 fn projection(
     definition: &ProviderDefinition,
     secret: String,
     app: &str,
 ) -> Result<Provider, AppError> {
+    validate_projection_protocol(app, &definition.protocol)?;
     let mut universal = UniversalProvider::new(
         format!("pc-{}", definition.id),
         definition.name.clone(),
@@ -1496,30 +1840,61 @@ fn projection(
         }
         "opencode" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
             "npm": "@ai-sdk/openai-compatible", "name": definition.name,
-            "options": { "baseURL": definition.base_url, "apiKey": secret },
+            "options": { "baseURL": openai_compatible_base_url(definition), "apiKey": secret },
             "models": models.iter().map(|item| (item.clone(), json!({ "name": item }))).collect::<serde_json::Map<String, serde_json::Value>>()
         }), None)),
         "openclaw" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "baseUrl": definition.base_url, "apiKey": secret, "api": "openai-completions",
+            "baseUrl": openai_compatible_base_url(definition), "apiKey": secret,
+            "api": native_api_name(&definition.protocol).expect("validated protocol"),
             "models": models.iter().map(|item| json!({ "id": item, "name": item })).collect::<Vec<_>>()
         }), None)),
         "hermes" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "base_url": definition.base_url, "api_key": secret,
+            "base_url": openai_compatible_base_url(definition), "api_key": secret,
             "models": models.iter().map(|item| (item.clone(), json!({}))).collect::<serde_json::Map<String, serde_json::Value>>()
         }), None)),
         "pi" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
             "apiKey": secret,
-            "models": models.iter().map(|item| json!({ "id": item, "name": item, "api": "openai-completions", "baseUrl": definition.base_url })).collect::<Vec<_>>()
+            "models": models.iter().map(|item| json!({
+                "id": item,
+                "name": item,
+                "api": native_api_name(&definition.protocol).expect("validated protocol"),
+                "baseUrl": openai_compatible_base_url(definition)
+            })).collect::<Vec<_>>()
         }), None)),
         _ => None,
     }.ok_or_else(|| AppError::Message("该应用尚未有安全的配置适配器".to_string()))?;
-    provider.id = format!("provider-center-{app}-{}", definition.id);
+    provider.id = projected_provider_id(definition, app);
     provider.category = Some("provider-center".to_string());
     Ok(provider)
 }
 
+fn projected_provider_id(definition: &ProviderDefinition, app: &str) -> String {
+    definition
+        .source
+        .as_ref()
+        .and_then(|source| source.source_ref.strip_prefix("universal:"))
+        .filter(|_| matches!(app, "claude" | "codex" | "gemini"))
+        .map(|legacy_id| format!("universal-{app}-{legacy_id}"))
+        .unwrap_or_else(|| format!("provider-center-{app}-{}", definition.id))
+}
+
 fn provider_fingerprint(provider: &Provider) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(provider)
+    // Provider constructors may attach volatile creation/sort metadata. Those
+    // values are not part of the projected live configuration and would make
+    // two identical renders hash differently. Drift detection intentionally
+    // covers only stable user-visible/configuration fields.
+    let stable = json!({
+        "id": provider.id,
+        "name": provider.name,
+        "settingsConfig": provider.settings_config,
+        "websiteUrl": provider.website_url,
+        "category": provider.category,
+        "notes": provider.notes,
+        "meta": provider.meta,
+        "icon": provider.icon,
+        "iconColor": provider.icon_color,
+    });
+    let bytes = serde_json::to_vec(&stable)
         .map_err(|error| AppError::Message(format!("无法计算配置指纹: {error}")))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -1816,10 +2191,7 @@ pub fn apply_transaction(
         {
             return Err(AppError::Message("无效的幂等请求标识".to_string()));
         }
-        if let Some(existing) = load_transactions(state)?
-            .into_iter()
-            .find(|transaction| transaction.id == key)
-        {
+        if let Some(existing) = state.db.get_provider_center_transaction(key)? {
             return Ok(existing);
         }
     }
@@ -1867,8 +2239,6 @@ pub fn apply_transaction(
         created_at: now(),
         completed_at: None,
     };
-    save_transaction(state, transaction.clone())?;
-
     let mut snapshots = Vec::new();
     for target in &preview.targets {
         let app = AppType::from_str(&target.app_type)?;
@@ -1886,10 +2256,12 @@ pub fn apply_transaction(
         });
     }
     save_snapshots(state, &transaction_id, &snapshots)?;
+    save_transaction(state, transaction.clone())?;
 
     let mut bindings = load_bindings(state)?;
     let mut succeeded = Vec::new();
     let mut failed = false;
+    let mut failed_index = None;
     for (index, snapshot) in snapshots.iter().enumerate() {
         let app = AppType::from_str(&snapshot.app_type)?;
         let projected = projection(&definition, secret.clone(), &snapshot.app_type)?;
@@ -1931,16 +2303,25 @@ pub fn apply_transaction(
                     binding.updated_at = now();
                 }
                 failed = true;
+                failed_index = Some(index);
                 break;
             }
         }
     }
     if failed {
         let mut rollback_failed = false;
-        for index in succeeded.into_iter().rev() {
+        let mut rollback_indices = succeeded;
+        if let Some(index) = failed_index {
+            rollback_indices.push(index);
+        }
+        rollback_indices.sort_unstable();
+        rollback_indices.dedup();
+        for index in rollback_indices.into_iter().rev() {
+            let original_message = transaction.targets[index].message.clone();
             match restore_snapshot(state, &snapshots[index]) {
                 Ok(()) => {
                     transaction.targets[index].status = "rolledBack".to_string();
+                    transaction.targets[index].message = original_message;
                     if let Some(binding) = bindings.iter_mut().find(|binding| {
                         binding.provider_id == provider_id
                             && binding.app_type == snapshots[index].app_type
@@ -1952,7 +2333,10 @@ pub fn apply_transaction(
                 Err(error) => {
                     rollback_failed = true;
                     transaction.targets[index].status = "rollbackFailed".to_string();
-                    transaction.targets[index].message = Some(error.to_string());
+                    transaction.targets[index].message = Some(match original_message {
+                        Some(original) => format!("{original}；回滚失败：{error}"),
+                        None => error.to_string(),
+                    });
                 }
             }
         }
@@ -1975,11 +2359,9 @@ pub fn restore_transaction(
     transaction_id: &str,
 ) -> Result<ProviderApplyTransaction, AppError> {
     let snapshots = load_snapshots(state, transaction_id)?;
-    let transactions = load_transactions(state)?;
-    let source = transactions
-        .iter()
-        .find(|item| item.id == transaction_id)
-        .cloned()
+    let source = state
+        .db
+        .get_provider_center_transaction(transaction_id)?
         .ok_or_else(|| AppError::Message("应用历史不存在".to_string()))?;
     let restore_id = Uuid::new_v4().to_string();
     // A restore may itself be interrupted or partially fail. Persist an
@@ -2101,6 +2483,43 @@ pub fn set_binding_override(
     save_core(state, &definitions, &bindings)
 }
 
+pub fn disable_binding(
+    state: &AppState,
+    provider_id: &str,
+    app_type: &str,
+    remove_projection: bool,
+) -> Result<(), AppError> {
+    let definitions = load_definitions(state)?;
+    let definition = definitions
+        .iter()
+        .find(|definition| definition.id == provider_id)
+        .ok_or_else(|| AppError::Message("模型服务不存在".to_string()))?;
+    let mut bindings = load_bindings(state)?;
+    let binding = bindings
+        .iter_mut()
+        .find(|binding| binding.provider_id == provider_id && binding.app_type == app_type)
+        .ok_or_else(|| AppError::Message("绑定关系不存在".to_string()))?;
+    if remove_projection {
+        let app = AppType::from_str(app_type)?;
+        let projected_id = projected_provider_id(definition, app_type);
+        if state
+            .db
+            .get_provider_by_id(&projected_id, app.as_str())?
+            .is_some()
+        {
+            ProviderService::delete(state, app, &projected_id)?;
+        }
+    }
+    binding.enabled = false;
+    binding.override_enabled = false;
+    binding.status = "detached".to_string();
+    binding.applied_revision = None;
+    binding.expected_fingerprint = None;
+    binding.last_error = None;
+    binding.updated_at = now();
+    save_core(state, &definitions, &bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2148,6 +2567,7 @@ mod tests {
         ] {
             let protocol = match app {
                 "claude" => "anthropic",
+                "codex" => "openai-responses",
                 "gemini" => "gemini",
                 _ => "openai-chat",
             };
@@ -2164,6 +2584,111 @@ mod tests {
     }
 
     #[test]
+    fn projections_enforce_protocol_compatibility_and_render_native_api_names() {
+        assert!(projection(&definition("openai-chat"), "sk-secret".to_string(), "codex").is_err());
+        assert!(projection(
+            &definition("openai-responses"),
+            "sk-secret".to_string(),
+            "codex"
+        )
+        .is_ok());
+        assert!(projection(&definition("anthropic"), "sk-secret".to_string(), "claude").is_ok());
+        assert!(projection(&definition("gemini"), "sk-secret".to_string(), "claude").is_err());
+
+        let openclaw = projection(
+            &definition("anthropic"),
+            "sk-secret".to_string(),
+            "openclaw",
+        )
+        .expect("OpenClaw supports Anthropic Messages");
+        assert_eq!(
+            openclaw.settings_config["api"].as_str(),
+            Some("anthropic-messages")
+        );
+
+        let mut ollama = definition("ollama");
+        ollama.base_url = "http://127.0.0.1:11434".to_string();
+        let pi = projection(&ollama, String::new(), "pi").expect("Pi supports Ollama");
+        assert_eq!(
+            pi.settings_config["models"][0]["api"].as_str(),
+            Some("openai-completions")
+        );
+        assert_eq!(
+            pi.settings_config["models"][0]["baseUrl"].as_str(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+    }
+
+    #[test]
+    fn provider_save_rejects_unknown_protocols_and_credential_bearing_urls() {
+        use crate::database::Database;
+
+        let state = AppState::new(Arc::new(Database::memory().expect("memory database")));
+        let input = |protocol: &str, base_url: &str| SaveProviderDefinitionInput {
+            id: None,
+            expected_revision: None,
+            name: "Example".to_string(),
+            protocol: protocol.to_string(),
+            base_url: base_url.to_string(),
+            models: Vec::new(),
+            notes: String::new(),
+            enabled: Some(true),
+            credential_action: Some("keep".to_string()),
+            source: None,
+            api_key: None,
+            app_types: Vec::new(),
+        };
+
+        assert!(save_definition(&state, input("unknown", "https://api.example.test")).is_err());
+        assert!(save_definition(
+            &state,
+            input("openai-chat", "https://user:secret@api.example.test/v1")
+        )
+        .is_err());
+        assert!(save_definition(
+            &state,
+            input("openai-chat", "https://api.example.test/v1?api_key=secret")
+        )
+        .is_err());
+        assert!(save_definition(&state, input("ollama", "http://127.0.0.1:11434")).is_ok());
+    }
+
+    #[test]
+    fn import_protocol_is_inferred_from_each_apps_native_configuration() {
+        let codex = Provider::with_id(
+            "codex-source".to_string(),
+            "Codex".to_string(),
+            json!({
+                "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://api.example/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        assert_eq!(
+            protocol_from_provider(&AppType::Codex, &codex),
+            "openai-responses"
+        );
+
+        let openclaw = Provider::with_id(
+            "openclaw-source".to_string(),
+            "OpenClaw".to_string(),
+            json!({ "api": "anthropic-messages" }),
+            None,
+        );
+        assert_eq!(
+            protocol_from_provider(&AppType::OpenClaw, &openclaw),
+            "anthropic"
+        );
+
+        let pi = Provider::with_id(
+            "pi-source".to_string(),
+            "Pi".to_string(),
+            json!({ "models": [{ "id": "gemini", "api": "google-generative-ai" }] }),
+            None,
+        );
+        assert_eq!(protocol_from_provider(&AppType::Pi, &pi), "gemini");
+    }
+
+    #[test]
     fn claude_desktop_rejects_incompatible_protocols() {
         assert!(projection(
             &definition("openai-chat"),
@@ -2177,5 +2702,199 @@ mod tests {
             "claude-desktop"
         )
         .is_ok());
+    }
+
+    fn legacy_universal() -> UniversalProvider {
+        let mut provider = UniversalProvider::new(
+            "legacy-shared".to_string(),
+            "Legacy Shared".to_string(),
+            "openai-chat".to_string(),
+            "https://legacy.example/v1/".to_string(),
+            "sk-legacy-secret".to_string(),
+        );
+        provider.created_at = Some(1234);
+        provider.notes = Some("migrated note".to_string());
+        provider.apps = crate::provider::UniversalProviderApps {
+            claude: true,
+            codex: true,
+            gemini: false,
+        };
+        provider.models = crate::provider::UniversalProviderModels {
+            claude: Some(ClaudeModelConfig {
+                model: Some("claude-main".to_string()),
+                haiku_model: Some("claude-haiku".to_string()),
+                sonnet_model: Some("claude-main".to_string()),
+                opus_model: None,
+            }),
+            codex: Some(CodexModelConfig {
+                model: Some("gpt-codex".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            }),
+            gemini: Some(GeminiModelConfig {
+                model: Some("gemini-pro".to_string()),
+            }),
+        };
+        provider
+    }
+
+    #[test]
+    fn legacy_universal_conversion_preserves_models_bindings_and_source() {
+        let legacy = legacy_universal();
+        let (definition, bindings) =
+            convert_legacy_universal(&legacy, "migrated-id".to_string(), 1234);
+
+        assert_eq!(definition.id, "migrated-id");
+        assert_eq!(definition.base_url, "https://legacy.example/v1");
+        assert_eq!(
+            definition.models,
+            vec!["claude-haiku", "claude-main", "gemini-pro", "gpt-codex"]
+        );
+        assert_eq!(definition.credential_hint.as_deref(), Some("…cret"));
+        assert_eq!(
+            definition
+                .source
+                .as_ref()
+                .map(|source| source.source_ref.as_str()),
+            Some("universal:legacy-shared")
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.app_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex"]
+        );
+        assert!(bindings.iter().all(|binding| binding.status == "pending"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_universal_migration_encrypts_key_deletes_plaintext_and_is_idempotent() {
+        use crate::database::Database;
+
+        let db = Arc::new(Database::memory().expect("create memory database"));
+        let state = AppState::new(db.clone());
+        let legacy = legacy_universal();
+        db.save_universal_provider(&legacy)
+            .expect("seed plaintext legacy provider");
+
+        ensure_sqlite_migrated(&state).expect("migrate legacy provider");
+
+        let definitions = db
+            .load_provider_center_definitions()
+            .expect("load migrated definitions");
+        let migrated_id = migrated_legacy_universal_id(&definitions, &legacy.id)
+            .expect("migrated definition must retain source identity");
+        assert_eq!(get_secret(&state, &migrated_id).unwrap(), legacy.api_key);
+        assert!(db.get_all_universal_providers().unwrap().is_empty());
+        let legacy_json = db
+            .get_setting("universal_providers")
+            .unwrap()
+            .unwrap_or_default();
+        assert!(!legacy_json.contains(&legacy.api_key));
+
+        let definition_count = definitions.len();
+        let binding_count = db.load_provider_center_bindings().unwrap().len();
+        db.save_universal_provider(&legacy)
+            .expect("simulate cleanup interruption");
+        db.set_setting(SQLITE_MIGRATED_KEY, "false")
+            .expect("force migration retry");
+
+        ensure_sqlite_migrated(&state).expect("retry migration");
+
+        assert_eq!(
+            db.load_provider_center_definitions().unwrap().len(),
+            definition_count,
+            "retry must not duplicate the definition"
+        );
+        assert_eq!(
+            db.load_provider_center_bindings().unwrap().len(),
+            binding_count,
+            "retry must not duplicate bindings"
+        );
+        assert!(db.get_all_universal_providers().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn import_session_copies_source_hides_key_and_creates_pending_bindings() {
+        use crate::database::Database;
+
+        let db = Arc::new(Database::memory().expect("create memory database"));
+        let state = AppState::new(db.clone());
+        let source = Provider::with_id(
+            "source-codex".to_string(),
+            "Imported Codex".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-import-secret" },
+                "config": "model = \"gpt-5\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://import.example/v1\"\n"
+            }),
+            None,
+        );
+        db.save_provider("codex", &source)
+            .expect("seed source provider");
+        let source_before = db
+            .get_provider_by_id("source-codex", "codex")
+            .unwrap()
+            .expect("source exists");
+
+        let session =
+            start_import_session(&state, vec!["codex".to_string()]).expect("start import session");
+        let candidate = session
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_ref == "saved:codex:source-codex")
+            .expect("saved provider candidate")
+            .clone();
+        assert_eq!(candidate.credential_hint.as_deref(), Some("…cret"));
+        let record = db
+            .list_provider_import_candidates(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == candidate.id)
+            .expect("candidate record");
+        let temporary_secret_ref = record
+            .temporary_secret_ref
+            .clone()
+            .expect("temporary secret reference");
+        assert!(!record.normalized_json.contains("sk-import-secret"));
+
+        let imported = commit_import_session_candidate(
+            &state,
+            &session.id,
+            &candidate.id,
+            vec!["codex".to_string(), "openclaw".to_string()],
+        )
+        .expect("commit import");
+
+        assert_eq!(imported.id, format!("import-{}", candidate.id));
+        assert_eq!(imported.models, vec!["gpt-5"]);
+        assert_eq!(
+            get_secret(&state, &imported.id).unwrap(),
+            "sk-import-secret"
+        );
+        assert!(get_secret(&state, &temporary_secret_ref).is_err());
+        let source_after = db
+            .get_provider_by_id("source-codex", "codex")
+            .unwrap()
+            .expect("source remains");
+        assert_eq!(
+            serde_json::to_value(source_after).unwrap(),
+            serde_json::to_value(source_before).unwrap(),
+            "import must not modify the source provider"
+        );
+        let bindings = db.load_provider_center_bindings().unwrap();
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.provider_id == imported.id)
+                .map(|binding| binding.app_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex", "openclaw"]
+        );
+        assert!(bindings
+            .iter()
+            .filter(|binding| binding.provider_id == imported.id)
+            .all(|binding| binding.status == "pending"));
     }
 }

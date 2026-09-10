@@ -122,9 +122,12 @@ fn upsert_definition_tx(
                 source.source_app,
                 source.source_ref,
                 source.source_ref,
-                "legacy-import",
+                source
+                    .source_fingerprint
+                    .as_deref()
+                    .unwrap_or("legacy-import"),
                 source.imported_at,
-                source.imported_at,
+                source.last_observed_at.unwrap_or(source.imported_at),
             ],
         )
         .map_err(|error| AppError::Database(format!("保存导入来源失败: {error}")))?;
@@ -476,7 +479,8 @@ impl Database {
                 .map_err(|error| AppError::Database(error.to_string()))?;
             let source = conn
                 .query_row(
-                    "SELECT source_app_type, COALESCE(source_provider_id, source_locator), imported_at
+                    "SELECT source_app_type, COALESCE(source_provider_id, source_locator), imported_at,
+                            source_fingerprint, last_observed_at
                      FROM provider_sources WHERE provider_id = ?1
                      ORDER BY imported_at ASC LIMIT 1",
                     params![id],
@@ -485,6 +489,8 @@ impl Database {
                             source_app: source_row.get(0)?,
                             source_ref: source_row.get(1)?,
                             imported_at: source_row.get(2)?,
+                            source_fingerprint: source_row.get(3)?,
+                            last_observed_at: source_row.get(4)?,
                         })
                     },
                 )
@@ -726,6 +732,61 @@ impl Database {
         }
         Ok(transactions)
     }
+
+    pub fn get_provider_center_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<ProviderApplyTransaction>, AppError> {
+        let conn = lock_conn!(self.conn);
+        let header = conn
+            .query_row(
+                "SELECT id, provider_id, provider_revision, state, created_at, completed_at
+                 FROM provider_apply_transactions WHERE id = ?1",
+                params![transaction_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let Some((id, provider_id, revision, status, created_at, completed_at)) = header else {
+            return Ok(None);
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT app_type, state, error_message
+                 FROM provider_apply_transaction_targets
+                 WHERE transaction_id = ?1 ORDER BY app_type ASC",
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let targets = stmt
+            .query_map(params![id], |row| {
+                Ok(ProviderApplyTargetResult {
+                    app_type: row.get(0)?,
+                    status: row.get(1)?,
+                    message: row.get(2)?,
+                })
+            })
+            .map_err(|error| AppError::Database(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(Some(ProviderApplyTransaction {
+            id,
+            provider_id,
+            provider_revision: revision.max(0) as u64,
+            status,
+            targets,
+            created_at,
+            completed_at,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +810,8 @@ mod tests {
                 source_app: "codex".to_string(),
                 source_ref: "saved:codex:origin".to_string(),
                 imported_at: 100,
+                source_fingerprint: Some("fingerprint".to_string()),
+                last_observed_at: Some(100),
             }),
             credential_configured: false,
             credential_hint: None,

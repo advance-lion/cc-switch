@@ -98,6 +98,17 @@ pub struct DesktopAppStatus {
     pub can_uninstall: bool,
     pub can_launch: bool,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub installations: Vec<DesktopInstallation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopInstallation {
+    pub version: String,
+    pub path: String,
+    pub launch_target: Option<String>,
+    pub package_identity: Option<String>,
+    pub installation_source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +119,12 @@ struct AppxRecord {
     package_family_name: Option<String>,
     install_location: String,
     launch_target: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Deserialize)]
+struct AppxRecords {
+    records: Vec<AppxRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -191,9 +208,20 @@ pub struct DesktopLifecycleJob {
     pub post_probe: Option<DesktopAppStatus>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub logs: Vec<DesktopLifecycleLogEntry>,
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopLifecycleLogEntry {
+    pub at: i64,
+    pub level: String,
+    pub step: String,
+    pub message: String,
 }
 
 fn now() -> i64 {
@@ -212,6 +240,7 @@ fn job_record(job: &DesktopLifecycleJob) -> Result<LifecycleJobRecord, String> {
             "component": job.component,
             "action": job.action,
             "source": "registered-manifest",
+            "logs": job.logs,
         }))
         .map_err(|error| error.to_string())?,
         pre_probe_json: job
@@ -235,6 +264,11 @@ fn job_record(job: &DesktopLifecycleJob) -> Result<LifecycleJobRecord, String> {
 }
 
 fn job_from_record(record: LifecycleJobRecord) -> Result<DesktopLifecycleJob, String> {
+    let logs = serde_json::from_str::<serde_json::Value>(&record.plan_json)
+        .ok()
+        .and_then(|value| value.get("logs").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     Ok(DesktopLifecycleJob {
         id: record.id,
         app_id: record.app_id,
@@ -253,6 +287,7 @@ fn job_from_record(record: LifecycleJobRecord) -> Result<DesktopLifecycleJob, St
             .map_err(|error| format!("Invalid lifecycle post-probe: {error}"))?,
         error_code: record.error_code,
         error_message: record.error_message,
+        logs,
         created_at: record.created_at,
         started_at: record.started_at,
         completed_at: record.completed_at,
@@ -295,10 +330,32 @@ fn command_output_cancellable(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to start {label}: {error}"))?;
+    // Drain both pipes while the installer is running. Waiting first and only
+    // reading afterwards can deadlock when winget/Homebrew fills an OS pipe.
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = pipe.read_to_string(&mut output);
+            output
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = pipe.read_to_string(&mut output);
+            output
+        })
+    });
     let status = loop {
         if cancellation.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(reader) = stdout_reader {
+                let _ = reader.join();
+            }
+            if let Some(reader) = stderr_reader {
+                let _ = reader.join();
+            }
             return Err("JOB_CANCELLED".to_string());
         }
         match child
@@ -309,14 +366,12 @@ fn command_output_cancellable(
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     let stdout = stdout.trim().to_string();
     let stderr = stderr.trim().to_string();
     if !status.success() {
@@ -351,43 +406,54 @@ fn powershell_output(script: &str, label: &str) -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String> {
+    let winget_available = Command::new("winget.exe")
+        .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
     let script = format!(
         r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$pkg = Get-AppxPackage -Name '{}' | Sort-Object Version -Descending | Select-Object -First 1
-if ($null -ne $pkg) {{
-  [pscustomobject]@{{
+$records = @()
+$packages = Get-AppxPackage -Name '{}' | Sort-Object Version -Descending
+foreach ($pkg in $packages) {{
+  $records += [pscustomobject]@{{
     kind = 'appx'
     version = $pkg.Version.ToString()
     package_full_name = $pkg.PackageFullName
     package_family_name = $pkg.PackageFamilyName
     install_location = $pkg.InstallLocation
     launch_target = $null
-  }} | ConvertTo-Json -Compress
-  exit 0
+  }}
 }}
 $uninstallRoots = @(
   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
-$entry = Get-ItemProperty $uninstallRoots -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.DisplayName -eq '{}' }} |
-  Sort-Object DisplayVersion -Descending | Select-Object -First 1
-if ($null -eq $entry) {{ Write-Output 'null'; exit 0 }}
-$launch = $entry.DisplayIcon
-if ($launch) {{ $launch = $launch.Trim('"').Split(',')[0] }}
-[pscustomobject]@{{
-  kind = 'win32'
-  version = [string]$entry.DisplayVersion
-  package_full_name = $null
-  package_family_name = $null
-  install_location = [string]$entry.InstallLocation
-  launch_target = $launch
-}} | ConvertTo-Json -Compress"#,
+$entries = Get-ItemProperty $uninstallRoots -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DisplayName -eq '{}' }} | Sort-Object DisplayVersion -Descending
+foreach ($entry in $entries) {{
+  $launch = $entry.DisplayIcon
+  if ($launch) {{ $launch = $launch.Trim('"').Split(',')[0] }}
+  $records += [pscustomobject]@{{
+    kind = 'win32'
+    version = [string]$entry.DisplayVersion
+    package_full_name = $null
+    package_family_name = $null
+    install_location = [string]$entry.InstallLocation
+    launch_target = $launch
+  }}
+}}
+[pscustomobject]@{{ records = @($records) }} | ConvertTo-Json -Depth 4 -Compress"#,
         manifest.windows_package_name, manifest.windows_display_name
     );
     let output = powershell_output(&script, "desktop application detection")?;
-    if output.trim().is_empty() || output.trim() == "null" {
+    let mut records = serde_json::from_str::<AppxRecords>(&output)
+        .map_err(|error| format!("Invalid desktop package metadata: {error}"))?
+        .records;
+    if records.is_empty() {
         return Ok(DesktopAppStatus {
             id: manifest.id.to_string(),
             display_name: manifest.display_name.to_string(),
@@ -398,54 +464,81 @@ if ($launch) {{ $launch = $launch.Trim('"').Split(',')[0] }}
             launch_target: None,
             package_identity: None,
             installation_source: "not_installed".to_string(),
-            can_install: true,
+            can_install: winget_available,
             can_update: false,
             can_uninstall: false,
             can_launch: false,
-            reason: None,
+            reason: (!winget_available).then(|| "未找到 Winget，无法执行自动安装".to_string()),
+            installations: Vec::new(),
         });
     }
 
-    let record: AppxRecord = serde_json::from_str(&output)
-        .map_err(|error| format!("Invalid desktop package metadata: {error}"))?;
-    if record.kind == "appx" {
-        let valid_identity = record
-            .package_full_name
-            .as_deref()
-            .is_some_and(|value| value.starts_with(manifest.windows_package_name));
-        let valid_family = record
-            .package_family_name
-            .as_deref()
-            .is_some_and(|value| value.starts_with(manifest.windows_package_name));
-        if !valid_identity || !valid_family {
-            return Err(format!(
-                "Detected package identity does not match {}",
-                manifest.display_name
-            ));
+    for record in &records {
+        if record.kind == "appx" {
+            let valid_identity = record
+                .package_full_name
+                .as_deref()
+                .is_some_and(|value| value.starts_with(manifest.windows_package_name));
+            let valid_family = record
+                .package_family_name
+                .as_deref()
+                .is_some_and(|value| value.starts_with(manifest.windows_package_name));
+            if !valid_identity || !valid_family {
+                return Err(format!(
+                    "Detected package identity does not match {}",
+                    manifest.display_name
+                ));
+            }
         }
     }
+    records.sort_by(|left, right| {
+        numeric_version_parts(&right.version).cmp(&numeric_version_parts(&left.version))
+    });
+    let installations = records
+        .iter()
+        .map(|record| DesktopInstallation {
+            version: record.version.clone(),
+            path: record.install_location.clone(),
+            launch_target: record.launch_target.clone(),
+            package_identity: record.package_full_name.clone(),
+            installation_source: if record.kind == "win32" {
+                "official_exe"
+            } else if manifest.id == "codex-desktop" {
+                "microsoft_store"
+            } else {
+                "official_appx"
+            }
+            .to_string(),
+        })
+        .collect::<Vec<_>>();
+    let primary = installations
+        .first()
+        .expect("non-empty installations after detection");
+    let primary_is_appx = primary.package_identity.is_some();
 
     Ok(DesktopAppStatus {
         id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
         installed: true,
-        version: Some(record.version),
+        version: Some(primary.version.clone()),
         latest_version: None,
-        path: Some(record.install_location),
-        launch_target: record.launch_target,
-        package_identity: record.package_full_name,
-        installation_source: if record.kind == "win32" {
-            "official_exe".to_string()
-        } else if manifest.id == "codex-desktop" {
-            "microsoft_store".to_string()
-        } else {
-            "official_appx".to_string()
-        },
+        path: Some(primary.path.clone()),
+        launch_target: primary.launch_target.clone(),
+        package_identity: primary.package_identity.clone(),
+        installation_source: primary.installation_source.clone(),
         can_install: false,
-        can_update: true,
-        can_uninstall: true,
+        can_update: winget_available,
+        can_uninstall: primary_is_appx || winget_available,
         can_launch: true,
-        reason: None,
+        reason: (!winget_available).then(|| {
+            if primary_is_appx {
+                "未找到 Winget，仍可启动和卸载，但不能自动更新"
+            } else {
+                "未找到 Winget，仍可启动，但不能自动更新或卸载"
+            }
+            .to_string()
+        }),
+        installations,
     })
 }
 
@@ -478,7 +571,7 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
         installed,
-        version,
+        version: version.clone(),
         latest_version: None,
         path: installed.then(|| manifest.macos_bundle_path.to_string()),
         launch_target: installed.then(|| manifest.macos_bundle_path.to_string()),
@@ -495,6 +588,17 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         can_launch: installed,
         reason: (!homebrew_available)
             .then(|| "需要 Homebrew 才能自动安装、更新或卸载；仍可启动现有应用".to_string()),
+        installations: if installed {
+            vec![DesktopInstallation {
+                version: version.unwrap_or_default(),
+                path: manifest.macos_bundle_path.to_string(),
+                launch_target: Some(manifest.macos_bundle_path.to_string()),
+                package_identity: None,
+                installation_source: "application_bundle".to_string(),
+            }]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -517,6 +621,7 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         reason: Some(
             "This desktop application is not supported on the current platform.".to_string(),
         ),
+        installations: Vec::new(),
     })
 }
 
@@ -537,6 +642,20 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
     latest_parts > current_parts
 }
 
+fn same_installation(left: &DesktopInstallation, right: &DesktopInstallation) -> bool {
+    match (
+        left.package_identity.as_deref(),
+        right.package_identity.as_deref(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => {
+            left.installation_source == right.installation_source
+                && !left.path.is_empty()
+                && left.path.eq_ignore_ascii_case(&right.path)
+        }
+    }
+}
+
 fn verification_satisfied(
     action: DesktopLifecycleAction,
     before: &DesktopAppStatus,
@@ -549,7 +668,16 @@ fn verification_satisfied(
                 && (before.version.is_none()
                     || after.version.as_deref() != before.version.as_deref())
         }
-        DesktopLifecycleAction::Uninstall => !after.installed,
+        DesktopLifecycleAction::Uninstall => before
+            .installations
+            .first()
+            .map(|target| {
+                !after
+                    .installations
+                    .iter()
+                    .any(|candidate| same_installation(target, candidate))
+            })
+            .unwrap_or(!after.installed),
     }
 }
 
@@ -557,7 +685,11 @@ fn detect_after_action(
     manifest: DesktopAppManifest,
     action: DesktopLifecycleAction,
     before: &DesktopAppStatus,
+    cancellation: &AtomicBool,
 ) -> Result<DesktopAppStatus, String> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("JOB_CANCELLED".to_string());
+    }
     let mut last = detect_desktop_app(manifest)?;
     if verification_satisfied(action, before, &last) {
         return Ok(last);
@@ -566,6 +698,9 @@ fn detect_after_action(
     // before declaring verification failure, while keeping success tied to a
     // real post-action probe.
     for _ in 0..29 {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("JOB_CANCELLED".to_string());
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
         last = detect_desktop_app(manifest)?;
         if verification_satisfied(action, before, &last) {
@@ -906,6 +1041,12 @@ fn fail_job(
     code: &str,
     message: String,
 ) -> String {
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "error".to_string(),
+        step: job.state.clone(),
+        message: message.clone(),
+    });
     job.state = "failed".to_string();
     job.error_code = Some(code.to_string());
     job.error_message = Some(message.clone());
@@ -934,6 +1075,12 @@ fn run_lifecycle_job(
         post_probe: None,
         error_code: None,
         error_message: None,
+        logs: vec![DesktopLifecycleLogEntry {
+            at: created_at,
+            level: "info".to_string(),
+            step: "queued".to_string(),
+            message: format!("已创建 {} 任务", action.as_str()),
+        }],
         created_at,
         started_at: None,
         completed_at: None,
@@ -941,6 +1088,12 @@ fn run_lifecycle_job(
     save_job(&db, &job)?;
     job.state = "running".to_string();
     job.started_at = Some(now());
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "info".to_string(),
+        step: "detecting".to_string(),
+        message: "正在检测当前安装状态".to_string(),
+    });
     save_job(&db, &job)?;
 
     let before = match detect_desktop_app(manifest) {
@@ -948,10 +1101,35 @@ fn run_lifecycle_job(
         Err(error) => return Err(fail_job(&db, &mut job, "APP_PROBE_FAILED", error)),
     };
     job.pre_probe = Some(before.clone());
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "info".to_string(),
+        step: "detected".to_string(),
+        message: if before.installed {
+            format!(
+                "已检测到 {}{}",
+                manifest.display_name,
+                before
+                    .version
+                    .as_deref()
+                    .map(|version| format!(" {version}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!("未检测到 {}", manifest.display_name)
+        },
+    });
     if let Err(error) = save_job(&db, &job) {
         return Err(fail_job(&db, &mut job, "JOB_PERSIST_FAILED", error));
     }
 
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "info".to_string(),
+        step: "executing".to_string(),
+        message: format!("正在通过已登记的官方安装源执行 {}", action.as_str()),
+    });
+    save_job(&db, &job)?;
     let execute_result = match action {
         DesktopLifecycleAction::Install => {
             if before.installed {
@@ -986,6 +1164,12 @@ fn run_lifecycle_job(
                             current_status.latest_version = Some(latest);
                             job.post_probe = Some(current_status.clone());
                             job.state = "succeeded".to_string();
+                            job.logs.push(DesktopLifecycleLogEntry {
+                                at: now(),
+                                level: "info".to_string(),
+                                step: "completed".to_string(),
+                                message: "当前已是最新版本，无需更新".to_string(),
+                            });
                             job.completed_at = Some(now());
                             save_job(&db, &job)?;
                             return Ok(current_status);
@@ -1014,6 +1198,12 @@ fn run_lifecycle_job(
             if !before.installed {
                 job.post_probe = Some(before.clone());
                 job.state = "succeeded".to_string();
+                job.logs.push(DesktopLifecycleLogEntry {
+                    at: now(),
+                    level: "info".to_string(),
+                    step: "completed".to_string(),
+                    message: "应用已经处于未安装状态，无需卸载".to_string(),
+                });
                 job.completed_at = Some(now());
                 save_job(&db, &job)?;
                 return Ok(before);
@@ -1046,6 +1236,12 @@ fn run_lifecycle_job(
             job.state = "cancelled".to_string();
             job.error_code = Some(code.to_string());
             job.error_message = Some("操作已停止".to_string());
+            job.logs.push(DesktopLifecycleLogEntry {
+                at: now(),
+                level: "warning".to_string(),
+                step: "cancelled".to_string(),
+                message: "用户已停止操作".to_string(),
+            });
             job.completed_at = Some(now());
             save_job(&db, &job)?;
             return Err("操作已停止".to_string());
@@ -1054,9 +1250,29 @@ fn run_lifecycle_job(
     }
 
     job.state = "verifying".to_string();
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "info".to_string(),
+        step: "verifying".to_string(),
+        message: "安装器已结束，正在重新检测版本和安装状态".to_string(),
+    });
     save_job(&db, &job)?;
-    let after = match detect_after_action(manifest, action, &before) {
+    let mut after = match detect_after_action(manifest, action, &before, &cancellation) {
         Ok(status) => status,
+        Err(error) if error == "JOB_CANCELLED" => {
+            job.state = "cancelled".to_string();
+            job.error_code = Some("JOB_CANCELLED".to_string());
+            job.error_message = Some("操作已停止".to_string());
+            job.logs.push(DesktopLifecycleLogEntry {
+                at: now(),
+                level: "warning".to_string(),
+                step: "cancelled".to_string(),
+                message: "用户已停止结果检测".to_string(),
+            });
+            job.completed_at = Some(now());
+            save_job(&db, &job)?;
+            return Err("操作已停止".to_string());
+        }
         Err(error) => {
             return Err(fail_job(
                 &db,
@@ -1082,10 +1298,12 @@ fn run_lifecycle_job(
                 manifest.display_name
             ))
         }
-        DesktopLifecycleAction::Uninstall if after.installed => Some(format!(
-            "{} uninstall completed but the package is still installed",
-            manifest.display_name
-        )),
+        DesktopLifecycleAction::Uninstall if !verification_satisfied(action, &before, &after) => {
+            Some(format!(
+                "{} uninstall completed but the package is still installed",
+                manifest.display_name
+            ))
+        }
         _ => None,
     };
     if let Some(error) = verification_error {
@@ -1096,7 +1314,32 @@ fn run_lifecycle_job(
             error,
         ));
     }
+    if matches!(action, DesktopLifecycleAction::Uninstall) && after.installed {
+        after.reason = Some(format!(
+            "已移除所选安装，但仍检测到另一份 {}（{}）",
+            manifest.display_name,
+            after.version.as_deref().unwrap_or("版本未知")
+        ));
+        job.post_probe = Some(after.clone());
+        job.logs.push(DesktopLifecycleLogEntry {
+            at: now(),
+            level: "warning".to_string(),
+            step: "completed".to_string(),
+            message: after.reason.clone().unwrap_or_default(),
+        });
+    }
     job.state = "succeeded".to_string();
+    job.logs.push(DesktopLifecycleLogEntry {
+        at: now(),
+        level: "info".to_string(),
+        step: "completed".to_string(),
+        message: match action {
+            DesktopLifecycleAction::Install => "安装完成并已通过检测",
+            DesktopLifecycleAction::Update => "更新完成并已检测到版本变化",
+            DesktopLifecycleAction::Uninstall => "卸载完成并确认应用已移除",
+        }
+        .to_string(),
+    });
     job.completed_at = Some(now());
     save_job(&db, &job)?;
     Ok(after)
@@ -1215,5 +1458,120 @@ mod tests {
         assert!(version_is_newer("26.901.6512.0", "26.901.6511.0"));
         assert!(!version_is_newer("1.2.0", "1.2"));
         assert!(!version_is_newer("1.1", "1.2"));
+    }
+
+    fn status(installed: bool, version: Option<&str>) -> DesktopAppStatus {
+        DesktopAppStatus {
+            id: "codex-desktop".to_string(),
+            display_name: "Codex Desktop".to_string(),
+            installed,
+            version: version.map(str::to_string),
+            latest_version: None,
+            path: None,
+            launch_target: None,
+            package_identity: None,
+            installation_source: if installed {
+                "microsoft_store"
+            } else {
+                "not_installed"
+            }
+            .to_string(),
+            can_install: !installed,
+            can_update: installed,
+            can_uninstall: installed,
+            can_launch: installed,
+            reason: None,
+            installations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_success_requires_a_real_post_action_state_change() {
+        let missing = status(false, None);
+        let v1 = status(true, Some("1.0.0"));
+        let v2 = status(true, Some("1.1.0"));
+
+        assert!(verification_satisfied(
+            DesktopLifecycleAction::Install,
+            &missing,
+            &v1
+        ));
+        assert!(!verification_satisfied(
+            DesktopLifecycleAction::Install,
+            &missing,
+            &missing
+        ));
+        assert!(verification_satisfied(
+            DesktopLifecycleAction::Update,
+            &v1,
+            &v2
+        ));
+        assert!(!verification_satisfied(
+            DesktopLifecycleAction::Update,
+            &v1,
+            &v1
+        ));
+        assert!(verification_satisfied(
+            DesktopLifecycleAction::Uninstall,
+            &v1,
+            &missing
+        ));
+        assert!(!verification_satisfied(
+            DesktopLifecycleAction::Uninstall,
+            &v1,
+            &v1
+        ));
+
+        let mut appx = v1.clone();
+        appx.installations = vec![DesktopInstallation {
+            version: "1.0.0".to_string(),
+            path: "C:\\Program Files\\WindowsApps\\Claude".to_string(),
+            launch_target: None,
+            package_identity: Some("Claude_1.0.0_x64".to_string()),
+            installation_source: "official_appx".to_string(),
+        }];
+        let mut remaining_exe = v2;
+        remaining_exe.installations = vec![DesktopInstallation {
+            version: "1.1.0".to_string(),
+            path: "C:\\Users\\test\\AppData\\Local\\Claude".to_string(),
+            launch_target: Some("claude.exe".to_string()),
+            package_identity: None,
+            installation_source: "official_exe".to_string(),
+        }];
+        assert!(verification_satisfied(
+            DesktopLifecycleAction::Uninstall,
+            &appx,
+            &remaining_exe
+        ));
+    }
+
+    #[test]
+    fn lifecycle_job_round_trip_preserves_structured_logs() {
+        let job = DesktopLifecycleJob {
+            id: "job-log".to_string(),
+            app_id: "codex-desktop".to_string(),
+            component: "desktop".to_string(),
+            action: "install".to_string(),
+            state: "verifying".to_string(),
+            pre_probe: Some(status(false, None)),
+            post_probe: None,
+            error_code: None,
+            error_message: None,
+            logs: vec![DesktopLifecycleLogEntry {
+                at: 11,
+                level: "info".to_string(),
+                step: "verifying".to_string(),
+                message: "正在重新检测安装结果".to_string(),
+            }],
+            created_at: 10,
+            started_at: Some(11),
+            completed_at: None,
+        };
+
+        let restored =
+            job_from_record(job_record(&job).expect("serialize job")).expect("deserialize job");
+        assert_eq!(restored.logs.len(), 1);
+        assert_eq!(restored.logs[0].step, "verifying");
+        assert_eq!(restored.logs[0].message, "正在重新检测安装结果");
     }
 }

@@ -386,6 +386,16 @@ export function ProviderCenterPanel() {
     }
   };
 
+  const detachBinding = async (binding: ProviderBinding) => {
+    try {
+      await providerCenterApi.disableBinding(binding.providerId, binding.appType, false);
+      await load();
+      toast.success("已解除共享关联；应用中的现有配置保持不变");
+    } catch (error) {
+      toast.error(`解除关联失败：${String(error)}`);
+    }
+  };
+
   const prepareApply = async (definition: ProviderDefinition) => {
     const targets = bindingsFor(definition.id).filter((binding) => binding.enabled && !binding.overrideEnabled).map((binding) => binding.appType);
     if (targets.length === 0) {
@@ -538,7 +548,7 @@ export function ProviderCenterPanel() {
                         <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{appLabel(binding.appType)}</span><Badge variant="outline" className={statusClass[binding.status]}>{statusText[binding.status]}</Badge></div>
                         {binding.lastError && <p className="mt-1 text-xs text-destructive">{binding.lastError}</p>}
                       </div>
-                      {binding.enabled && binding.status !== "unsupported" && <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground"><Switch checked={binding.overrideEnabled} onCheckedChange={(checked) => void updateOverride(binding, checked)} />单独自定义</label>}
+                      {binding.enabled && binding.status !== "unsupported" && <div className="flex shrink-0 items-center gap-2"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Switch checked={binding.overrideEnabled} onCheckedChange={(checked) => void updateOverride(binding, checked)} />单独自定义</label><Button size="sm" variant="ghost" onClick={() => void detachBinding(binding)}><Unlink className="mr-1.5 h-3.5 w-3.5" />解除关联</Button></div>}
                     </div>
                   ))}
                 </div>

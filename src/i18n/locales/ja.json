@@ -1121,7 +1121,7 @@
     "runFailed": "Codex タスクに失敗しました",
     "invalidPlan": "Codex から有効な構造化インストール計画が返されませんでした",
     "manualOnly": "このアプリには登録済みの安全なインストーラーがありません。アシスタントは案内のみ行え、自動実行はできません。",
-    "executionCompleted": "計画が完了しました。Runtime を再検出しています",
+    "executionCompleted": "計画が完了しました。インストール済みツールを再検出しています",
     "safetyNote": "確認済みの構造化インストール計画のみ実行します"
   },
   "grokBuild": {

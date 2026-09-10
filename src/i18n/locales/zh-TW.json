@@ -1122,7 +1122,7 @@
     "runFailed": "Codex 任務失敗",
     "invalidPlan": "Codex 未回傳可執行的結構化安裝計畫",
     "manualOnly": "此應用尚未有已登記的受控安裝器；助手只能提供建議，不能自動執行。",
-    "executionCompleted": "計畫已執行完成，正在重新偵測 Runtime",
+    "executionCompleted": "計畫已執行完成，正在重新偵測已安裝工具",
     "safetyNote": "僅執行確認後的結構化安裝計畫"
   },
   "grokBuild": {

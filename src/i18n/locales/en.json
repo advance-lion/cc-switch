@@ -1121,7 +1121,7 @@
     "runFailed": "Codex task failed",
     "invalidPlan": "Codex did not return a usable structured installation plan",
     "manualOnly": "This app has no registered guarded installer yet. The assistant can offer guidance, but cannot execute it automatically.",
-    "executionCompleted": "Plan completed; detecting Runtimes again",
+    "executionCompleted": "Plan completed; detecting installed tools again",
     "safetyNote": "Runs only confirmed structured installation plans"
   },
   "grokBuild": {

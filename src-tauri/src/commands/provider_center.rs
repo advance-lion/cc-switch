@@ -207,3 +207,22 @@ pub async fn set_provider_center_binding_override(
     provider_center::set_binding_override(state.inner(), &providerId, &appType, enabled)
         .map_err(|error| error.to_string())
 }
+
+#[tauri::command]
+pub async fn disable_provider_center_binding(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] appType: String,
+    #[allow(non_snake_case)] removeProjection: bool,
+) -> Result<(), String> {
+    let _data_guard = operations.lock_data().await;
+    let _guards = operations.lock_apps(vec![appType.clone()]).await;
+    provider_center::disable_binding(
+        state.inner(),
+        &providerId,
+        &appType,
+        removeProjection,
+    )
+    .map_err(|error| error.to_string())
+}

@@ -1720,6 +1720,7 @@ pub fn run() {
             commands::apply_provider_center_transaction,
             commands::restore_provider_center_transaction,
             commands::set_provider_center_binding_override,
+            commands::disable_provider_center_binding,
             // OpenCode specific
             commands::import_opencode_providers_from_live,
             commands::get_opencode_live_provider_ids,

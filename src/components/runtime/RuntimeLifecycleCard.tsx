@@ -97,6 +97,7 @@ interface LifecycleRowProps {
   updateChecked: boolean;
   updateAvailable: boolean;
   installationSource?: string | null;
+  additionalInstallationCount?: number;
   needsRepair?: boolean;
   loading: boolean;
   busy: boolean;
@@ -125,6 +126,7 @@ function LifecycleRow({
   updateChecked,
   updateAvailable,
   installationSource,
+  additionalInstallationCount = 0,
   needsRepair = false,
   loading,
   busy,
@@ -182,6 +184,7 @@ function LifecycleRow({
             {t("appLifecycle.installationSource", {
               source: installationSource,
             })}
+            {additionalInstallationCount > 0 ? ` · 另检测到 ${additionalInstallationCount} 份安装` : ""}
           </p>
         )}
         {!installed && disabledReason && (
@@ -472,8 +475,10 @@ function DesktopLifecycleRow({
   const [action, setAction] = useState<string | null>(null);
   const [uninstallOpen, setUninstallOpen] = useState(false);
   const [uninstallCompletedOpen, setUninstallCompletedOpen] = useState(false);
+  const [uninstallCompletionMessage, setUninstallCompletionMessage] = useState<string | null>(null);
   const [lastJob, setLastJob] = useState<DesktopLifecycleJob | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<DesktopLifecycleJob | null>(null);
   const lastRefreshRequestRef = useRef(refreshRequestId);
 
   const refresh = useCallback(async (includeLatest = false) => {
@@ -509,9 +514,28 @@ function DesktopLifecycleRow({
     void refresh(false);
   }, [refresh, refreshRequestId]);
 
+  useEffect(() => {
+    if (!activeJobId) {
+      setActiveJob(null);
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      const job = await settingsApi.getDesktopLifecycleJob(activeJobId).catch(() => null);
+      if (!disposed && job) setActiveJob(job);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 700);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [activeJobId]);
+
   const runLifecycle = async (nextAction: "install" | "update" | "uninstall") => {
     const jobId = crypto.randomUUID();
     setActiveJobId(jobId);
+    setActiveJob(null);
     setAction(nextAction);
     try {
       const next = await settingsApi.runDesktopAppLifecycleAction(app, nextAction, jobId);
@@ -521,6 +545,7 @@ function DesktopLifecycleRow({
       setLastJob(jobs[0] ?? null);
       if (nextAction === "uninstall") {
         setUninstallOpen(false);
+        setUninstallCompletionMessage(next.installed ? next.reason : null);
         setUninstallCompletedOpen(true);
       } else {
         toast.success(
@@ -584,6 +609,7 @@ function DesktopLifecycleRow({
           updateChecked={updateChecked}
           updateAvailable={updateAvailable}
           installationSource={status?.installation_source}
+          additionalInstallationCount={Math.max(0, (status?.installations?.length ?? 0) - 1)}
           loading={loading}
           busy={action !== null}
           action={action}
@@ -603,11 +629,31 @@ function DesktopLifecycleRow({
           onRedetect={() => void refresh(false)}
           onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
         />
+        {activeJob && ["queued", "running", "verifying"].includes(activeJob.state) && (
+          <div className="rounded-lg border border-blue-500/25 bg-blue-500/5 px-3 py-2 text-xs text-foreground">
+            <div className="flex items-center gap-2 font-medium">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600" />
+              {activeJob.state === "verifying" ? "正在重新检测安装结果" : "正在执行操作"}
+            </div>
+            <div className="mt-2 space-y-1 text-muted-foreground" aria-live="polite">
+              {activeJob.logs.slice(-4).map((entry, index) => (
+                <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
+              ))}
+            </div>
+          </div>
+        )}
         {lastJob && ["failed", "interrupted"].includes(lastJob.state) && (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
             上次{lastJob.action === "install" ? "安装" : lastJob.action === "update" ? "更新" : "卸载"}
             {lastJob.state === "interrupted" ? "被中断" : "失败"}
             {lastJob.errorMessage ? `：${lastJob.errorMessage}` : "，请重新检测后重试。"}
+            {lastJob.logs.length > 0 && (
+              <div className="mt-2 space-y-1 border-t border-amber-500/20 pt-2 opacity-90">
+                {lastJob.logs.slice(-4).map((entry, index) => (
+                  <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -624,6 +670,7 @@ function DesktopLifecycleRow({
         open={uninstallCompletedOpen}
         onOpenChange={setUninstallCompletedOpen}
         appName={title}
+        message={uninstallCompletionMessage}
       />
     </>
   );
@@ -633,10 +680,12 @@ function UninstallCompletedDialog({
   open,
   onOpenChange,
   appName,
+  message,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   appName: string;
+  message?: string | null;
 }) {
   const { t } = useTranslation();
   return (
@@ -647,7 +696,7 @@ function UninstallCompletedDialog({
             {t("appLifecycle.uninstallCompleted")}
           </DialogTitle>
           <DialogDescription className="text-sm leading-relaxed">
-            {t("appLifecycle.uninstallCompletedDescription", { app: appName })}
+            {message ?? t("appLifecycle.uninstallCompletedDescription", { app: appName })}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="pt-2 sm:justify-end">

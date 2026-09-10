@@ -96,6 +96,13 @@ export interface DesktopAppStatus {
   can_uninstall: boolean;
   can_launch: boolean;
   reason: string | null;
+  installations?: Array<{
+    version: string;
+    path: string;
+    launch_target: string | null;
+    package_identity: string | null;
+    installation_source: string;
+  }>;
 }
 
 export interface DesktopLifecycleJob {
@@ -115,6 +122,12 @@ export interface DesktopLifecycleJob {
   postProbe: DesktopAppStatus | null;
   errorCode: string | null;
   errorMessage: string | null;
+  logs: Array<{
+    at: number;
+    level: "info" | "warning" | "error" | string;
+    step: string;
+    message: string;
+  }>;
   createdAt: number;
   startedAt: number | null;
   completedAt: number | null;

@@ -25,6 +25,8 @@ export interface ProviderDefinition {
     sourceApp: string;
     sourceRef: string;
     importedAt: number;
+    sourceFingerprint?: string;
+    lastObservedAt?: number;
   };
   credentialConfigured: boolean;
   credentialHint?: string;
@@ -219,5 +221,15 @@ export const providerCenterApi = {
       providerId,
       appType,
       enabled,
+    }),
+  disableBinding: (
+    providerId: string,
+    appType: string,
+    removeProjection = false,
+  ): Promise<void> =>
+    invoke("disable_provider_center_binding", {
+      providerId,
+      appType,
+      removeProjection,
     }),
 };
