@@ -4,17 +4,17 @@
 //! 明文密钥的共享定义和绑定关系；用户明确点击「应用」后，才投影为原有的
 //! 应用级 Provider。这样原有的单应用自定义仍然是唯一的最终写入路径。
 
+mod app_adapter;
+
+use self::app_adapter::{projected_provider_id, provider_fingerprint, AppAdapterRegistry};
 use crate::app_config::AppType;
 use crate::database::{ProviderImportCandidateRecord, ProviderImportSessionRecord};
 use crate::error::AppError;
-use crate::provider::{
-    ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, Provider, UniversalProvider,
-};
+use crate::provider::{Provider, UniversalProvider};
 use crate::services::ProviderService;
 use crate::store::AppState;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -134,6 +134,46 @@ pub struct SaveProviderDefinitionInput {
     pub app_types: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFailure {
+    pub app_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    pub code: String,
+    pub stage: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportConflict {
+    pub existing_provider_id: String,
+    pub existing_name: String,
+    pub existing_revision: u64,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCommitDecision {
+    pub action: String,
+    #[serde(default)]
+    pub target_provider_id: Option<String>,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCommitResult {
+    pub action: String,
+    #[serde(default)]
+    pub provider: Option<ProviderDefinition>,
+    pub repeated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportCandidate {
@@ -151,6 +191,8 @@ pub struct ImportCandidate {
     pub credential_configured: bool,
     /// 只显示安全尾码，帮助区分条目；绝不返回密钥。
     pub credential_hint: Option<String>,
+    #[serde(default)]
+    pub conflicts: Vec<ImportConflict>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,9 +202,27 @@ pub struct ProviderImportSession {
     pub state: String,
     pub candidates: Vec<ImportCandidate>,
     #[serde(default)]
-    pub errors: Vec<String>,
+    pub errors: Vec<ImportFailure>,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PersistedImportCandidateState {
+    #[serde(default)]
+    conflicts: Vec<ImportConflict>,
+    #[serde(default)]
+    outcome: Option<PersistedImportOutcome>,
+    #[serde(default)]
+    quarantine: Option<ImportFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedImportOutcome {
+    action: String,
+    provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,8 +898,8 @@ pub fn unified_model_catalog(
     }
 
     for app in AppType::all().filter(|app| includes(app.as_str())) {
-        let current = ProviderService::current(state, app.clone()).unwrap_or_default();
-        let providers = match ProviderService::list(state, app.clone()) {
+        let current = app_adapter(&app).current(state).unwrap_or_default();
+        let providers = match app_adapter(&app).list(state) {
             Ok(providers) => providers,
             Err(_) => continue,
         };
@@ -1134,74 +1194,18 @@ fn models_from_settings(settings: &serde_json::Value) -> Vec<String> {
     models
 }
 
+fn app_adapter(app: &AppType) -> &'static app_adapter::AppAdapter {
+    AppAdapterRegistry::global()
+        .resolve(app.as_str())
+        .expect("all AppType variants must have Provider Center adapters")
+}
+
 fn protocol_for(app: &AppType) -> &'static str {
-    match app {
-        AppType::Claude | AppType::ClaudeDesktop => "anthropic",
-        AppType::Gemini => "gemini",
-        _ => "openai-chat",
-    }
+    app_adapter(app).default_protocol()
 }
 
 fn protocol_from_provider(app: &AppType, provider: &Provider) -> String {
-    let api = provider
-        .settings_config
-        .get("api")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            provider
-                .settings_config
-                .get("models")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|models| models.first())
-                .and_then(|model| model.get("api"))
-                .and_then(serde_json::Value::as_str)
-        });
-    if let Some(api) = api {
-        return match api {
-            "openai-responses" => "openai-responses",
-            "anthropic" | "anthropic-messages" => "anthropic",
-            "gemini" | "google-generative-ai" => "gemini",
-            _ => "openai-chat",
-        }
-        .to_string();
-    }
-    if matches!(app, AppType::Codex) {
-        if let Some(config) = provider
-            .settings_config
-            .get("config")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|config| toml::from_str::<toml::Value>(config).ok())
-        {
-            let provider_name = config.get("model_provider").and_then(toml::Value::as_str);
-            let wire_api = provider_name
-                .and_then(|name| config.get("model_providers")?.get(name))
-                .and_then(|value| value.get("wire_api"))
-                .and_then(toml::Value::as_str);
-            return if wire_api == Some("chat") {
-                "openai-chat"
-            } else {
-                "openai-responses"
-            }
-            .to_string();
-        }
-    }
-    if matches!(app, AppType::OpenCode) {
-        let npm = provider
-            .settings_config
-            .get("npm")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if npm.contains("anthropic") {
-            return "anthropic".to_string();
-        }
-        if npm.contains("google") || npm.contains("gemini") {
-            return "gemini".to_string();
-        }
-        if npm.contains("ollama") {
-            return "ollama".to_string();
-        }
-    }
-    protocol_for(app).to_string()
+    app_adapter(app).infer_protocol(provider)
 }
 
 fn candidate_from_provider(
@@ -1224,55 +1228,74 @@ fn candidate_from_provider(
         models: models_from_settings(&provider.settings_config),
         credential_configured: !key.trim().is_empty(),
         credential_hint: secret_hint(&key),
+        conflicts: Vec::new(),
     })
 }
 
 fn scan_imports_for_apps(
     state: &AppState,
     requested_apps: &HashSet<String>,
-) -> Result<Vec<ImportCandidate>, AppError> {
+) -> (Vec<ImportCandidate>, Vec<ImportFailure>) {
     let mut candidates = Vec::new();
+    let mut failures = Vec::new();
     for app in AppType::all() {
         if !requested_apps.is_empty() && !requested_apps.contains(app.as_str()) {
             continue;
         }
-        // 一个应用的损坏配置不能遮蔽其他应用的可导入结果。
-        if let Ok(providers) = ProviderService::list(state, app.clone()) {
-            for provider in providers.values() {
-                if let Some(candidate) = candidate_from_provider(
-                    format!("saved:{}:{}", app.as_str(), provider.id),
-                    &app,
-                    provider,
-                ) {
+        match app_adapter(&app).list(state) {
+            Ok(providers) => {
+                for provider in providers.values() {
+                    if let Some(candidate) = candidate_from_provider(
+                        format!("saved:{}:{}", app.as_str(), provider.id),
+                        &app,
+                        provider,
+                    ) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Err(error) => failures.push(ImportFailure {
+                app_type: app.as_str().to_string(),
+                source_ref: None,
+                code: "IMPORT_SAVED_SCAN_FAILED".to_string(),
+                stage: "scanSaved".to_string(),
+                message: error.to_string(),
+            }),
+        }
+        match app_adapter(&app).read_live_settings() {
+            Ok(settings) => {
+                let live = Provider::with_id(
+                    "live".to_string(),
+                    format!("{} 当前配置", app.as_str()),
+                    settings,
+                    None,
+                );
+                if let Some(candidate) =
+                    candidate_from_provider(format!("live:{}", app.as_str()), &app, &live)
+                {
                     candidates.push(candidate);
                 }
             }
-        }
-        if let Ok(settings) = ProviderService::read_live_settings(app.clone()) {
-            let live = Provider::with_id(
-                "live".to_string(),
-                format!("{} 当前配置", app.as_str()),
-                settings,
-                None,
-            );
-            if let Some(candidate) =
-                candidate_from_provider(format!("live:{}", app.as_str()), &app, &live)
-            {
-                candidates.push(candidate);
-            }
+            Err(error) => failures.push(ImportFailure {
+                app_type: app.as_str().to_string(),
+                source_ref: Some(format!("live:{}", app.as_str())),
+                code: "IMPORT_LIVE_SCAN_FAILED".to_string(),
+                stage: "scanLive".to_string(),
+                message: error.to_string(),
+            }),
         }
     }
     candidates.sort_by(|left, right| left.source_ref.cmp(&right.source_ref));
     candidates.dedup_by(|left, right| left.source_ref == right.source_ref);
-    Ok(candidates)
+    (candidates, failures)
 }
 
 pub fn scan_imports(state: &AppState) -> Result<Vec<ImportCandidate>, AppError> {
-    scan_imports_for_apps(state, &HashSet::new())
+    Ok(scan_imports_for_apps(state, &HashSet::new()).0)
 }
 
-fn import_candidate_fingerprint(provider: &Provider) -> Result<String, AppError> {
-    provider_fingerprint(provider)
+fn import_candidate_fingerprint(app: &AppType, provider: &Provider) -> Result<String, AppError> {
+    app_adapter(app).fingerprint(provider)
 }
 
 fn cleanup_expired_import_sessions(state: &AppState) -> Result<(), AppError> {
@@ -1280,6 +1303,109 @@ fn cleanup_expired_import_sessions(state: &AppState) -> Result<(), AppError> {
         remove_secret(state, &secret_ref)?;
     }
     Ok(())
+}
+
+fn normalized_import_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    match url::Url::parse(trimmed) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string().trim_end_matches('/').to_ascii_lowercase()
+        }
+        Err(_) => trimmed.to_ascii_lowercase(),
+    }
+}
+
+fn import_conflicts(
+    definitions: &[ProviderDefinition],
+    candidate: &ImportCandidate,
+    fingerprint: &str,
+) -> Vec<ImportConflict> {
+    definitions
+        .iter()
+        .filter_map(|definition| {
+            let mut reasons = Vec::new();
+            if definition.source.as_ref().is_some_and(|source| {
+                source.source_app == candidate.source_app
+                    && source.source_ref == candidate.source_ref
+            }) {
+                reasons.push("sameSource".to_string());
+            }
+            if definition.protocol == candidate.protocol
+                && normalized_import_url(&definition.base_url)
+                    == normalized_import_url(&candidate.base_url)
+            {
+                reasons.push("sameEndpoint".to_string());
+            }
+            if definition
+                .source
+                .as_ref()
+                .and_then(|source| source.source_fingerprint.as_deref())
+                == Some(fingerprint)
+            {
+                reasons.push("sameFingerprint".to_string());
+            }
+            if definition
+                .name
+                .trim()
+                .eq_ignore_ascii_case(candidate.name.trim())
+            {
+                reasons.push("sameName".to_string());
+            }
+            (!reasons.is_empty()).then(|| ImportConflict {
+                existing_provider_id: definition.id.clone(),
+                existing_name: definition.name.clone(),
+                existing_revision: definition.revision,
+                reasons,
+            })
+        })
+        .collect()
+}
+
+fn candidate_state(record: &ProviderImportCandidateRecord) -> PersistedImportCandidateState {
+    record
+        .conflict_json
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default()
+}
+
+fn import_failure(
+    app_type: impl Into<String>,
+    source_ref: Option<String>,
+    code: &str,
+    stage: &str,
+    message: impl Into<String>,
+) -> ImportFailure {
+    ImportFailure {
+        app_type: app_type.into(),
+        source_ref,
+        code: code.to_string(),
+        stage: stage.to_string(),
+        message: message.into(),
+    }
+}
+
+fn decode_session_errors(text: &str) -> Vec<ImportFailure> {
+    if let Ok(errors) = serde_json::from_str::<Vec<ImportFailure>>(text) {
+        return errors;
+    }
+    if let Ok(errors) = serde_json::from_str::<Vec<String>>(text) {
+        return errors
+            .into_iter()
+            .map(|message| import_failure("unknown", None, "IMPORT_SCAN_FAILED", "scan", message))
+            .collect();
+    }
+    vec![import_failure(
+        "provider-center",
+        None,
+        "IMPORT_SESSION_ERRORS_CORRUPT",
+        "decodeSession",
+        "导入错误摘要已损坏",
+    )]
 }
 
 pub fn start_import_session(
@@ -1295,22 +1421,53 @@ pub fn start_import_session(
     let session_id = Uuid::new_v4().to_string();
     let created_at = now();
     let expires_at = created_at + 30 * 60 * 1_000;
-    let mut errors = Vec::new();
+    let (scanned, mut errors) = scan_imports_for_apps(state, &requested_set);
+    let definitions = load_definitions(state)?;
     let mut candidates = Vec::new();
     let mut records = Vec::new();
 
-    for mut candidate in scan_imports_for_apps(state, &requested_set)? {
+    for mut candidate in scanned {
         let candidate_id = Uuid::new_v4().to_string();
-        let source = match source_provider(state, &candidate.source_ref) {
-            Ok((_, provider)) => provider,
+        let (source_app_type, source) = match source_provider(state, &candidate.source_ref) {
+            Ok((app, provider)) => (app, provider),
             Err(error) => {
-                errors.push(format!("{}: {error}", candidate.source_app));
+                errors.push(import_failure(
+                    candidate.source_app,
+                    Some(candidate.source_ref),
+                    "IMPORT_SOURCE_READ_FAILED",
+                    "readSource",
+                    error.to_string(),
+                ));
                 continue;
             }
         };
-        let fingerprint = import_candidate_fingerprint(&source)?;
-        let (_, api_key) =
-            source.resolve_usage_credentials(&AppType::from_str(&candidate.source_app)?);
+        let fingerprint = match import_candidate_fingerprint(&source_app_type, &source) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                errors.push(import_failure(
+                    candidate.source_app,
+                    Some(candidate.source_ref),
+                    "IMPORT_FINGERPRINT_FAILED",
+                    "fingerprint",
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let source_app = match AppType::from_str(&candidate.source_app) {
+            Ok(app) => app,
+            Err(error) => {
+                errors.push(import_failure(
+                    candidate.source_app,
+                    Some(candidate.source_ref),
+                    "IMPORT_APP_UNSUPPORTED",
+                    "credentials",
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let (_, api_key) = source.resolve_usage_credentials(&source_app);
         let temporary_secret_ref = if api_key.trim().is_empty() {
             None
         } else {
@@ -1320,6 +1477,11 @@ pub fn start_import_session(
         };
         candidate.id = candidate_id.clone();
         candidate.session_id = session_id.clone();
+        candidate.conflicts = import_conflicts(&definitions, &candidate, &fingerprint);
+        let persisted_state = PersistedImportCandidateState {
+            conflicts: candidate.conflicts.clone(),
+            ..Default::default()
+        };
         records.push(ProviderImportCandidateRecord {
             id: candidate_id,
             session_id: session_id.clone(),
@@ -1333,7 +1495,10 @@ pub fn start_import_session(
             temporary_secret_ref,
             credential_configured: candidate.credential_configured,
             fingerprint,
-            conflict_json: None,
+            conflict_json: Some(
+                serde_json::to_string(&persisted_state)
+                    .map_err(|error| AppError::Database(error.to_string()))?,
+            ),
         });
         candidates.push(candidate);
     }
@@ -1379,21 +1544,54 @@ pub fn get_import_session(
     if session.expires_at <= now() || session.state == "expired" {
         return Err(AppError::Message("导入会话已过期，请重新扫描".to_string()));
     }
-    let candidates = state
-        .db
-        .list_provider_import_candidates(session_id)?
-        .into_iter()
-        .map(|record| {
-            serde_json::from_str::<ImportCandidate>(&record.normalized_json)
-                .map_err(|error| AppError::Database(format!("导入候选已损坏: {error}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut errors = decode_session_errors(&session.error_summary_json);
+    let mut candidates = Vec::new();
+    for record in state.db.list_provider_import_candidates(session_id)? {
+        let persisted = candidate_state(&record);
+        if let Some(error) = persisted.quarantine {
+            errors.push(error);
+            continue;
+        }
+        if persisted.outcome.is_some() {
+            continue;
+        }
+        match serde_json::from_str::<ImportCandidate>(&record.normalized_json) {
+            Ok(mut candidate) => {
+                candidate.conflicts = persisted.conflicts;
+                candidates.push(candidate);
+            }
+            Err(_) => {
+                let failure = import_failure(
+                    record.source_app_type,
+                    record.source_locator,
+                    "IMPORT_CANDIDATE_CORRUPT",
+                    "decodeCandidate",
+                    "一个已保存的导入候选已损坏并被隔离",
+                );
+                let quarantine = PersistedImportCandidateState {
+                    quarantine: Some(failure.clone()),
+                    ..Default::default()
+                };
+                let state_json = serde_json::to_string(&quarantine)
+                    .map_err(|error| AppError::Database(error.to_string()))?;
+                state.db.update_provider_import_candidate_state(
+                    session_id,
+                    &record.id,
+                    &state_json,
+                    now(),
+                )?;
+                if let Some(reference) = record.temporary_secret_ref.as_deref() {
+                    let _ = remove_secret(state, reference);
+                }
+                errors.push(failure);
+            }
+        }
+    }
     Ok(ProviderImportSession {
         id: session.id,
         state: session.state,
         candidates,
-        errors: serde_json::from_str(&session.error_summary_json)
-            .map_err(|error| AppError::Database(format!("导入错误摘要已损坏: {error}")))?,
+        errors,
         created_at: session.created_at,
         expires_at: session.expires_at,
     })
@@ -1404,7 +1602,8 @@ pub fn commit_import_session_candidate(
     session_id: &str,
     candidate_id: &str,
     app_types: Vec<String>,
-) -> Result<ProviderDefinition, AppError> {
+    decision: ImportCommitDecision,
+) -> Result<ImportCommitResult, AppError> {
     let session = state
         .db
         .get_provider_import_session(session_id)?
@@ -1415,14 +1614,61 @@ pub fn commit_import_session_candidate(
     }
     let record = state
         .db
-        .list_provider_import_candidates(session_id)?
-        .into_iter()
-        .find(|candidate| candidate.id == candidate_id)
-        .ok_or_else(|| AppError::Message("导入候选不存在或已经处理".to_string()))?;
+        .get_provider_import_candidate(session_id, candidate_id)?
+        .ok_or_else(|| AppError::Message("导入候选不存在".to_string()))?;
+    let persisted = candidate_state(&record);
+    if let Some(outcome) = persisted.outcome {
+        let provider = outcome
+            .provider_id
+            .as_deref()
+            .map(|id| {
+                load_definitions(state)?
+                    .into_iter()
+                    .find(|item| item.id == id)
+                    .ok_or_else(|| AppError::Message("已提交的导入结果不存在".to_string()))
+            })
+            .transpose()?;
+        return Ok(ImportCommitResult {
+            action: outcome.action,
+            provider,
+            repeated: true,
+        });
+    }
+    if persisted.quarantine.is_some() {
+        return Err(AppError::Message("导入候选已损坏并被隔离".to_string()));
+    }
     let candidate: ImportCandidate = serde_json::from_str(&record.normalized_json)
-        .map_err(|error| AppError::Database(format!("导入候选已损坏: {error}")))?;
-    let (_, current_source) = source_provider(state, &candidate.source_ref)?;
-    if import_candidate_fingerprint(&current_source)? != record.fingerprint {
+        .map_err(|_| AppError::Message("导入候选已损坏并被隔离".to_string()))?;
+    if decision.action == "skip" {
+        let completed = PersistedImportCandidateState {
+            conflicts: persisted.conflicts,
+            outcome: Some(PersistedImportOutcome {
+                action: "skip".to_string(),
+                provider_id: None,
+            }),
+            quarantine: None,
+        };
+        state.db.update_provider_import_candidate_state(
+            session_id,
+            candidate_id,
+            &serde_json::to_string(&completed)
+                .map_err(|error| AppError::Database(error.to_string()))?,
+            now(),
+        )?;
+        if let Some(reference) = record.temporary_secret_ref.as_deref() {
+            remove_secret(state, reference)?;
+        }
+        return Ok(ImportCommitResult {
+            action: "skip".to_string(),
+            provider: None,
+            repeated: false,
+        });
+    }
+    if !matches!(decision.action.as_str(), "createCopy" | "merge") {
+        return Err(AppError::Message("无效的导入冲突处理方式".to_string()));
+    }
+    let (source_app_type, current_source) = source_provider(state, &candidate.source_ref)?;
+    if import_candidate_fingerprint(&source_app_type, &current_source)? != record.fingerprint {
         return Err(AppError::Message(
             "来源配置在扫描后发生变化，请重新扫描再导入".to_string(),
         ));
@@ -1432,21 +1678,45 @@ pub fn commit_import_session_candidate(
         .as_deref()
         .map(|reference| get_secret(state, reference))
         .transpose()?;
+    let (provider_id, expected_revision) = if decision.action == "merge" {
+        let target = decision
+            .target_provider_id
+            .as_deref()
+            .ok_or_else(|| AppError::Message("合并时必须选择目标模型服务".to_string()))?;
+        if !persisted
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.existing_provider_id == target)
+        {
+            return Err(AppError::Message(
+                "合并目标不在已确认的冲突列表中".to_string(),
+            ));
+        }
+        let revision = decision.expected_revision.ok_or_else(|| {
+            AppError::Message("合并时必须提供目标的 expectedRevision".to_string())
+        })?;
+        (target.to_string(), Some(revision))
+    } else {
+        (format!("import-{candidate_id}"), None)
+    };
     let result = save_definition(
         state,
         SaveProviderDefinitionInput {
-            // The import candidate is already a unique, persisted identity.
-            // Reusing it makes a retry idempotent if the process stops after
-            // saving the definition but before completing session cleanup.
-            id: Some(format!("import-{candidate_id}")),
+            id: Some(provider_id.clone()),
             name: candidate.name,
             protocol: candidate.protocol,
             base_url: candidate.base_url,
             models: candidate.models,
             notes: String::new(),
             enabled: Some(true),
-            expected_revision: None,
-            credential_action: api_key.as_ref().map(|_| "replace".to_string()),
+            expected_revision,
+            credential_action: if api_key.is_some() {
+                Some("replace".to_string())
+            } else if decision.action == "merge" {
+                Some("keep".to_string())
+            } else {
+                None
+            },
             source: Some(ProviderSource {
                 source_app: candidate.source_app,
                 source_ref: candidate.source_ref,
@@ -1458,22 +1728,29 @@ pub fn commit_import_session_candidate(
             app_types,
         },
     )?;
+    let completed = PersistedImportCandidateState {
+        conflicts: persisted.conflicts,
+        outcome: Some(PersistedImportOutcome {
+            action: decision.action.clone(),
+            provider_id: Some(result.id.clone()),
+        }),
+        quarantine: None,
+    };
+    state.db.update_provider_import_candidate_state(
+        session_id,
+        candidate_id,
+        &serde_json::to_string(&completed)
+            .map_err(|error| AppError::Database(error.to_string()))?,
+        now(),
+    )?;
     if let Some(reference) = record.temporary_secret_ref.as_deref() {
         remove_secret(state, reference)?;
     }
-    if let Err(error) = state
-        .db
-        .complete_provider_import_candidate(session_id, candidate_id, now())
-    {
-        // Keep the persisted session retryable if its database cleanup fails.
-        if let (Some(reference), Some(secret)) =
-            (record.temporary_secret_ref.as_deref(), api_key.as_deref())
-        {
-            let _ = save_secret(state, reference, secret);
-        }
-        return Err(error);
-    }
-    Ok(result)
+    Ok(ImportCommitResult {
+        action: decision.action,
+        provider: Some(result),
+        repeated: false,
+    })
 }
 
 fn source_provider(state: &AppState, source_ref: &str) -> Result<(AppType, Provider), AppError> {
@@ -1490,7 +1767,7 @@ fn source_provider(state: &AppState, source_ref: &str) -> Result<(AppType, Provi
     if let Some(app) = source_ref.strip_prefix("live:") {
         if !app.contains(':') {
             let app = AppType::from_str(app)?;
-            let settings = ProviderService::read_live_settings(app.clone())?;
+            let settings = app_adapter(&app).read_live_settings()?;
             return Ok((
                 app.clone(),
                 Provider::with_id(
@@ -1517,7 +1794,7 @@ pub fn import_candidate(
             "来源配置没有可导入的请求地址".to_string(),
         ));
     }
-    let source_fingerprint = import_candidate_fingerprint(&provider)?;
+    let source_fingerprint = import_candidate_fingerprint(&source_app, &provider)?;
     let source_protocol = protocol_from_provider(&source_app, &provider);
     save_definition(
         state,
@@ -1740,163 +2017,14 @@ pub async fn discover_models(
     Ok(result)
 }
 
-fn toml_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn openai_compatible_base_url(definition: &ProviderDefinition) -> String {
-    let base = definition.base_url.trim_end_matches('/');
-    if definition.protocol == "ollama" && !base.ends_with("/v1") {
-        format!("{base}/v1")
-    } else {
-        base.to_string()
-    }
-}
-
-fn native_api_name(protocol: &str) -> Option<&'static str> {
-    match protocol {
-        "openai-chat" | "ollama" => Some("openai-completions"),
-        "openai-responses" => Some("openai-responses"),
-        "anthropic" => Some("anthropic-messages"),
-        "gemini" => Some("google-generative-ai"),
-        _ => None,
-    }
-}
-
-fn validate_projection_protocol(app: &str, protocol: &str) -> Result<(), AppError> {
-    let supported = match app {
-        "claude" | "claude-desktop" => protocol == "anthropic",
-        "codex" => protocol == "openai-responses",
-        "gemini" => protocol == "gemini",
-        "grokbuild" => protocol == "openai-chat",
-        "opencode" | "hermes" => matches!(protocol, "openai-chat" | "ollama"),
-        "openclaw" | "pi" => native_api_name(protocol).is_some(),
-        _ => false,
-    };
-    if supported {
-        Ok(())
-    } else {
-        Err(AppError::Message(format!(
-            "{app} 当前不能直接使用 {protocol} 协议；请保留单应用配置或选择兼容协议"
-        )))
-    }
-}
-
 fn projection(
     definition: &ProviderDefinition,
     secret: String,
     app: &str,
 ) -> Result<Provider, AppError> {
-    validate_projection_protocol(app, &definition.protocol)?;
-    let mut universal = UniversalProvider::new(
-        format!("pc-{}", definition.id),
-        definition.name.clone(),
-        definition.protocol.clone(),
-        definition.base_url.clone(),
-        secret.clone(),
-    );
-    let models = if definition.models.is_empty() {
-        vec!["default".to_string()]
-    } else {
-        definition.models.clone()
-    };
-    let model = models.first().cloned();
-    let mut provider = match app {
-        "claude" => {
-            universal.apps.claude = true;
-            universal.models.claude = Some(ClaudeModelConfig {
-                model,
-                ..Default::default()
-            });
-            universal.to_claude_provider()
-        }
-        "codex" => {
-            universal.apps.codex = true;
-            universal.models.codex = Some(CodexModelConfig {
-                model,
-                reasoning_effort: Some("medium".to_string()),
-            });
-            universal.to_codex_provider()
-        }
-        "gemini" => {
-            universal.apps.gemini = true;
-            universal.models.gemini = Some(GeminiModelConfig { model });
-            universal.to_gemini_provider()
-        }
-        "claude-desktop" => {
-            if definition.protocol != "anthropic" {
-                return Err(AppError::Message("Claude Desktop 直连仅支持 Anthropic 协议；OpenAI 兼容服务请保留单应用配置或等待网关适配".to_string()));
-            }
-            Some(Provider::with_id(String::new(), definition.name.clone(), json!({ "env": { "ANTHROPIC_BASE_URL": definition.base_url, "ANTHROPIC_AUTH_TOKEN": secret } }), None))
-        }
-        "grokbuild" => {
-            let model = model.unwrap_or_else(|| "gpt-4o".to_string());
-            let model_key = "shared";
-            let config = format!(
-                "[models]\ndefault = \"{model_key}\"\n\n[model.{model_key}]\nmodel = \"{}\"\nbase_url = \"{}\"\napi_key = \"{}\"\nname = \"{}\"\napi_backend = \"openai\"\ncontext_window = 128000\n",
-                toml_string(&model), toml_string(&definition.base_url), toml_string(&secret), toml_string(&definition.name)
-            );
-            Some(Provider::with_id(String::new(), definition.name.clone(), json!({ "config": config }), None))
-        }
-        "opencode" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "npm": "@ai-sdk/openai-compatible", "name": definition.name,
-            "options": { "baseURL": openai_compatible_base_url(definition), "apiKey": secret },
-            "models": models.iter().map(|item| (item.clone(), json!({ "name": item }))).collect::<serde_json::Map<String, serde_json::Value>>()
-        }), None)),
-        "openclaw" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "baseUrl": openai_compatible_base_url(definition), "apiKey": secret,
-            "api": native_api_name(&definition.protocol).expect("validated protocol"),
-            "models": models.iter().map(|item| json!({ "id": item, "name": item })).collect::<Vec<_>>()
-        }), None)),
-        "hermes" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "base_url": openai_compatible_base_url(definition), "api_key": secret,
-            "models": models.iter().map(|item| (item.clone(), json!({}))).collect::<serde_json::Map<String, serde_json::Value>>()
-        }), None)),
-        "pi" => Some(Provider::with_id(String::new(), definition.name.clone(), json!({
-            "apiKey": secret,
-            "models": models.iter().map(|item| json!({
-                "id": item,
-                "name": item,
-                "api": native_api_name(&definition.protocol).expect("validated protocol"),
-                "baseUrl": openai_compatible_base_url(definition)
-            })).collect::<Vec<_>>()
-        }), None)),
-        _ => None,
-    }.ok_or_else(|| AppError::Message("该应用尚未有安全的配置适配器".to_string()))?;
-    provider.id = projected_provider_id(definition, app);
-    provider.category = Some("provider-center".to_string());
-    Ok(provider)
-}
-
-fn projected_provider_id(definition: &ProviderDefinition, app: &str) -> String {
-    definition
-        .source
-        .as_ref()
-        .and_then(|source| source.source_ref.strip_prefix("universal:"))
-        .filter(|_| matches!(app, "claude" | "codex" | "gemini"))
-        .map(|legacy_id| format!("universal-{app}-{legacy_id}"))
-        .unwrap_or_else(|| format!("provider-center-{app}-{}", definition.id))
-}
-
-fn provider_fingerprint(provider: &Provider) -> Result<String, AppError> {
-    // Provider constructors may attach volatile creation/sort metadata. Those
-    // values are not part of the projected live configuration and would make
-    // two identical renders hash differently. Drift detection intentionally
-    // covers only stable user-visible/configuration fields.
-    let stable = json!({
-        "id": provider.id,
-        "name": provider.name,
-        "settingsConfig": provider.settings_config,
-        "websiteUrl": provider.website_url,
-        "category": provider.category,
-        "notes": provider.notes,
-        "meta": provider.meta,
-        "icon": provider.icon,
-        "iconColor": provider.icon_color,
-    });
-    let bytes = serde_json::to_vec(&stable)
-        .map_err(|error| AppError::Message(format!("无法计算配置指纹: {error}")))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    AppAdapterRegistry::global()
+        .resolve(app)?
+        .render_projection(definition, &secret)
 }
 
 fn selected_targets(
@@ -2015,7 +2143,7 @@ pub fn preview_apply(
             .find(|binding| binding.provider_id == provider_id && binding.app_type == app_name)
             .and_then(|binding| binding.expected_fingerprint.as_ref());
         let drifted = expected.is_some() && expected != current_fingerprint.as_ref();
-        let current_id = ProviderService::current(state, app.clone())?;
+        let current_id = app_adapter(&app).current(state)?;
         previews.push(ProviderApplyPreviewTarget {
             app_type: app_name,
             operation: if existing.is_some() {
@@ -2107,19 +2235,12 @@ fn load_snapshots(
 
 fn apply_projected_provider(
     state: &AppState,
-    app: AppType,
+    app: &str,
     provider: Provider,
 ) -> Result<(), AppError> {
-    let id = provider.id.clone();
-    if state.db.get_provider_by_id(&id, app.as_str())?.is_some() {
-        ProviderService::update(state, app.clone(), Some(&id), provider)?;
-    } else {
-        ProviderService::add(state, app.clone(), provider, true)?;
-    }
-    if !app.is_additive_mode() {
-        ProviderService::switch(state, app, &id)?;
-    }
-    Ok(())
+    AppAdapterRegistry::global()
+        .resolve(app)?
+        .apply(state, provider)
 }
 
 fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(), AppError> {
@@ -2149,14 +2270,12 @@ fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(
                 .db
                 .get_provider_by_id(&snapshot.projected_provider_id, app.as_str())?
                 .is_some()
-            {
-                if ProviderService::delete(state, app.clone(), &snapshot.projected_provider_id)
+                && ProviderService::delete(state, app.clone(), &snapshot.projected_provider_id)
                     .is_err()
-                {
-                    state
-                        .db
-                        .delete_provider(app.as_str(), &snapshot.projected_provider_id)?;
-                }
+            {
+                state
+                    .db
+                    .delete_provider(app.as_str(), &snapshot.projected_provider_id)?;
             }
         }
     }
@@ -2263,18 +2382,19 @@ pub fn apply_transaction(
     let mut failed = false;
     let mut failed_index = None;
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let app = AppType::from_str(&snapshot.app_type)?;
+        let adapter = AppAdapterRegistry::global().resolve(&snapshot.app_type)?;
         let projected = projection(&definition, secret.clone(), &snapshot.app_type)?;
-        let result = apply_projected_provider(state, app.clone(), projected).and_then(|_| {
-            let actual = state
-                .db
-                .get_provider_by_id(&snapshot.projected_provider_id, app.as_str())?
-                .ok_or_else(|| AppError::Message("写入后未找到目标配置".to_string()))?;
-            if provider_fingerprint(&actual)? != snapshot.after_fingerprint {
-                return Err(AppError::Message("写入后配置校验失败".to_string()));
-            }
-            Ok(())
-        });
+        let result =
+            apply_projected_provider(state, &snapshot.app_type, projected).and_then(|_| {
+                let actual = state
+                    .db
+                    .get_provider_by_id(&snapshot.projected_provider_id, adapter.app_id())?
+                    .ok_or_else(|| AppError::Message("写入后未找到目标配置".to_string()))?;
+                if provider_fingerprint(&actual)? != snapshot.after_fingerprint {
+                    return Err(AppError::Message("写入后配置校验失败".to_string()));
+                }
+                Ok(())
+            });
         match result {
             Ok(()) => {
                 transaction.targets[index].status = "applied".to_string();
@@ -2320,7 +2440,7 @@ pub fn apply_transaction(
             let original_message = transaction.targets[index].message.clone();
             match restore_snapshot(state, &snapshots[index]) {
                 Ok(()) => {
-                    transaction.targets[index].status = "rolledBack".to_string();
+                    transaction.targets[index].status = "rolled_back".to_string();
                     transaction.targets[index].message = original_message;
                     if let Some(binding) = bindings.iter_mut().find(|binding| {
                         binding.provider_id == provider_id
@@ -2343,7 +2463,7 @@ pub fn apply_transaction(
         transaction.status = if rollback_failed {
             "recoveryRequired".to_string()
         } else {
-            "rolledBack".to_string()
+            "rolled_back".to_string()
         };
     } else {
         transaction.status = "applied".to_string();
@@ -2507,7 +2627,7 @@ pub fn disable_binding(
             .get_provider_by_id(&projected_id, app.as_str())?
             .is_some()
         {
-            ProviderService::delete(state, app, &projected_id)?;
+            app_adapter(&app).delete(state, &projected_id)?;
         }
     }
     binding.enabled = false;
@@ -2523,6 +2643,8 @@ pub fn disable_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{ClaudeModelConfig, CodexModelConfig, GeminiModelConfig};
+    use serde_json::json;
 
     fn definition(protocol: &str) -> ProviderDefinition {
         ProviderDefinition {
@@ -2543,6 +2665,28 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn rollback_status_serializes_with_frontend_contract() {
+        let transaction = ProviderApplyTransaction {
+            id: "tx-rollback".to_string(),
+            provider_id: "shared".to_string(),
+            provider_revision: 1,
+            status: "rolled_back".to_string(),
+            targets: vec![ProviderApplyTargetResult {
+                app_type: "codex".to_string(),
+                status: "rolled_back".to_string(),
+                message: None,
+            }],
+            created_at: 1,
+            completed_at: Some(2),
+        };
+
+        let json = serde_json::to_value(transaction).expect("serialize rollback transaction");
+        assert_eq!(json["status"], "rolled_back");
+        assert_eq!(json["targets"][0]["status"], "rolled_back");
+        assert!(!json.to_string().contains("rolledBack"));
     }
 
     #[test]
@@ -2864,8 +3008,15 @@ mod tests {
             &session.id,
             &candidate.id,
             vec!["codex".to_string(), "openclaw".to_string()],
+            ImportCommitDecision {
+                action: "createCopy".to_string(),
+                target_provider_id: None,
+                expected_revision: None,
+            },
         )
-        .expect("commit import");
+        .expect("commit import")
+        .provider
+        .expect("createCopy returns the imported definition");
 
         assert_eq!(imported.id, format!("import-{}", candidate.id));
         assert_eq!(imported.models, vec!["gpt-5"]);

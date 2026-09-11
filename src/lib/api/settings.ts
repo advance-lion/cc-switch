@@ -56,9 +56,14 @@ export interface CodexAssistantInstallSummary {
   officialSource: string;
 }
 
+export interface CodexAssistantChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface CodexAssistantEvent {
   runId: string;
-  kind: "started" | "log" | "stderr" | "plan" | "finished";
+  kind: "started" | "log" | "stderr" | "plan" | "message" | "finished";
   message?: string | null;
   planId?: string | null;
   plan?: CodexAssistantPlan | null;
@@ -128,6 +133,25 @@ export interface DesktopLifecycleJob {
     step: string;
     message: string;
   }>;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+}
+
+export type LifecycleJobState = DesktopLifecycleJob["state"];
+export type LifecycleJobLogEntry = DesktopLifecycleJob["logs"][number];
+
+export interface CliLifecycleJob {
+  id: string;
+  appId: string;
+  component: "cli";
+  action: "install" | "update" | "uninstall";
+  state: LifecycleJobState;
+  preProbe: { installed: boolean; version: string | null } | null;
+  postProbe: { installed: boolean; version: string | null } | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  logs: LifecycleJobLogEntry[];
   createdAt: number;
   startedAt: number | null;
   completedAt: number | null;
@@ -240,6 +264,21 @@ export const settingsApi = {
     return await invoke("start_codex_assistant_plan", body);
   },
 
+  async startCodexAssistantChat(
+    request: string,
+    history: CodexAssistantChatTurn[],
+  ): Promise<string> {
+    const body = { request, history };
+    if (isCodexAssistantWebBridgeActive()) {
+      const result = await webAssistantRequest<{ runId: string }>(
+        "/chat",
+        body,
+      );
+      return result.runId;
+    }
+    return await invoke("start_codex_assistant_chat", body);
+  },
+
   async executeCodexAssistantPlan(planId: string): Promise<string> {
     if (isCodexAssistantWebBridgeActive()) {
       const result = await webAssistantRequest<{ runId: string }>("/execute", {
@@ -303,7 +342,11 @@ export const settingsApi = {
         { app, action, jobId },
       );
     }
-    return await invoke("run_desktop_app_lifecycle_action", { app, action, jobId });
+    return await invoke("run_desktop_app_lifecycle_action", {
+      app,
+      action,
+      jobId,
+    });
   },
 
   async cancelDesktopLifecycleJob(jobId: string): Promise<boolean> {
@@ -327,10 +370,9 @@ export const settingsApi = {
 
   async launchDesktopApp(app: DesktopAppId): Promise<void> {
     if (isCodexAssistantWebBridgeActive()) {
-      await webAssistantRequest<{ launched: boolean }>(
-        "/desktop-app-launch",
-        { app },
-      );
+      await webAssistantRequest<{ launched: boolean }>("/desktop-app-launch", {
+        app,
+      });
       return;
     }
     await invoke("launch_desktop_app", { app });
@@ -567,9 +609,7 @@ export const settingsApi = {
   },
 
   /** 只有用户明确点“检查更新”时才访问远程版本源。 */
-  async checkToolUpdates(
-    tools: string[],
-  ): Promise<
+  async checkToolUpdates(tools: string[]): Promise<
     Array<{
       name: string;
       version: string | null;
@@ -599,6 +639,40 @@ export const settingsApi = {
       action,
       wslShellByTool,
     });
+  },
+
+  /**
+   * 任务化的 CLI 生命周期操作：后端把进度写入持久化任务记录，
+   * 前端生成 jobId 并轮询 getCliLifecycleJob 获取实时日志；
+   * 相同 jobId 重复提交幂等，不会重复执行安装脚本。
+   */
+  async runCliLifecycleAction(
+    tool: string,
+    action: "install" | "update" | "uninstall",
+    jobId?: string,
+    wslShellByTool?: Record<
+      string,
+      { wslShell?: string | null; wslShellFlag?: string | null }
+    >,
+  ): Promise<void> {
+    await invoke("run_cli_lifecycle_action", {
+      tool,
+      action,
+      jobId,
+      wslShellByTool,
+    });
+  },
+
+  async cancelCliLifecycleJob(jobId: string): Promise<boolean> {
+    return await invoke("cancel_cli_lifecycle_job", { jobId });
+  },
+
+  async getCliLifecycleJob(jobId: string): Promise<CliLifecycleJob | null> {
+    return await invoke("get_cli_lifecycle_job", { jobId });
+  },
+
+  async listCliLifecycleJobs(tool?: string): Promise<CliLifecycleJob[]> {
+    return await invoke("list_cli_lifecycle_jobs", { tool });
   },
 
   /** 在用户首选终端中启动已登记 Runtime 的 CLI。后端只接受受支持的工具名。 */

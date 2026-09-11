@@ -12,6 +12,7 @@ export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
 export { isCodexAssistantWebBridgeActive } from "./settings";
 export type {
+  CodexAssistantChatTurn,
   CodexAssistantEvent,
   CodexAssistantPlan,
   CodexAssistantPlanStep,
@@ -20,6 +21,7 @@ export type {
   DesktopAppStatus,
   DesktopLifecycleAction,
   DesktopLifecycleJob,
+  CliLifecycleJob,
   ToolLifecycleCapabilities,
 } from "./settings";
 export { mcpApi } from "./mcp";

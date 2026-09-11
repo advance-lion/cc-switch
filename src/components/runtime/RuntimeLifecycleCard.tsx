@@ -25,6 +25,7 @@ import { APP_ICON_MAP } from "@/config/appConfig";
 import {
   settingsApi,
   type AppId,
+  type CliLifecycleJob,
   type DesktopAppId,
   type DesktopAppStatus,
   type DesktopLifecycleJob,
@@ -68,10 +69,13 @@ const DESKTOP_BY_APP: Partial<Record<AppId, DesktopAppId>> = {
   codex: "codex-desktop",
 };
 
-const cliCache = new Map<RuntimeTool, {
-  status: ToolVersion | null;
-  capabilities: ToolLifecycleCapabilities | null;
-}>();
+const cliCache = new Map<
+  RuntimeTool,
+  {
+    status: ToolVersion | null;
+    capabilities: ToolLifecycleCapabilities | null;
+  }
+>();
 const desktopCache = new Map<DesktopAppId, DesktopAppStatus>();
 
 interface RuntimeLifecycleCardProps {
@@ -115,6 +119,70 @@ interface LifecycleRowProps {
   onUninstall: () => void;
   onRedetect: () => void;
   onCancel?: () => void;
+}
+
+/** CLI 与桌面任务共用的横幅视图：渲染只依赖状态、动作、错误和日志尾部。 */
+interface LifecycleJobView {
+  state: string;
+  action: string;
+  errorMessage: string | null;
+  logs: Array<{ at: number; step: string; message: string }>;
+}
+
+/** 进行中任务横幅：不定态进度条 + 实时日志尾部（软件商店式安装进度）。 */
+function JobActiveBanner({ job }: { job: LifecycleJobView }) {
+  const { t } = useTranslation();
+  return (
+    <div className="rounded-lg border border-blue-500/25 bg-blue-500/5 px-3 py-2 text-xs text-foreground">
+      <div className="flex items-center gap-2 font-medium">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600" />
+        {job.state === "verifying"
+          ? t("appLifecycle.jobVerifying")
+          : t("appLifecycle.jobRunning")}
+      </div>
+      <div className="mt-2 h-1 overflow-hidden rounded-full bg-blue-500/15">
+        <div className="cc-progress-indeterminate h-full w-1/3 rounded-full bg-blue-500" />
+      </div>
+      <div className="mt-2 space-y-1 text-muted-foreground" aria-live="polite">
+        {job.logs.slice(-4).map((entry, index) => (
+          <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** 失败/中断任务横幅：给出动作语义、错误详情和日志尾部。 */
+function JobFailureBanner({ job }: { job: LifecycleJobView }) {
+  const { t } = useTranslation();
+  return (
+    <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+      {t(
+        job.state === "interrupted"
+          ? "appLifecycle.lastJobInterrupted"
+          : "appLifecycle.lastJobFailed",
+        {
+          action: t(
+            job.action === "install"
+              ? "appLifecycle.actionInstall"
+              : job.action === "update"
+                ? "appLifecycle.actionUpdate"
+                : "appLifecycle.actionUninstall",
+          ),
+        },
+      )}
+      {job.errorMessage
+        ? `：${job.errorMessage}`
+        : t("appLifecycle.retryAfterDetect")}
+      {job.logs.length > 0 && (
+        <div className="mt-2 space-y-1 border-t border-amber-500/20 pt-2 opacity-90">
+          {job.logs.slice(-4).map((entry, index) => (
+            <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function LifecycleRow({
@@ -184,7 +252,9 @@ function LifecycleRow({
             {t("appLifecycle.installationSource", {
               source: installationSource,
             })}
-            {additionalInstallationCount > 0 ? ` · 另检测到 ${additionalInstallationCount} 份安装` : ""}
+            {additionalInstallationCount > 0
+              ? ` · 另检测到 ${additionalInstallationCount} 份安装`
+              : ""}
           </p>
         )}
         {!installed && disabledReason && (
@@ -197,7 +267,7 @@ function LifecycleRow({
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         {busy && onCancel && (
           <Button variant="outline" size="sm" onClick={onCancel}>
-            停止
+            {t("appLifecycle.stop")}
           </Button>
         )}
         {installed ? (
@@ -207,7 +277,7 @@ function LifecycleRow({
               size="sm"
               disabled={busy || needsRepair || !canLaunch}
               onClick={onLaunch}
-              title={!canLaunch ? disabledReason ?? undefined : undefined}
+              title={!canLaunch ? (disabledReason ?? undefined) : undefined}
             >
               {action === "launch" ? (
                 <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -221,9 +291,11 @@ function LifecycleRow({
             <Button
               variant="outline"
               size="sm"
-              disabled={busy || !canUpdate || (updateChecked && !updateAvailable)}
+              disabled={
+                busy || !canUpdate || (updateChecked && !updateAvailable)
+              }
               onClick={onCheckOrUpdate}
-              title={!canUpdate ? disabledReason ?? undefined : undefined}
+              title={!canUpdate ? (disabledReason ?? undefined) : undefined}
             >
               {action === "check" || action === "update" ? (
                 <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -255,7 +327,7 @@ function LifecycleRow({
               size="sm"
               disabled={busy || loading || !canInstall}
               onClick={onInstall}
-              title={!canInstall ? disabledReason ?? undefined : undefined}
+              title={!canInstall ? (disabledReason ?? undefined) : undefined}
             >
               {action === "install" ? (
                 <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -307,43 +379,67 @@ function CliLifecycleRow({
 }) {
   const { t } = useTranslation();
   const cached = cliCache.get(tool);
-  const [status, setStatus] = useState<ToolVersion | null>(cached?.status ?? null);
-  const [capabilities, setCapabilities] = useState<ToolLifecycleCapabilities | null>(
-    cached?.capabilities ?? null,
+  const [status, setStatus] = useState<ToolVersion | null>(
+    cached?.status ?? null,
   );
+  const [capabilities, setCapabilities] =
+    useState<ToolLifecycleCapabilities | null>(cached?.capabilities ?? null);
   const [loading, setLoading] = useState(!cached);
   const [action, setAction] = useState<string | null>(null);
   const [uninstallOpen, setUninstallOpen] = useState(false);
   const [uninstallCompletedOpen, setUninstallCompletedOpen] = useState(false);
+  const [lastJob, setLastJob] = useState<CliLifecycleJob | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<CliLifecycleJob | null>(null);
   const lastRefreshRequestRef = useRef(refreshRequestId);
 
-  const refresh = useCallback(async (includeLatest = false) => {
-    setLoading(true);
-    try {
-      const [versions, lifecycleCapabilities] = await Promise.all([
-        includeLatest
-          ? settingsApi.checkToolUpdates([tool])
-          : settingsApi.getToolVersions([tool]),
-        settingsApi.getToolLifecycleCapabilities([tool]),
-      ]);
-      const next = versions[0] ?? null;
-      const nextCapabilities = lifecycleCapabilities[0] ?? null;
-      setStatus(next);
-      setCapabilities(nextCapabilities);
-      cliCache.set(tool, { status: next, capabilities: nextCapabilities });
-      return next;
-    } catch (error) {
-      toast.error(t("appLifecycle.detectFailed"), {
-        description: extractErrorMessage(error),
-      });
-      return null;
-    } finally {
-      setLoading(false);
-    }
-  }, [t, tool]);
+  const refresh = useCallback(
+    async (includeLatest = false) => {
+      setLoading(true);
+      try {
+        const [versions, lifecycleCapabilities] = await Promise.all([
+          includeLatest
+            ? settingsApi.checkToolUpdates([tool])
+            : settingsApi.getToolVersions([tool]),
+          settingsApi.getToolLifecycleCapabilities([tool]),
+        ]);
+        const next = versions[0] ?? null;
+        const nextCapabilities = lifecycleCapabilities[0] ?? null;
+        setStatus(next);
+        setCapabilities(nextCapabilities);
+        cliCache.set(tool, { status: next, capabilities: nextCapabilities });
+        return next;
+      } catch (error) {
+        toast.error(t("appLifecycle.detectFailed"), {
+          description: extractErrorMessage(error),
+        });
+        return null;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [t, tool],
+  );
 
   useEffect(() => {
     if (!cliCache.has(tool)) void refresh(false);
+    void settingsApi
+      .listCliLifecycleJobs(tool)
+      .then((jobs) => {
+        const latest = jobs[0] ?? null;
+        if (
+          latest &&
+          ["queued", "running", "verifying"].includes(latest.state)
+        ) {
+          // 切换页面后重新挂载：恢复进行中任务的进度展示与取消入口，
+          // 不再出现"后台还在装、按钮却已变回可点"的假空闲状态。
+          setActiveJobId(latest.id);
+          setAction(latest.action);
+          setActiveJob(latest);
+        }
+        setLastJob(latest);
+      })
+      .catch(() => undefined);
   }, [refresh, tool]);
 
   useEffect(() => {
@@ -352,24 +448,69 @@ function CliLifecycleRow({
     void refresh(false);
   }, [refresh, refreshRequestId]);
 
+  useEffect(() => {
+    if (!activeJobId) {
+      setActiveJob(null);
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      const job = await settingsApi
+        .getCliLifecycleJob(activeJobId)
+        .catch(() => null);
+      if (!disposed && job) setActiveJob(job);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 700);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [activeJobId]);
+
   const runLifecycle = async (nextAction: "install" | "update") => {
+    const jobId = crypto.randomUUID();
+    setActiveJobId(jobId);
+    setActiveJob(null);
     setAction(nextAction);
     try {
-      await settingsApi.runToolLifecycleAction([tool], nextAction);
+      await settingsApi.runCliLifecycleAction(tool, nextAction, jobId);
       const detected = await refresh(false);
       if (nextAction === "install" && !detected?.version) {
         throw new Error(t("appLifecycle.installNotDetected"));
       }
+      const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       toast.success(
-        t(nextAction === "install" ? "appLifecycle.installCompleted" : "appLifecycle.updateCompleted"),
+        t(
+          nextAction === "install"
+            ? "appLifecycle.installCompleted"
+            : "appLifecycle.updateCompleted",
+        ),
       );
     } catch (error) {
+      const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       toast.error(
-        t(nextAction === "install" ? "appLifecycle.installFailed" : "appLifecycle.updateFailed"),
+        t(
+          nextAction === "install"
+            ? "appLifecycle.installFailed"
+            : "appLifecycle.updateFailed",
+        ),
         { description: extractErrorMessage(error) },
       );
     } finally {
+      setActiveJobId(null);
       setAction(null);
+    }
+  };
+
+  const cancelLifecycle = async () => {
+    if (!activeJobId) return;
+    const accepted = await settingsApi.cancelCliLifecycleJob(activeJobId);
+    if (!accepted) {
+      toast.error(t("appLifecycle.cancelFinished"));
+      await refresh(false);
     }
   };
 
@@ -388,18 +529,27 @@ function CliLifecycleRow({
   };
 
   const uninstall = async () => {
+    const jobId = crypto.randomUUID();
+    setActiveJobId(jobId);
+    setActiveJob(null);
     setAction("uninstall");
     try {
-      await settingsApi.uninstallToolRuntime(tool);
+      await settingsApi.runCliLifecycleAction(tool, "uninstall", jobId);
       const detected = await refresh(false);
-      if (detected?.version) throw new Error(t("appLifecycle.uninstallStillDetected"));
+      if (detected?.version)
+        throw new Error(t("appLifecycle.uninstallStillDetected"));
+      const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       setUninstallOpen(false);
       setUninstallCompletedOpen(true);
     } catch (error) {
+      const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
+      setLastJob(jobs[0] ?? null);
       toast.error(t("appLifecycle.uninstallFailed"), {
         description: extractErrorMessage(error),
       });
     } finally {
+      setActiveJobId(null);
       setAction(null);
     }
   };
@@ -407,40 +557,54 @@ function CliLifecycleRow({
   const installed = Boolean(status?.version);
   const updateChecked = Boolean(status?.latest_version);
   const updateAvailable = Boolean(
-    status?.version && status.latest_version && isUpdateAvailable(status.version, status.latest_version),
+    status?.version &&
+      status.latest_version &&
+      isUpdateAvailable(status.version, status.latest_version),
   );
   const busy = action !== null;
 
   return (
     <>
-      <LifecycleRow
-        title={title}
-        subtitle={subtitle}
-        installed={installed}
-        version={status?.version ?? null}
-        latestVersion={status?.latest_version ?? null}
-        updateChecked={updateChecked}
-        updateAvailable={updateAvailable}
-        installationSource={capabilities?.installation_source}
-        needsRepair={status?.installed_but_broken}
-        loading={loading}
-        busy={busy}
-        action={action}
-        canInstall={capabilities?.can_install ?? false}
-        canUpdate={capabilities?.can_update ?? false}
-        canUninstall={capabilities?.can_uninstall ?? false}
-        canLaunch={capabilities?.can_launch ?? false}
-        disabledReason={capabilities?.reason}
-        launchLabel={t("appLifecycle.launch")}
-        onInstall={() => void runLifecycle("install")}
-        onAiInstall={onAiInstall}
-        onLaunch={() => void launch()}
-        onCheckOrUpdate={() =>
-          void (updateChecked && updateAvailable ? runLifecycle("update") : refresh(true))
-        }
-        onUninstall={() => setUninstallOpen(true)}
-        onRedetect={() => void refresh(false)}
-      />
+      <div className="space-y-1.5">
+        <LifecycleRow
+          title={title}
+          subtitle={subtitle}
+          installed={installed}
+          version={status?.version ?? null}
+          latestVersion={status?.latest_version ?? null}
+          updateChecked={updateChecked}
+          updateAvailable={updateAvailable}
+          installationSource={capabilities?.installation_source}
+          needsRepair={status?.installed_but_broken}
+          loading={loading}
+          busy={busy}
+          action={action}
+          canInstall={capabilities?.can_install ?? false}
+          canUpdate={capabilities?.can_update ?? false}
+          canUninstall={capabilities?.can_uninstall ?? false}
+          canLaunch={capabilities?.can_launch ?? false}
+          disabledReason={capabilities?.reason}
+          launchLabel={t("appLifecycle.launch")}
+          onInstall={() => void runLifecycle("install")}
+          onAiInstall={onAiInstall}
+          onLaunch={() => void launch()}
+          onCheckOrUpdate={() =>
+            void (updateChecked && updateAvailable
+              ? runLifecycle("update")
+              : refresh(true))
+          }
+          onUninstall={() => setUninstallOpen(true)}
+          onRedetect={() => void refresh(false)}
+          onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
+        />
+        {activeJob &&
+          ["queued", "running", "verifying"].includes(activeJob.state) && (
+            <JobActiveBanner job={activeJob} />
+          )}
+        {lastJob && ["failed", "interrupted"].includes(lastJob.state) && (
+          <JobFailureBanner job={lastJob} />
+        )}
+      </div>
       <ConfirmDialog
         isOpen={uninstallOpen}
         title={t("appLifecycle.uninstallTitle", { app: title })}
@@ -475,36 +639,53 @@ function DesktopLifecycleRow({
   const [action, setAction] = useState<string | null>(null);
   const [uninstallOpen, setUninstallOpen] = useState(false);
   const [uninstallCompletedOpen, setUninstallCompletedOpen] = useState(false);
-  const [uninstallCompletionMessage, setUninstallCompletionMessage] = useState<string | null>(null);
+  const [uninstallCompletionMessage, setUninstallCompletionMessage] = useState<
+    string | null
+  >(null);
   const [lastJob, setLastJob] = useState<DesktopLifecycleJob | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<DesktopLifecycleJob | null>(null);
   const lastRefreshRequestRef = useRef(refreshRequestId);
 
-  const refresh = useCallback(async (includeLatest = false) => {
-    setLoading(true);
-    try {
-      const next = includeLatest
-        ? await settingsApi.checkDesktopAppUpdates(app)
-        : await settingsApi.getDesktopAppStatus(app);
-      setStatus(next);
-      desktopCache.set(app, next);
-      return next;
-    } catch (error) {
-      toast.error(t("appLifecycle.detectFailed"), {
-        description: extractErrorMessage(error),
-      });
-      return null;
-    } finally {
-      setLoading(false);
-    }
-  }, [app, t]);
+  const refresh = useCallback(
+    async (includeLatest = false) => {
+      setLoading(true);
+      try {
+        const next = includeLatest
+          ? await settingsApi.checkDesktopAppUpdates(app)
+          : await settingsApi.getDesktopAppStatus(app);
+        setStatus(next);
+        desktopCache.set(app, next);
+        return next;
+      } catch (error) {
+        toast.error(t("appLifecycle.detectFailed"), {
+          description: extractErrorMessage(error),
+        });
+        return null;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [app, t],
+  );
 
   useEffect(() => {
     if (!desktopCache.has(app)) void refresh(false);
     void settingsApi
       .listDesktopLifecycleJobs(app)
-      .then((jobs) => setLastJob(jobs[0] ?? null))
+      .then((jobs) => {
+        const latest = jobs[0] ?? null;
+        if (
+          latest &&
+          ["queued", "running", "verifying"].includes(latest.state)
+        ) {
+          // 切换页面后重新挂载：恢复进行中任务的进度展示与取消入口。
+          setActiveJobId(latest.id);
+          setAction(latest.action);
+          setActiveJob(latest);
+        }
+        setLastJob(latest);
+      })
       .catch(() => undefined);
   }, [app, refresh]);
 
@@ -521,7 +702,9 @@ function DesktopLifecycleRow({
     }
     let disposed = false;
     const poll = async () => {
-      const job = await settingsApi.getDesktopLifecycleJob(activeJobId).catch(() => null);
+      const job = await settingsApi
+        .getDesktopLifecycleJob(activeJobId)
+        .catch(() => null);
       if (!disposed && job) setActiveJob(job);
     };
     void poll();
@@ -532,16 +715,24 @@ function DesktopLifecycleRow({
     };
   }, [activeJobId]);
 
-  const runLifecycle = async (nextAction: "install" | "update" | "uninstall") => {
+  const runLifecycle = async (
+    nextAction: "install" | "update" | "uninstall",
+  ) => {
     const jobId = crypto.randomUUID();
     setActiveJobId(jobId);
     setActiveJob(null);
     setAction(nextAction);
     try {
-      const next = await settingsApi.runDesktopAppLifecycleAction(app, nextAction, jobId);
+      const next = await settingsApi.runDesktopAppLifecycleAction(
+        app,
+        nextAction,
+        jobId,
+      );
       setStatus(next);
       desktopCache.set(app, next);
-      const jobs = await settingsApi.listDesktopLifecycleJobs(app).catch(() => []);
+      const jobs = await settingsApi
+        .listDesktopLifecycleJobs(app)
+        .catch(() => []);
       setLastJob(jobs[0] ?? null);
       if (nextAction === "uninstall") {
         setUninstallOpen(false);
@@ -549,17 +740,24 @@ function DesktopLifecycleRow({
         setUninstallCompletedOpen(true);
       } else {
         toast.success(
-          t(nextAction === "install" ? "appLifecycle.installCompleted" : "appLifecycle.updateCompleted"),
+          t(
+            nextAction === "install"
+              ? "appLifecycle.installCompleted"
+              : "appLifecycle.updateCompleted",
+          ),
         );
       }
     } catch (error) {
-      const jobs = await settingsApi.listDesktopLifecycleJobs(app).catch(() => []);
+      const jobs = await settingsApi
+        .listDesktopLifecycleJobs(app)
+        .catch(() => []);
       setLastJob(jobs[0] ?? null);
-      const key = nextAction === "install"
-        ? "appLifecycle.installFailed"
-        : nextAction === "update"
-          ? "appLifecycle.updateFailed"
-          : "appLifecycle.uninstallFailed";
+      const key =
+        nextAction === "install"
+          ? "appLifecycle.installFailed"
+          : nextAction === "update"
+            ? "appLifecycle.updateFailed"
+            : "appLifecycle.uninstallFailed";
       toast.error(t(key), { description: extractErrorMessage(error) });
     } finally {
       setActiveJobId(null);
@@ -571,7 +769,7 @@ function DesktopLifecycleRow({
     if (!activeJobId) return;
     const accepted = await settingsApi.cancelDesktopLifecycleJob(activeJobId);
     if (!accepted) {
-      toast.error("当前操作已经结束，正在重新检测状态");
+      toast.error(t("appLifecycle.cancelFinished"));
       await refresh(false);
     }
   };
@@ -580,7 +778,9 @@ function DesktopLifecycleRow({
     setAction("launch");
     try {
       await settingsApi.launchDesktopApp(app);
-      toast.success(t("appLifecycle.desktopOpened", { app: status?.display_name ?? app }));
+      toast.success(
+        t("appLifecycle.desktopOpened", { app: status?.display_name ?? app }),
+      );
     } catch (error) {
       toast.error(t("appLifecycle.desktopLaunchFailed"), {
         description: extractErrorMessage(error),
@@ -593,9 +793,13 @@ function DesktopLifecycleRow({
   const installed = status?.installed ?? false;
   const updateChecked = Boolean(status?.latest_version);
   const updateAvailable = Boolean(
-    status?.version && status.latest_version && isUpdateAvailable(status.version, status.latest_version),
+    status?.version &&
+      status.latest_version &&
+      isUpdateAvailable(status.version, status.latest_version),
   );
-  const title = status?.display_name ?? (app === "codex-desktop" ? "Codex Desktop" : "Claude Desktop");
+  const title =
+    status?.display_name ??
+    (app === "codex-desktop" ? "Codex Desktop" : "Claude Desktop");
 
   return (
     <>
@@ -609,7 +813,10 @@ function DesktopLifecycleRow({
           updateChecked={updateChecked}
           updateAvailable={updateAvailable}
           installationSource={status?.installation_source}
-          additionalInstallationCount={Math.max(0, (status?.installations?.length ?? 0) - 1)}
+          additionalInstallationCount={Math.max(
+            0,
+            (status?.installations?.length ?? 0) - 1,
+          )}
           loading={loading}
           busy={action !== null}
           action={action}
@@ -623,38 +830,20 @@ function DesktopLifecycleRow({
           onAiInstall={onAiInstall}
           onLaunch={() => void launch()}
           onCheckOrUpdate={() =>
-            void (updateChecked && updateAvailable ? runLifecycle("update") : refresh(true))
+            void (updateChecked && updateAvailable
+              ? runLifecycle("update")
+              : refresh(true))
           }
           onUninstall={() => setUninstallOpen(true)}
           onRedetect={() => void refresh(false)}
           onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
         />
-        {activeJob && ["queued", "running", "verifying"].includes(activeJob.state) && (
-          <div className="rounded-lg border border-blue-500/25 bg-blue-500/5 px-3 py-2 text-xs text-foreground">
-            <div className="flex items-center gap-2 font-medium">
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600" />
-              {activeJob.state === "verifying" ? "正在重新检测安装结果" : "正在执行操作"}
-            </div>
-            <div className="mt-2 space-y-1 text-muted-foreground" aria-live="polite">
-              {activeJob.logs.slice(-4).map((entry, index) => (
-                <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
-              ))}
-            </div>
-          </div>
-        )}
+        {activeJob &&
+          ["queued", "running", "verifying"].includes(activeJob.state) && (
+            <JobActiveBanner job={activeJob} />
+          )}
         {lastJob && ["failed", "interrupted"].includes(lastJob.state) && (
-          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-            上次{lastJob.action === "install" ? "安装" : lastJob.action === "update" ? "更新" : "卸载"}
-            {lastJob.state === "interrupted" ? "被中断" : "失败"}
-            {lastJob.errorMessage ? `：${lastJob.errorMessage}` : "，请重新检测后重试。"}
-            {lastJob.logs.length > 0 && (
-              <div className="mt-2 space-y-1 border-t border-amber-500/20 pt-2 opacity-90">
-                {lastJob.logs.slice(-4).map((entry, index) => (
-                  <p key={`${entry.at}-${entry.step}-${index}`}>{entry.message}</p>
-                ))}
-              </div>
-            )}
-          </div>
+          <JobFailureBanner job={lastJob} />
         )}
       </div>
       <ConfirmDialog
@@ -696,11 +885,14 @@ function UninstallCompletedDialog({
             {t("appLifecycle.uninstallCompleted")}
           </DialogTitle>
           <DialogDescription className="text-sm leading-relaxed">
-            {message ?? t("appLifecycle.uninstallCompletedDescription", { app: appName })}
+            {message ??
+              t("appLifecycle.uninstallCompletedDescription", { app: appName })}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="pt-2 sm:justify-end">
-          <Button onClick={() => onOpenChange(false)}>{t("common.close")}</Button>
+          <Button onClick={() => onOpenChange(false)}>
+            {t("common.close")}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -721,11 +913,12 @@ export function RuntimeLifecycleCard({
   const app = APP_ICON_MAP[appId];
   const tool = TOOL_BY_APP[appId];
   const desktop = DESKTOP_BY_APP[appId];
-  const cliTitle = appId === "codex"
-    ? "Codex CLI"
-    : appId === "claude"
-      ? "Claude Code CLI"
-      : `${app.label} CLI`;
+  const cliTitle =
+    appId === "codex"
+      ? "Codex CLI"
+      : appId === "claude"
+        ? "Claude Code CLI"
+        : `${app.label} CLI`;
 
   return (
     <section className="sticky top-0 z-20 rounded-2xl border bg-background/95 p-4 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/85">
@@ -781,12 +974,16 @@ export function RuntimeLifecycleCard({
             refreshRequestId={refreshRequestId}
             onAiInstall={
               onAiInstall
-                ? () => onAiInstall({
-                    tool: desktop,
-                    appName: desktop === "codex-desktop" ? "Codex Desktop" : "Claude Desktop",
-                    supportsCustomLocation: false,
-                    supportsVersionPin: false,
-                  })
+                ? () =>
+                    onAiInstall({
+                      tool: desktop,
+                      appName:
+                        desktop === "codex-desktop"
+                          ? "Codex Desktop"
+                          : "Claude Desktop",
+                      supportsCustomLocation: false,
+                      supportsVersionPin: false,
+                    })
                 : undefined
             }
           />

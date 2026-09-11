@@ -1,7 +1,8 @@
 use crate::provider_center::{
-    self, ImportCandidate, ModelDiscoveryResult, ProviderApplyPreview, ProviderApplyTransaction,
-    ProviderBinding, ProviderCenterOperationState, ProviderCenterState, ProviderDefinition,
-    ProviderImportSession, SaveProviderDefinitionInput, UnifiedModelCatalog,
+    self, ImportCandidate, ImportCommitDecision, ImportCommitResult, ModelDiscoveryResult,
+    ProviderApplyPreview, ProviderApplyTransaction, ProviderBinding, ProviderCenterOperationState,
+    ProviderCenterState, ProviderDefinition, ProviderImportSession, SaveProviderDefinitionInput,
+    UnifiedModelCatalog,
 };
 use crate::store::AppState;
 use tauri::State;
@@ -106,13 +107,15 @@ pub async fn commit_provider_center_import_candidate(
     #[allow(non_snake_case)] sessionId: String,
     #[allow(non_snake_case)] candidateId: String,
     #[allow(non_snake_case)] appTypes: Vec<String>,
-) -> Result<ProviderDefinition, String> {
+    decision: ImportCommitDecision,
+) -> Result<ImportCommitResult, String> {
     let _data_guard = operations.lock_data().await;
     provider_center::commit_import_session_candidate(
         state.inner(),
         &sessionId,
         &candidateId,
         appTypes,
+        decision,
     )
     .map_err(|error| error.to_string())
 }
@@ -218,11 +221,6 @@ pub async fn disable_provider_center_binding(
 ) -> Result<(), String> {
     let _data_guard = operations.lock_data().await;
     let _guards = operations.lock_apps(vec![appType.clone()]).await;
-    provider_center::disable_binding(
-        state.inner(),
-        &providerId,
-        &appType,
-        removeProjection,
-    )
-    .map_err(|error| error.to_string())
+    provider_center::disable_binding(state.inner(), &providerId, &appType, removeProjection)
+        .map_err(|error| error.to_string())
 }

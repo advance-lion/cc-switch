@@ -62,6 +62,27 @@ export interface ProviderCenterState {
   transactions: ProviderApplyTransaction[];
 }
 
+export interface ImportConflict {
+  existingProviderId: string;
+  existingName: string;
+  existingRevision: number;
+  reasons: string[];
+}
+
+export type ImportCommitAction = "createCopy" | "merge" | "skip";
+
+export interface ImportCommitDecision {
+  action: ImportCommitAction;
+  targetProviderId?: string;
+  expectedRevision?: number;
+}
+
+export interface ImportCommitResult {
+  action: ImportCommitAction;
+  provider?: ProviderDefinition;
+  repeated: boolean;
+}
+
 export interface ImportCandidate {
   id: string;
   sessionId: string;
@@ -73,13 +94,22 @@ export interface ImportCandidate {
   models: string[];
   credentialConfigured: boolean;
   credentialHint?: string;
+  conflicts: ImportConflict[];
+}
+
+export interface ImportFailure {
+  appType: string;
+  sourceRef?: string;
+  code: string;
+  stage: string;
+  message: string;
 }
 
 export interface ProviderImportSession {
   id: string;
   state: "ready" | "readyWithErrors" | "completed" | "expired" | string;
   candidates: ImportCandidate[];
-  errors: string[];
+  errors: ImportFailure[];
   createdAt: number;
   expiresAt: number;
 }
@@ -170,7 +200,9 @@ export const providerCenterApi = {
     invoke("discover_provider_center_models", { providerId }),
   scanImports: (): Promise<ImportCandidate[]> =>
     invoke("scan_provider_center_imports"),
-  startImportSession: (appTypes: string[] = []): Promise<ProviderImportSession> =>
+  startImportSession: (
+    appTypes: string[] = [],
+  ): Promise<ProviderImportSession> =>
     invoke("start_provider_center_import_session", { appTypes }),
   getImportSession: (sessionId: string): Promise<ProviderImportSession> =>
     invoke("get_provider_center_import_session", { sessionId }),
@@ -178,11 +210,13 @@ export const providerCenterApi = {
     sessionId: string,
     candidateId: string,
     appTypes: string[],
-  ): Promise<ProviderDefinition> =>
+    decision: ImportCommitDecision,
+  ): Promise<ImportCommitResult> =>
     invoke("commit_provider_center_import_candidate", {
       sessionId,
       candidateId,
       appTypes,
+      decision,
     }),
   importCandidate: (
     sourceRef: string,

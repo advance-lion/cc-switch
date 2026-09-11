@@ -98,17 +98,17 @@ pub async fn get_skills_migration_result() -> Result<Option<SkillsMigrationPaylo
 
 #[derive(serde::Serialize)]
 pub struct ToolVersion {
-    name: String,
-    version: Option<String>,
-    latest_version: Option<String>, // 新增字段：最新版本
-    error: Option<String>,
+    pub(super) name: String,
+    pub(super) version: Option<String>,
+    pub(super) latest_version: Option<String>, // 新增字段：最新版本
+    pub(super) error: Option<String>,
     /// 已定位到可执行文件、但 `--version` 报错退出（装了却跑不起来，如 Node 版本不达标）。
     /// 供前端区分"未安装"与"已安装·无法运行"，无需匹配 error 文案反推语义。
-    installed_but_broken: bool,
+    pub(super) installed_but_broken: bool,
     /// 工具运行环境: "windows", "wsl", "macos", "linux", "unknown"
-    env_type: String,
+    pub(super) env_type: String,
     /// 当 env_type 为 "wsl" 时，返回该工具绑定的 WSL distro（用于按 distro 探测 shells）
-    wsl_distro: Option<String>,
+    pub(super) wsl_distro: Option<String>,
 }
 
 /// A deliberately small, source-aware contract for the application-management
@@ -140,7 +140,7 @@ pub struct CodexDesktopStatus {
     path: Option<String>,
 }
 
-const VALID_TOOLS: [&str; 8] = [
+pub(super) const VALID_TOOLS: [&str; 8] = [
     "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
 ];
 
@@ -256,10 +256,8 @@ pub async fn get_tool_lifecycle_capabilities(
 /// generic desktop component API in `desktop_lifecycle`.
 #[tauri::command]
 pub async fn get_codex_desktop_status() -> Result<CodexDesktopStatus, String> {
-    let status = super::desktop_lifecycle::get_desktop_app_status(
-        "codex-desktop".to_string(),
-    )
-    .await?;
+    let status =
+        super::desktop_lifecycle::get_desktop_app_status("codex-desktop".to_string()).await?;
     Ok(CodexDesktopStatus {
         installed: status.installed,
         version: status.version,
@@ -468,11 +466,28 @@ fn tool_lifecycle_capabilities_for(tool: &str) -> Result<ToolLifecycleCapabiliti
     })
 }
 
+/// Windows 的 Node.js 只提供 `npm.cmd` 批处理 shim（没有 npm.exe），而
+/// CreateProcess 不按 PATHEXT 解析扩展名，直接 `Command::new("npm")` 必然
+/// 报 "program not found"。统一经 cmd 解释执行；首个 token 保持不带引号的
+/// 裸 `npm`，避免 cmd /S 剥去首尾引号后的解析歧义。
+pub(super) fn npm_command() -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/D", "/S", "/C", "npm"]);
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("npm")
+    }
+}
+
 /// Verifies ownership using a fixed package from `npm_package_for`; neither
 /// the package nor the executable path comes from the renderer.  The WSL case
 /// is run inside the configured distribution, matching the existing lifecycle
 /// command builder.
-fn global_npm_package_is_installed(tool: &str, package: &str) -> Result<bool, String> {
+pub(super) fn global_npm_package_is_installed(tool: &str, package: &str) -> Result<bool, String> {
     let mut command = {
         #[cfg(target_os = "windows")]
         {
@@ -481,14 +496,14 @@ fn global_npm_package_is_installed(tool: &str, package: &str) -> Result<bool, St
                 command.args(["-d", &distro, "--", "npm", "ls", "-g", "--depth=0", package]);
                 command
             } else {
-                let mut command = std::process::Command::new("npm");
+                let mut command = npm_command();
                 command.args(["ls", "-g", "--depth=0", package]);
                 command
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let mut command = std::process::Command::new("npm");
+            let mut command = npm_command();
             command.args(["ls", "-g", "--depth=0", package]);
             command
         }
@@ -650,7 +665,7 @@ fn decode_windows_command_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn normalize_requested_tools(tools: &[String]) -> Vec<&'static str> {
+pub(super) fn normalize_requested_tools(tools: &[String]) -> Vec<&'static str> {
     let set: std::collections::HashSet<&str> = tools.iter().map(|s| s.as_str()).collect();
     VALID_TOOLS
         .iter()
@@ -660,7 +675,7 @@ fn normalize_requested_tools(tools: &[String]) -> Vec<&'static str> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ToolLifecycleAction {
+pub(super) enum ToolLifecycleAction {
     Install,
     Update,
 }
@@ -733,7 +748,10 @@ fn managed_assistant_install_dirs() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn save_managed_assistant_install_dir(tool: &str, install_dir: &Path) -> Result<(), String> {
+pub(super) fn save_managed_assistant_install_dir(
+    tool: &str,
+    install_dir: &Path,
+) -> Result<(), String> {
     let path = managed_assistant_install_registry_path();
     let parent = path
         .parent()
@@ -747,7 +765,7 @@ fn save_managed_assistant_install_dir(tool: &str, install_dir: &Path) -> Result<
     std::fs::write(path, serialized).map_err(|error| format!("无法写入 AI 安装位置: {error}"))
 }
 
-fn remove_managed_assistant_install_dir(tool: &str) -> Result<(), String> {
+pub(super) fn remove_managed_assistant_install_dir(tool: &str) -> Result<(), String> {
     let path = managed_assistant_install_registry_path();
     let mut entries = managed_assistant_install_dirs();
     if entries.remove(tool).is_none() {
@@ -758,7 +776,7 @@ fn remove_managed_assistant_install_dir(tool: &str) -> Result<(), String> {
     std::fs::write(path, serialized).map_err(|error| format!("无法写入 AI 安装位置: {error}"))
 }
 
-fn managed_assistant_install_dir(tool: &str) -> Option<PathBuf> {
+pub(super) fn managed_assistant_install_dir(tool: &str) -> Option<PathBuf> {
     let raw = managed_assistant_install_dirs()
         .get(tool)?
         .trim()
@@ -767,7 +785,7 @@ fn managed_assistant_install_dir(tool: &str) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn assistant_install_bin_dir(install_dir: &Path) -> PathBuf {
+pub(super) fn assistant_install_bin_dir(install_dir: &Path) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         install_dir.to_path_buf()
@@ -800,10 +818,14 @@ pub(super) fn sandbox_managed_install_dir(tool: &str) -> Result<PathBuf, String>
 fn update_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<(), String> {
     let package = npm_package_for(tool)
         .ok_or_else(|| format!("{} 没有受支持的自定义目录更新器", tool_display_name(tool)))?;
-    let output = std::process::Command::new("npm")
+    let mut command = npm_command();
+    command
         .args(["install", "--global", "--prefix"])
         .arg(install_dir)
-        .arg(format!("{package}@latest"))
+        .arg(format!("{package}@latest"));
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
         .output()
         .map_err(|error| format!("无法启动自定义目录更新进程: {error}"))?;
     finish_lifecycle_output(&output)?;
@@ -827,10 +849,14 @@ fn update_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<()
 fn uninstall_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<(), String> {
     let package = npm_package_for(tool)
         .ok_or_else(|| format!("{} 没有受支持的自定义目录卸载器", tool_display_name(tool)))?;
-    let output = std::process::Command::new("npm")
+    let mut command = npm_command();
+    command
         .args(["uninstall", "--global", "--prefix"])
         .arg(install_dir)
-        .arg(package)
+        .arg(package);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
         .output()
         .map_err(|error| format!("无法启动自定义目录卸载进程: {error}"))?;
     finish_lifecycle_output(&output)?;
@@ -901,6 +927,7 @@ pub(super) fn plan_registered_assistant_install(
 
 /// Spawn only a command line manufactured by `plan_registered_assistant_install`.
 /// Its stdout/stderr are piped so the assistant can show observable progress.
+#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
 pub(super) fn spawn_registered_assistant_install(
     install: &RegisteredAssistantInstall,
 ) -> Result<RegisteredAssistantInstallChild, String> {
@@ -913,7 +940,7 @@ pub(super) fn spawn_registered_assistant_install(
     use std::process::{Command, Stdio};
 
     if let RegisteredAssistantInstaller::Npm { package } = &install.installer {
-        let mut command = Command::new("npm");
+        let mut command = npm_command();
         command.arg("install").arg("--global");
         if let Some(dir) = &install.install_dir {
             command.arg("--prefix").arg(dir);
@@ -1073,7 +1100,8 @@ pub(super) fn verify_registered_assistant_install(
     }
 }
 
-fn build_tool_uninstall_command(tool: &str, package: &str) -> Result<String, String> {
+#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
+pub(super) fn build_tool_uninstall_command(tool: &str, package: &str) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         if let Some(distro) = wsl_distro_for_tool(tool) {
@@ -1107,7 +1135,7 @@ impl FromStr for ToolLifecycleAction {
     }
 }
 
-fn build_tool_lifecycle_command(
+pub(super) fn build_tool_lifecycle_command(
     tools: &[&str],
     action: ToolLifecycleAction,
     wsl_shell_by_tool: Option<&HashMap<String, WslShellPreferenceInput>>,
@@ -1153,7 +1181,7 @@ fn build_tool_lifecycle_command(
     }))
 }
 
-fn tool_display_name(tool: &str) -> &'static str {
+pub(super) fn tool_display_name(tool: &str) -> &'static str {
     match tool {
         "claude" => "Claude Code",
         "codex" => "Codex",
@@ -1475,7 +1503,7 @@ fn windows_cmd_double_quote_arg(value: &str) -> String {
 }
 
 /// 获取单个工具的版本信息（内部实现）
-async fn get_single_tool_version_impl(
+pub(super) async fn get_single_tool_version_impl(
     tool: &str,
     wsl_shell: Option<&str>,
     wsl_shell_flag: Option<&str>,
@@ -2308,7 +2336,7 @@ fn grok_extra_search_paths(
     paths
 }
 
-fn tool_executable_candidates(tool: &str, dir: &Path) -> Vec<std::path::PathBuf> {
+pub(super) fn tool_executable_candidates(tool: &str, dir: &Path) -> Vec<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let extensionless = dir.join(tool);
@@ -2668,7 +2696,7 @@ fn is_windows_command_script(path: &Path) -> bool {
 /// specified." Direct Win32 executable launches accept the prefix; batch
 /// scripts do not.
 #[cfg(target_os = "windows")]
-fn windows_shell_compatible_path(path: &Path) -> std::path::PathBuf {
+pub(super) fn windows_shell_compatible_path(path: &Path) -> std::path::PathBuf {
     let raw = path.to_string_lossy();
     if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
         std::path::PathBuf::from(format!(r"\\{unc}"))
@@ -2944,7 +2972,7 @@ fn path_line_from_env_output(raw: &str) -> Option<&str> {
 /// 合并两段 PATH：`primary` 全部保留在前，`extra` 中未出现过的段按序追加。
 /// 空段直接丢弃（`a::b` 里的空段在 POSIX 下语义是"当前目录"，注入时不该带上）。
 #[cfg(not(target_os = "windows"))]
-fn merge_path_segments(primary: &str, extra: &str) -> String {
+pub(super) fn merge_path_segments(primary: &str, extra: &str) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut merged: Vec<&str> = Vec::new();
     for segment in primary.split(':').chain(extra.split(':')) {
@@ -2979,7 +3007,7 @@ fn merge_path_segments(primary: &str, extra: &str) -> String {
 ///
 /// 解析不到时返回 `None`，调用方保持原有行为（不注入），不引入新的失败模式。
 #[cfg(not(target_os = "windows"))]
-fn login_shell_path() -> Option<String> {
+pub(super) fn login_shell_path() -> Option<String> {
     use std::process::Command;
     let shell = std::env::var("SHELL")
         .ok()
@@ -3260,7 +3288,7 @@ fn enumerate_tool_installations(tool: &str) -> Vec<ToolInstallation> {
 
 /// 工具对应的 npm 包名（hermes 走自己的 CLI/installer，不在此表）。锚定升级据此拼 `npm i -g`。
 /// 全平台共用一张表——Windows 锚定层(`anchored_command_from_paths` 的 windows 版)也读这里。
-fn npm_package_for(tool: &str) -> Option<&'static str> {
+pub(super) fn npm_package_for(tool: &str) -> Option<&'static str> {
     match tool {
         "claude" => Some("@anthropic-ai/claude-code"),
         "codex" => Some("@openai/codex"),
@@ -5501,6 +5529,28 @@ pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<()
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// Windows 上 npm 只有 npm.cmd 批处理 shim，CreateProcess 不解析 PATHEXT，
+    /// 裸 `Command::new("npm")` 会报 "program not found"；必须经 cmd /C 解释。
+    /// 回归红线：改回直接 spawn "npm" 会让本断言失败。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn npm_command_routes_through_cmd() {
+        let command = npm_command();
+        assert_eq!(command.get_program(), "cmd");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["/D", "/S", "/C", "npm"]);
+    }
+
+    /// 非 Windows 平台 npm 是可执行脚本，保持直接 spawn。
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn npm_command_spawns_npm_directly() {
+        assert_eq!(npm_command().get_program(), "npm");
+    }
 
     /// 探测 helper 正常路径：spawn（含 pre_exec setsid）能启动、输出能捕获。
     /// `/bin/echo --version` 在 macOS/Linux 均即刻成功退出。

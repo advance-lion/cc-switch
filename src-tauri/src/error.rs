@@ -47,6 +47,9 @@ pub enum AppError {
     McpValidation(String),
     #[error("{0}")]
     Message(String),
+    /// Stable Provider Center error for app identifiers without a registered adapter.
+    #[error("APP_NOT_SUPPORTED: {app}")]
+    AppNotSupported { app: String },
     #[error("HTTP {status}: {body}")]
     HttpStatus { status: u16, body: String },
     #[error("{zh} ({en})")]

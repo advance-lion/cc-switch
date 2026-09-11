@@ -1687,12 +1687,17 @@ pub fn run() {
             commands::launch_desktop_app,
             commands::get_codex_desktop_status,
             commands::run_tool_lifecycle_action,
+            commands::run_cli_lifecycle_action,
+            commands::cancel_cli_lifecycle_job,
+            commands::get_cli_lifecycle_job,
+            commands::list_cli_lifecycle_jobs,
             commands::probe_tool_installations,
             commands::launch_tool_terminal,
             commands::launch_codex_desktop,
             commands::uninstall_tool_runtime,
             // Guarded Codex CLI assistant automation
             commands::start_codex_assistant_plan,
+            commands::start_codex_assistant_chat,
             commands::execute_codex_assistant_plan,
             commands::cancel_codex_assistant_run,
             // Provider terminal

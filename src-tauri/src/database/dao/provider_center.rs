@@ -312,6 +312,86 @@ impl Database {
             .map_err(|error| AppError::Database(error.to_string()))
     }
 
+    pub fn get_provider_import_candidate(
+        &self,
+        session_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<ProviderImportCandidateRecord>, AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.query_row(
+            "SELECT id, session_id, source_app_type, source_provider_id,
+                    source_locator, normalized_json, models_json,
+                    temporary_secret_ref, credential_configured, fingerprint,
+                    conflict_json
+             FROM provider_import_candidates
+             WHERE session_id = ?1 AND id = ?2",
+            params![session_id, candidate_id],
+            |row| {
+                Ok(ProviderImportCandidateRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_app_type: row.get(2)?,
+                    source_provider_id: row.get(3)?,
+                    source_locator: row.get(4)?,
+                    normalized_json: row.get(5)?,
+                    models_json: row.get(6)?,
+                    temporary_secret_ref: row.get(7)?,
+                    credential_configured: row.get(8)?,
+                    fingerprint: row.get(9)?,
+                    conflict_json: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| AppError::Database(error.to_string()))
+    }
+
+    pub fn update_provider_import_candidate_state(
+        &self,
+        session_id: &str,
+        candidate_id: &str,
+        state_json: &str,
+        completed_at: i64,
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let changed = tx
+            .execute(
+                "UPDATE provider_import_candidates
+                 SET conflict_json = ?3, temporary_secret_ref = NULL
+                 WHERE id = ?1 AND session_id = ?2",
+                params![candidate_id, session_id, state_json],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        if changed == 0 {
+            return Err(AppError::Message("导入候选不存在".to_string()));
+        }
+        let pending: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provider_import_candidates
+                 WHERE session_id = ?1
+                   AND (conflict_json IS NULL
+                        OR json_valid(conflict_json) = 0
+                        OR (json_extract(conflict_json, '$.outcome') IS NULL
+                            AND json_extract(conflict_json, '$.quarantine') IS NULL))",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        if pending == 0 {
+            tx.execute(
+                "UPDATE provider_import_sessions
+                 SET state = 'completed', completed_at = ?2 WHERE id = ?1",
+                params![session_id, completed_at],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|error| AppError::Database(error.to_string()))
+    }
+
     pub fn complete_provider_import_candidate(
         &self,
         session_id: &str,

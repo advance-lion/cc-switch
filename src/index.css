@@ -296,3 +296,17 @@ input[type="password"]::-ms-clear {
     flex: 1 1 0%;
   }
 }
+
+/* 生命周期任务的不定态进度条（安装/更新进行中，后端无百分比时）。 */
+@keyframes cc-progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+.cc-progress-indeterminate {
+  animation: cc-progress-indeterminate 1.2s ease-in-out infinite;
+}

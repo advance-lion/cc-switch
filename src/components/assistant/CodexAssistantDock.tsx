@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import {
   isCodexAssistantWebBridgeActive,
   settingsApi,
+  type CodexAssistantChatTurn,
   type CodexAssistantPlan,
 } from "@/lib/api";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -38,6 +39,7 @@ type FloatingPosition = {
 
 type InstallLocationMode = "default" | "custom";
 type InstallVersionMode = "stable" | "latest" | "specific";
+type AssistantMode = "chat" | "plan";
 
 // Keep the visual affordance close to the Codex mark, but retain enough room
 // for a reliable pointer target on desktop.
@@ -108,8 +110,13 @@ export function CodexAssistantDock({
   const webBridgeActive = isCodexAssistantWebBridgeActive();
   const [open, setOpen] = useState(false);
   const [showFloatingGreeting, setShowFloatingGreeting] = useState(true);
+  const [mode, setMode] = useState<AssistantMode>("chat");
+  const [chatMessages, setChatMessages] = useState<CodexAssistantChatTurn[]>(
+    [],
+  );
   const [runtime, setRuntime] = useState<CodexRuntime | null>(null);
-  const supportsCustomInstallLocation = installIntent?.supportsCustomLocation !== false;
+  const supportsCustomInstallLocation =
+    installIntent?.supportsCustomLocation !== false;
   const supportsVersionPin = installIntent?.supportsVersionPin !== false;
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -145,9 +152,10 @@ export function CodexAssistantDock({
   } | null>(null);
   const suppressOpenRef = useRef(false);
   const activeRunIdRef = useRef<string | null>(null);
-  const activeRunKindRef = useRef<"plan" | "execute" | null>(null);
+  const activeRunKindRef = useRef<"plan" | "chat" | "execute" | null>(null);
   const activeInstallToolRef = useRef<string | null>(null);
   const planReceivedRef = useRef(false);
+  const messageReceivedRef = useRef(false);
   const lastHandledOpenRequestRef = useRef(0);
 
   const appendLog = useCallback((line: string) => {
@@ -191,6 +199,7 @@ export function CodexAssistantDock({
       setRequest(
         t("codexAssistant.installRequest", { app: installIntent.appName }),
       );
+      setMode("plan");
       setInstallLocationMode("default");
       setInstallVersionMode("stable");
       setSpecificVersion("");
@@ -264,6 +273,16 @@ export function CodexAssistantDock({
           return;
         }
 
+        if (event.kind === "message" && event.message) {
+          messageReceivedRef.current = true;
+          const answer = event.message;
+          setChatMessages((current) => [
+            ...current,
+            { role: "assistant", content: answer },
+          ]);
+          return;
+        }
+
         if (event.kind === "finished") {
           const completedKind = activeRunKindRef.current;
           const success = event.success === true;
@@ -283,6 +302,8 @@ export function CodexAssistantDock({
             });
           } else if (completedKind === "plan" && !planReceivedRef.current) {
             setRunError(t("codexAssistant.invalidPlan"));
+          } else if (completedKind === "chat" && !messageReceivedRef.current) {
+            setRunError(t("codexAssistant.invalidAnswer"));
           } else if (completedKind === "execute") {
             void refreshRuntime();
             const tool = activeInstallToolRef.current;
@@ -367,14 +388,16 @@ export function CodexAssistantDock({
   const requestPlan = async () => {
     if (!request.trim() || planning || executing) return;
     if (
-      (!installIntent || (supportsCustomInstallLocation && installLocationMode === "custom")) &&
+      (!installIntent ||
+        (supportsCustomInstallLocation && installLocationMode === "custom")) &&
       !targetDirectory
     ) {
       toast.error(t("codexAssistant.directoryRequired"));
       return;
     }
     if (
-      installIntent && supportsVersionPin &&
+      installIntent &&
+      supportsVersionPin &&
       installVersionMode === "specific" &&
       !specificVersion.trim()
     ) {
@@ -400,7 +423,8 @@ export function CodexAssistantDock({
                   ? specificVersion.trim()
                   : installVersionMode,
               customInstallLocation:
-                supportsCustomInstallLocation && installLocationMode === "custom",
+                supportsCustomInstallLocation &&
+                installLocationMode === "custom",
             }
           : undefined,
       );
@@ -415,6 +439,43 @@ export function CodexAssistantDock({
         extractErrorMessage(error) || t("codexAssistant.runFailed");
       setRunError(message);
       toast.error(t("codexAssistant.runFailed"), { description: message });
+    }
+  };
+
+  const sendChat = async () => {
+    const text = request.trim();
+    if (!text || planning || executing) return;
+    const history = chatMessages.slice(-24);
+    setPlan(null);
+    setPlanId(null);
+    setLogs([]);
+    setRunError(null);
+    setChatMessages((current) => [...current, { role: "user", content: text }]);
+    setRequest("");
+    messageReceivedRef.current = false;
+    activeRunKindRef.current = "chat";
+    setPlanning(true);
+    try {
+      const runId = await settingsApi.startCodexAssistantChat(text, history);
+      if (activeRunKindRef.current === "chat") {
+        activeRunIdRef.current = runId;
+        setActiveRunId(runId);
+      }
+    } catch (error) {
+      activeRunKindRef.current = null;
+      setPlanning(false);
+      const message =
+        extractErrorMessage(error) || t("codexAssistant.runFailed");
+      setRunError(message);
+      toast.error(t("codexAssistant.runFailed"), { description: message });
+    }
+  };
+
+  const submitRequest = () => {
+    if (mode === "chat") {
+      void sendChat();
+    } else {
+      void requestPlan();
     }
   };
 
@@ -730,212 +791,292 @@ export function CodexAssistantDock({
             </button>
           </section>
 
-          {installIntent ? (
-            <>
-              <section className="space-y-2">
-                <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-                  {t("codexAssistant.installVersion")}
-                </p>
-                <div className="rounded-xl border border-border bg-card p-2">
-                  <div className="grid grid-cols-3 gap-1">
-                    {(["stable", "latest", ...(supportsVersionPin ? ["specific" as const] : [])] as const).map((mode) => (
-                      <Button
-                        key={mode}
-                        type="button"
-                        size="sm"
-                        variant={
-                          installVersionMode === mode ? "default" : "ghost"
+          <section className="space-y-2">
+            <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+              {t("codexAssistant.mode")}
+            </p>
+            <div className="grid grid-cols-2 gap-1 rounded-xl border border-border bg-card p-1">
+              {(["chat", "plan"] as const).map((option) => (
+                <Button
+                  key={option}
+                  type="button"
+                  size="sm"
+                  variant={mode === option ? "default" : "ghost"}
+                  disabled={planning || executing}
+                  onClick={() => {
+                    setMode(option);
+                    setRunError(null);
+                  }}
+                >
+                  {option === "chat"
+                    ? t("codexAssistant.modeChat")
+                    : t("codexAssistant.modePlan")}
+                </Button>
+              ))}
+            </div>
+          </section>
+
+          {mode === "plan" &&
+            (installIntent ? (
+              <>
+                <section className="space-y-2">
+                  <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                    {t("codexAssistant.installVersion")}
+                  </p>
+                  <div className="rounded-xl border border-border bg-card p-2">
+                    <div className="grid grid-cols-3 gap-1">
+                      {(
+                        [
+                          "stable",
+                          "latest",
+                          ...(supportsVersionPin ? ["specific" as const] : []),
+                        ] as const
+                      ).map((mode) => (
+                        <Button
+                          key={mode}
+                          type="button"
+                          size="sm"
+                          variant={
+                            installVersionMode === mode ? "default" : "ghost"
+                          }
+                          disabled={planning || executing}
+                          onClick={() => setInstallVersionMode(mode)}
+                        >
+                          {t(
+                            `codexAssistant.version${mode[0].toUpperCase()}${mode.slice(1)}`,
+                          )}
+                        </Button>
+                      ))}
+                    </div>
+                    {installVersionMode === "specific" && (
+                      <Input
+                        value={specificVersion}
+                        onChange={(event) =>
+                          setSpecificVersion(event.target.value)
                         }
                         disabled={planning || executing}
-                        onClick={() => setInstallVersionMode(mode)}
-                      >
-                        {t(
-                          `codexAssistant.version${mode[0].toUpperCase()}${mode.slice(1)}`,
+                        placeholder={t(
+                          "codexAssistant.specificVersionPlaceholder",
                         )}
-                      </Button>
-                    ))}
+                        className="mt-2 h-8 text-xs"
+                      />
+                    )}
                   </div>
-                  {installVersionMode === "specific" && (
-                    <Input
-                      value={specificVersion}
-                      onChange={(event) =>
-                        setSpecificVersion(event.target.value)
-                      }
-                      disabled={planning || executing}
-                      placeholder={t(
-                        "codexAssistant.specificVersionPlaceholder",
-                      )}
-                      className="mt-2 h-8 text-xs"
-                    />
-                  )}
-                </div>
-              </section>
+                </section>
 
+                <section className="space-y-2">
+                  <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                    {t("codexAssistant.installLocation")}
+                  </p>
+                  <div className="rounded-xl border border-border bg-card p-2">
+                    {supportsCustomInstallLocation ? (
+                      <div className="grid grid-cols-2 gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={
+                            installLocationMode === "default"
+                              ? "default"
+                              : "ghost"
+                          }
+                          disabled={planning || executing}
+                          onClick={() => setInstallLocationMode("default")}
+                        >
+                          {t("codexAssistant.defaultLocation")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={
+                            installLocationMode === "custom"
+                              ? "default"
+                              : "ghost"
+                          }
+                          disabled={planning || executing}
+                          onClick={() => setInstallLocationMode("custom")}
+                        >
+                          {t("codexAssistant.customLocation")}
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                        桌面应用由系统安装器管理，将安装到系统默认位置。
+                      </div>
+                    )}
+                    <div className="mt-2 flex items-center gap-3 px-1 py-1">
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
+                        <FolderOpen className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">
+                          {installLocationMode === "default"
+                            ? t("codexAssistant.defaultLocationDescription")
+                            : targetDirectory ||
+                              t("codexAssistant.locationNotSelected")}
+                        </span>
+                        <span className="block text-xs text-muted-foreground">
+                          {installLocationMode === "default"
+                            ? t("codexAssistant.defaultLocationHint")
+                            : t("codexAssistant.locationHint")}
+                        </span>
+                      </span>
+                      {supportsCustomInstallLocation &&
+                        installLocationMode === "custom" && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={planning || executing}
+                            onClick={() => void chooseInstallDirectory()}
+                          >
+                            {t("codexAssistant.chooseLocation")}
+                          </Button>
+                        )}
+                    </div>
+                    {webBridgeActive &&
+                      supportsCustomInstallLocation &&
+                      installLocationMode === "custom" &&
+                      webDirectoryEditorOpen && (
+                        <div className="mt-2 rounded-lg border border-sky-500/20 bg-sky-500/[0.035] p-2">
+                          <p className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                            {t("codexAssistant.webDirectoryHint")}
+                          </p>
+                          <Input
+                            value={webDirectoryDraft}
+                            onChange={(event) =>
+                              setWebDirectoryDraft(event.target.value)
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") saveWebDirectory();
+                            }}
+                            placeholder="D:\\AI Tools\\node-global"
+                            className="h-8 text-xs"
+                          />
+                          <div className="mt-2 flex justify-end gap-2">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() => setWebDirectoryEditorOpen(false)}
+                            >
+                              {t("common.cancel")}
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={saveWebDirectory}
+                            >
+                              {t("codexAssistant.saveLocation")}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                </section>
+              </>
+            ) : (
               <section className="space-y-2">
                 <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
                   {t("codexAssistant.installLocation")}
                 </p>
-                <div className="rounded-xl border border-border bg-card p-2">
-                  {supportsCustomInstallLocation ? <div className="grid grid-cols-2 gap-1">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={
-                        installLocationMode === "default" ? "default" : "ghost"
-                      }
-                      disabled={planning || executing}
-                      onClick={() => setInstallLocationMode("default")}
-                    >
-                      {t("codexAssistant.defaultLocation")}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={
-                        installLocationMode === "custom" ? "default" : "ghost"
-                      }
-                      disabled={planning || executing}
-                      onClick={() => setInstallLocationMode("custom")}
-                    >
-                      {t("codexAssistant.customLocation")}
-                    </Button>
-                  </div> : <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm text-muted-foreground">桌面应用由系统安装器管理，将安装到系统默认位置。</div>}
-                  <div className="mt-2 flex items-center gap-3 px-1 py-1">
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
-                      <FolderOpen className="h-4 w-4" />
+                <div className="flex items-center gap-3 rounded-xl border border-border bg-card p-3">
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
+                    <FolderOpen className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      {targetDirectory ||
+                        t("codexAssistant.locationNotSelected")}
                     </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">
-                        {installLocationMode === "default"
-                          ? t("codexAssistant.defaultLocationDescription")
-                          : targetDirectory ||
-                            t("codexAssistant.locationNotSelected")}
-                      </span>
-                      <span className="block text-xs text-muted-foreground">
-                        {installLocationMode === "default"
-                          ? t("codexAssistant.defaultLocationHint")
-                          : t("codexAssistant.locationHint")}
-                      </span>
+                    <span className="block text-xs text-muted-foreground">
+                      {t("codexAssistant.locationHint")}
                     </span>
-                    {supportsCustomInstallLocation && installLocationMode === "custom" && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="shrink-0"
-                        disabled={planning || executing}
-                        onClick={() => void chooseInstallDirectory()}
-                      >
-                        {t("codexAssistant.chooseLocation")}
-                      </Button>
-                    )}
-                  </div>
-                  {webBridgeActive &&
-                    supportsCustomInstallLocation &&
-                    installLocationMode === "custom" &&
-                    webDirectoryEditorOpen && (
-                      <div className="mt-2 rounded-lg border border-sky-500/20 bg-sky-500/[0.035] p-2">
-                        <p className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">
-                          {t("codexAssistant.webDirectoryHint")}
-                        </p>
-                        <Input
-                          value={webDirectoryDraft}
-                          onChange={(event) =>
-                            setWebDirectoryDraft(event.target.value)
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") saveWebDirectory();
-                          }}
-                          placeholder="D:\\AI Tools\\node-global"
-                          className="h-8 text-xs"
-                        />
-                        <div className="mt-2 flex justify-end gap-2">
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 text-xs"
-                            onClick={() => setWebDirectoryEditorOpen(false)}
-                          >
-                            {t("common.cancel")}
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            className="h-7 text-xs"
-                            onClick={saveWebDirectory}
-                          >
-                            {t("codexAssistant.saveLocation")}
-                          </Button>
-                        </div>
-                      </div>
-                    )}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    disabled={planning || executing}
+                    onClick={() => void chooseInstallDirectory()}
+                  >
+                    {t("codexAssistant.chooseLocation")}
+                  </Button>
                 </div>
               </section>
-            </>
-          ) : (
-            <section className="space-y-2">
-              <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-                {t("codexAssistant.installLocation")}
-              </p>
-              <div className="flex items-center gap-3 rounded-xl border border-border bg-card p-3">
-                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
-                  <FolderOpen className="h-4 w-4" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium">
-                    {targetDirectory || t("codexAssistant.locationNotSelected")}
-                  </span>
-                  <span className="block text-xs text-muted-foreground">
-                    {t("codexAssistant.locationHint")}
-                  </span>
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="shrink-0"
-                  disabled={planning || executing}
-                  onClick={() => void chooseInstallDirectory()}
-                >
-                  {t("codexAssistant.chooseLocation")}
-                </Button>
-              </div>
-            </section>
-          )}
+            ))}
 
           <section className="space-y-2">
             <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-              {t("codexAssistant.installPlan")}
+              {mode === "chat"
+                ? t("codexAssistant.chatLabel")
+                : t("codexAssistant.installPlan")}
             </p>
             {webBridgeActive && (
               <p className="rounded-lg border border-sky-500/20 bg-sky-500/[0.045] px-3 py-2 text-xs leading-relaxed text-sky-800 dark:text-sky-200">
                 {t("codexAssistant.webBridgeNotice")}
               </p>
             )}
+            {mode === "chat" && (
+              <div className="space-y-2" aria-live="polite">
+                {chatMessages.length === 0 ? (
+                  <p className="rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                    {t("codexAssistant.chatEmpty")}
+                  </p>
+                ) : (
+                  chatMessages.map((message, index) => (
+                    <div
+                      key={`${message.role}-${index}`}
+                      className={cn(
+                        "max-w-[92%] whitespace-pre-wrap break-words rounded-xl px-3 py-2 text-sm leading-relaxed",
+                        message.role === "user"
+                          ? "ml-auto bg-violet-500/15 text-foreground"
+                          : "mr-auto border border-border bg-card",
+                      )}
+                    >
+                      {message.content}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+
             <div className="rounded-xl border border-border bg-card p-3">
               <Input
                 value={request}
                 onChange={(event) => setRequest(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") requestPlan();
+                  if (event.key === "Enter") submitRequest();
                 }}
                 disabled={!ready || planning || executing}
                 placeholder={
                   ready
-                    ? t("codexAssistant.requestPlaceholder")
+                    ? mode === "chat"
+                      ? t("codexAssistant.chatPlaceholder")
+                      : t("codexAssistant.requestPlaceholder")
                     : (blockedReason ?? undefined)
                 }
                 className="border-0 bg-transparent px-0 shadow-none focus:ring-0"
               />
               <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-2">
                 <span className="text-[11px] text-muted-foreground">
-                  {ready ? t("codexAssistant.planFirst") : blockedReason}
+                  {ready
+                    ? mode === "chat"
+                      ? t("codexAssistant.chatHint")
+                      : t("codexAssistant.planFirst")
+                    : blockedReason}
                 </span>
                 <Button
                   size="icon"
                   className="h-8 w-8 rounded-lg"
                   disabled={!ready || !request.trim() || planning || executing}
-                  onClick={() => void requestPlan()}
-                  aria-label={t("codexAssistant.createPlan")}
+                  onClick={submitRequest}
+                  aria-label={
+                    mode === "chat"
+                      ? t("codexAssistant.sendChat")
+                      : t("codexAssistant.createPlan")
+                  }
                 >
                   {planning ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />

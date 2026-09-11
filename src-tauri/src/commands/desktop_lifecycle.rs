@@ -33,8 +33,11 @@ struct DesktopAppManifest {
     windows_app_id_suffix: &'static str,
     winget_id: &'static str,
     winget_source: &'static str,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_bundle_path: &'static str,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_app_name: &'static str,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_cask: &'static str,
 }
 
@@ -153,6 +156,8 @@ impl DesktopLifecycleAction {
     }
 }
 
+/// 按应用串行化生命周期操作、跟踪可取消任务的共享状态。
+/// 机制与具体应用无关，CLI（cli_lifecycle）与桌面应用共用同一实例。
 #[derive(Default)]
 pub struct DesktopLifecycleOperationState {
     locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -160,7 +165,7 @@ pub struct DesktopLifecycleOperationState {
 }
 
 impl DesktopLifecycleOperationState {
-    async fn lock(&self, app_id: &str) -> OwnedMutexGuard<()> {
+    pub(crate) async fn lock(&self, app_id: &str) -> OwnedMutexGuard<()> {
         let lock = if let Some(lock) = self.locks.read().await.get(app_id).cloned() {
             lock
         } else {
@@ -173,7 +178,7 @@ impl DesktopLifecycleOperationState {
         lock.lock_owned().await
     }
 
-    async fn register_job(&self, job_id: &str) -> Arc<AtomicBool> {
+    pub(crate) async fn register_job(&self, job_id: &str) -> Arc<AtomicBool> {
         let cancellation = Arc::new(AtomicBool::new(false));
         self.cancellations
             .write()
@@ -182,11 +187,11 @@ impl DesktopLifecycleOperationState {
         cancellation
     }
 
-    async fn finish_job(&self, job_id: &str) {
+    pub(crate) async fn finish_job(&self, job_id: &str) {
         self.cancellations.write().await.remove(job_id);
     }
 
-    async fn cancel_job(&self, job_id: &str) -> bool {
+    pub(crate) async fn cancel_job(&self, job_id: &str) -> bool {
         if let Some(cancellation) = self.cancellations.read().await.get(job_id) {
             cancellation.store(true, Ordering::SeqCst);
             true
@@ -891,6 +896,7 @@ pub(crate) fn plan_registered_desktop_install(
     })
 }
 
+#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
 pub(crate) fn spawn_registered_desktop_install(
     install: &RegisteredDesktopAssistantInstall,
 ) -> Result<Child, String> {
@@ -1381,6 +1387,7 @@ pub async fn list_desktop_lifecycle_jobs(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
 pub async fn launch_desktop_app(app: String) -> Result<(), String> {
     let manifest = manifest(&app)?;
     tokio::task::spawn_blocking(move || {

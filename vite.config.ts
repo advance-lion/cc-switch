@@ -202,7 +202,9 @@ function webAssistantBridge() {
 
   const desktopManifest = (value: unknown): DesktopAppManifest => {
     if (value !== "codex-desktop" && value !== "claude-desktop") {
-      throw new Error(`Unsupported desktop application: ${String(value ?? "")}`);
+      throw new Error(
+        `Unsupported desktop application: ${String(value ?? "")}`,
+      );
     }
     return DESKTOP_APPS[value];
   };
@@ -276,7 +278,8 @@ function webAssistantBridge() {
     can_update: false,
     can_uninstall: false,
     can_launch: false,
-    reason: "Desktop application management in the web development bridge is supported on Windows only",
+    reason:
+      "Desktop application management in the web development bridge is supported on Windows only",
   });
 
   const readDesktopAppxRecord = async (
@@ -369,8 +372,7 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     const currentParts = numericVersionParts(current);
     const length = Math.max(latestParts.length, currentParts.length);
     for (let index = 0; index < length; index += 1) {
-      const difference =
-        (latestParts[index] ?? 0) - (currentParts[index] ?? 0);
+      const difference = (latestParts[index] ?? 0) - (currentParts[index] ?? 0);
       if (difference !== 0) return difference > 0;
     }
     return false;
@@ -570,6 +572,64 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     `Never propose deleting existing files, changing CC Switch configuration, changing Codex configuration, elevation, or disabling safety controls.\n` +
     `Return only the JSON object required by the output schema.\n\nUser request:\n${request}`;
 
+  const MAX_CHAT_HISTORY_TURNS = 12;
+  const MAX_CHAT_TURN_LENGTH = 2_000;
+  const MAX_CHAT_HISTORY_CHARS = 12_000;
+
+  type ChatTurn = { role: "user" | "assistant"; content: string };
+
+  // Mirrors normalize_chat_history in src-tauri/src/commands/codex_assistant.rs.
+  const normalizeChatHistory = (history: unknown): ChatTurn[] => {
+    if (history === undefined || history === null) return [];
+    if (!Array.isArray(history)) throw new Error("对话历史格式不正确");
+    let normalized: ChatTurn[] = [];
+    for (const entry of history) {
+      if (!entry || typeof entry !== "object")
+        throw new Error("对话历史格式不正确");
+      const { role, content } = entry as { role?: unknown; content?: unknown };
+      if (role !== "user" && role !== "assistant")
+        throw new Error("对话历史包含非法角色");
+      if (typeof content !== "string") throw new Error("对话历史格式不正确");
+      const trimmed = content.trim();
+      if (!trimmed) continue;
+      normalized.push({
+        role,
+        content: Array.from(trimmed).slice(0, MAX_CHAT_TURN_LENGTH).join(""),
+      });
+    }
+    if (normalized.length > MAX_CHAT_HISTORY_TURNS) {
+      normalized = normalized.slice(-MAX_CHAT_HISTORY_TURNS);
+    }
+    while (
+      normalized.reduce((total, turn) => total + turn.content.length, 0) >
+      MAX_CHAT_HISTORY_CHARS
+    ) {
+      normalized.shift();
+    }
+    return normalized;
+  };
+
+  // Mirrors build_chat_prompt in src-tauri/src/commands/codex_assistant.rs.
+  const createChatPrompt = (request: string, history: ChatTurn[]) => {
+    const transcript = history.length
+      ? "\n\nConversation so far:\n" +
+        history
+          .map(
+            (turn) =>
+              `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`,
+          )
+          .join("\n") +
+        "\n"
+      : "";
+    return (
+      `You are CC Switch's in-app assistant. Answer questions about AI CLI and desktop agents, their installation, providers, and configuration.\n` +
+      `You run in a read-only sandbox: you cannot install, download, modify files, or run shell commands. Never claim to have done any of these.\n` +
+      `If the user wants to install, update, or uninstall an agent, explain that the Install plan flow in this panel performs it safely after user confirmation.\n` +
+      `Never propose deleting existing files, changing CC Switch configuration, changing Codex configuration, elevation, or disabling safety controls.\n` +
+      `Answer concisely and in the user's language.${transcript}\n\nUser message:\n${request}`
+    );
+  };
+
   const isValidPlan = (value: unknown): value is AssistantPlan => {
     if (!value || typeof value !== "object") return false;
     const plan = value as Partial<AssistantPlan>;
@@ -594,7 +654,9 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     if (tool === "codex-desktop" || tool === "claude-desktop") {
       const manifest = DESKTOP_APPS[tool];
       if (customInstallLocation) {
-        throw new Error(`${manifest.displayName} 由系统安装器管理，不支持自定义安装位置`);
+        throw new Error(
+          `${manifest.displayName} 由系统安装器管理，不支持自定义安装位置`,
+        );
       }
       const version = normalizeInstallVersion(requestedVersion);
       if (version !== "latest") {
@@ -759,9 +821,8 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
   };
 
   const runRegisteredInstall = (runId: string, install: RegisteredInstall) => {
-    const desktop = install.kind === "desktop"
-      ? desktopManifest(install.tool)
-      : null;
+    const desktop =
+      install.kind === "desktop" ? desktopManifest(install.tool) : null;
     const executable = desktop ? "winget.exe" : "npm";
     const args = desktop
       ? [
@@ -785,15 +846,11 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
             install.targetDir,
             `${install.packageName}@${install.version}`,
           ];
-    const child = spawn(
-      executable,
-      args,
-      {
-        cwd: install.targetDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
+    const child = spawn(executable, args, {
+      cwd: install.targetDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
     running.set(runId, child);
     emit({
       runId,
@@ -1019,6 +1076,58 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
               );
               return sendJson(response, 202, { runId });
             }
+            if (route === `${WEB_ASSISTANT_BASE}/chat`) {
+              if (typeof body.request !== "string" || !body.request.trim())
+                throw new Error("请输入想问的内容");
+              if (body.request.length > MAX_REQUEST_LENGTH)
+                throw new Error("请求过长");
+              const history = normalizeChatHistory(body.history);
+              const targetDir = await defaultPlanWorkspace();
+              const runId = randomUUID();
+              const { directory } = await schemaPath();
+              const outputPath = path.join(
+                directory,
+                `run-output-${runId}.txt`,
+              );
+              runCodex(
+                runId,
+                targetDir,
+                [
+                  "exec",
+                  "--json",
+                  "--ephemeral",
+                  "--skip-git-repo-check",
+                  "--ignore-rules",
+                  "--cd",
+                  targetDir,
+                  "--sandbox",
+                  "read-only",
+                  "--output-last-message",
+                  outputPath,
+                  createChatPrompt(body.request.trim(), history),
+                ],
+                async (success) => {
+                  try {
+                    if (!success) return;
+                    const answer = (
+                      await fs.readFile(outputPath, "utf8")
+                    ).trim();
+                    if (!answer) throw new Error("Codex 未返回回答");
+                    emit({ runId, kind: "message", message: answer });
+                  } catch (error) {
+                    emit({
+                      runId,
+                      kind: "stderr",
+                      message:
+                        error instanceof Error ? error.message : String(error),
+                    });
+                  } finally {
+                    await fs.rm(outputPath, { force: true });
+                  }
+                },
+              );
+              return sendJson(response, 202, { runId });
+            }
             if (route === `${WEB_ASSISTANT_BASE}/execute`) {
               if (typeof body.planId !== "string")
                 throw new Error("安装计划不存在或已失效，请重新生成");
@@ -1042,9 +1151,7 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
               child.kill();
               return sendJson(response, 200, { cancelled: true });
             }
-            if (
-              route === `${WEB_ASSISTANT_BASE}/desktop-app-check-updates`
-            ) {
+            if (route === `${WEB_ASSISTANT_BASE}/desktop-app-check-updates`) {
               const status = await checkDesktopAppUpdates(
                 desktopManifest(body.app),
               );
