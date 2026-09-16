@@ -1,16 +1,39 @@
 /**
- * 统一供应商（Universal Provider）预设配置
+ * Provider presets for the preset selector in ProviderForm.
  *
- * 统一供应商是跨应用共享的配置，修改后会自动同步到 Claude、Codex、Gemini 三个应用。
- * 适用于 NewAPI 等支持多种协议的 API 网关。
+ * The old UniversalProvider type has been removed; these presets remain as
+ * standalone configuration entries used by ProviderPresetSelector to suggest
+ * common API gateway templates. The actual provider creation now goes through
+ * the Provider Center managed-draft flow.
  */
 
-import type {
-  UniversalProvider,
-  UniversalProviderApps,
-  UniversalProviderModels,
-} from "@/types";
-import { deepClone } from "@/utils/deepClone";
+interface UniversalProviderApps {
+  claude: boolean;
+  codex: boolean;
+  gemini: boolean;
+}
+
+interface ClaudeModelConfig {
+  model?: string;
+  haikuModel?: string;
+  sonnetModel?: string;
+  opusModel?: string;
+}
+
+interface CodexModelConfig {
+  model?: string;
+  reasoningEffort?: string;
+}
+
+interface GeminiModelConfig {
+  model?: string;
+}
+
+interface UniversalProviderModels {
+  claude?: ClaudeModelConfig;
+  codex?: CodexModelConfig;
+  gemini?: GeminiModelConfig;
+}
 
 /**
  * 统一供应商预设接口
@@ -91,34 +114,11 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
 ];
 
 /**
- * 根据预设创建统一供应商
- */
-export function createUniversalProviderFromPreset(
-  preset: UniversalProviderPreset,
-  id: string,
-  baseUrl: string,
-  apiKey: string,
-  customName?: string,
-): UniversalProvider {
-  return {
-    id,
-    name: customName || preset.name,
-    providerType: preset.providerType,
-    apps: { ...preset.defaultApps },
-    baseUrl,
-    apiKey,
-    models: deepClone(preset.defaultModels),
-    websiteUrl: preset.websiteUrl,
-    icon: preset.icon,
-    iconColor: preset.iconColor,
-    createdAt: Date.now(),
-  };
-}
-
-/**
  * 获取预设的显示名称（用于 UI）
  */
-export function getPresetDisplayName(preset: UniversalProviderPreset): string {
+export function getPresetDisplayName(
+  preset: UniversalProviderPreset,
+): string {
   return preset.name;
 }
 

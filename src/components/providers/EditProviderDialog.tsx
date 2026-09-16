@@ -18,6 +18,12 @@ import {
 } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
 
+interface ManagedEditContext {
+  definitionId: string;
+  expectedRevision?: number;
+  targetAppTypes: string[];
+}
+
 interface EditProviderDialogProps {
   open: boolean;
   provider: Provider | null;
@@ -25,9 +31,15 @@ interface EditProviderDialogProps {
   onSubmit: (payload: {
     provider: Provider;
     originalId?: string;
+    managedContext?: ManagedEditContext;
   }) => Promise<void> | void;
   appId: AppId;
   isProxyTakeover?: boolean; // 代理接管模式下不读取 live（避免显示被接管后的代理配置）
+  /** When set, the dialog edits a Provider Center projection: skip live read
+   * (DB projection is SSOT) and route the save through the managed draft API. */
+  managedContext?: ManagedEditContext;
+  /** Number of agents this universal provider is bound to. */
+  managedBindingCount?: number;
 }
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
@@ -95,6 +107,8 @@ export function EditProviderDialog({
   onSubmit,
   appId,
   isProxyTakeover = false,
+  managedContext,
+  managedBindingCount,
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
@@ -174,6 +188,16 @@ export function EditProviderDialog({
         return;
       }
 
+      // Provider Center 受管投射：数据库投影是 SSOT，不读取 live 配置
+      // （live 可能被代理接管或漂移改写，读回会污染共享定义）
+      if (managedContext) {
+        if (!cancelled) {
+          setLiveSettings(null);
+          setHasLoadedLive(true);
+        }
+        return;
+      }
+
       // OpenCode uses additive mode, while Pi's shared models.json is owned by
       // the catalog coordinator. Neither has a per-provider generic live
       // snapshot that may replace the DB aggregate in this form.
@@ -237,7 +261,7 @@ export function EditProviderDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
+  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover, managedContext]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
     const storedSettings = asRecord(provider?.settingsConfig);
@@ -324,10 +348,11 @@ export function EditProviderDialog({
       await onSubmit({
         provider: updatedProvider,
         originalId: provider.id,
+        managedContext,
       });
       closeDialog();
     },
-    [appId, onSubmit, closeDialog, provider],
+    [appId, onSubmit, closeDialog, provider, managedContext],
   );
 
   if (!provider || !initialData) {
@@ -352,6 +377,19 @@ export function EditProviderDialog({
         </Button>
       }
     >
+      {managedContext && (
+        <div className="mb-3 flex items-center gap-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 dark:border-sky-800 dark:bg-sky-950/40">
+          <span className="inline-flex items-center rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-900/40 dark:text-sky-200">
+            通用
+          </span>
+          <span className="text-xs text-muted-foreground">
+            通用 Provider
+            {managedBindingCount != null
+              ? ` · 已添加到 ${managedBindingCount} 个 Agent`
+              : ""}
+          </span>
+        </div>
+      )}
       <ProviderForm
         appId={appId}
         providerId={provider.id}

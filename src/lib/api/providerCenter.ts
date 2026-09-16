@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { Provider } from "@/types";
 
 export type ProviderCenterApp =
   | "claude"
@@ -28,6 +29,13 @@ export interface ProviderDefinition {
     sourceFingerprint?: string;
     lastObservedAt?: number;
   };
+  sources: Array<{
+    sourceApp: string;
+    sourceRef: string;
+    importedAt: number;
+    sourceFingerprint?: string;
+    lastObservedAt?: number;
+  }>;
   credentialConfigured: boolean;
   credentialHint?: string;
   lastDiscoveryAt?: number;
@@ -62,6 +70,32 @@ export interface ProviderCenterState {
   transactions: ProviderApplyTransaction[];
 }
 
+export type AgentProviderScope = "universal" | "agentOnly" | "nativeAccount";
+
+export type AgentProviderOwnership =
+  | "providerCenterProjection"
+  | "ccSwitchManaged"
+  | "agentNative";
+
+export interface AgentProviderCatalogItem {
+  providerId: string;
+  providerName: string;
+  category?: string;
+  scope: AgentProviderScope;
+  ownership: AgentProviderOwnership;
+  definitionId?: string;
+  bindingStatus?: ProviderBinding["status"];
+  appliedRevision?: number;
+  drifted: boolean;
+  readOnly: boolean;
+}
+
+export interface AgentProviderCatalog {
+  appType: ProviderCenterApp;
+  items: AgentProviderCatalogItem[];
+  generatedAt: number;
+}
+
 export interface ImportConflict {
   existingProviderId: string;
   existingName: string;
@@ -88,6 +122,7 @@ export interface ImportCandidate {
   sessionId: string;
   sourceRef: string;
   sourceApp: string;
+  sourceKind: "externalManaged" | "providerCenterProjection" | "localManaged";
   name: string;
   protocol: string;
   baseUrl: string;
@@ -156,6 +191,9 @@ export interface ProviderApplyPreviewTarget {
   appType: string;
   operation: "create" | "update" | "unsupported";
   compatible: boolean;
+  connectionMode: "direct" | "proxy" | "unsupported";
+  routeId?: string;
+  requiresTakeover: boolean;
   drifted: boolean;
   currentProviderId?: string;
   liveFingerprint?: string;
@@ -186,14 +224,35 @@ export interface ProviderApplyTransaction {
   completedAt?: number;
 }
 
+export interface ManagedProviderDraftInput {
+  appType: string;
+  provider: Provider;
+  definitionId: string;
+  expectedRevision?: number;
+  /** Agents to save the universal provider to. If empty, defaults to [appType]. */
+  targetAppTypes?: string[];
+}
+
+export type DeleteMode = "removeCurrent" | "detachKeepIndependent" | "deleteGlobally";
+
 export const providerCenterApi = {
   get: (): Promise<ProviderCenterState> => invoke("get_provider_center"),
+  getAgentProviderCatalog: (
+    appType: ProviderCenterApp,
+  ): Promise<AgentProviderCatalog> =>
+    invoke("get_provider_center_agent_provider_catalog", { appType }),
   getModelCatalog: (appTypes: string[] = []): Promise<UnifiedModelCatalog> =>
     invoke("get_provider_center_model_catalog", { appTypes }),
   save: (input: SaveProviderDefinitionInput): Promise<ProviderDefinition> =>
     invoke("save_provider_center_definition", { input }),
   delete: (providerId: string): Promise<void> =>
     invoke("delete_provider_center_definition", { providerId }),
+  deleteProvider: (
+    providerId: string,
+    appType: string,
+    mode: DeleteMode,
+  ): Promise<void> =>
+    invoke("delete_provider_center_provider", { providerId, appType, mode }),
   duplicate: (providerId: string): Promise<ProviderDefinition> =>
     invoke("duplicate_provider_center_definition", { providerId }),
   discoverModels: (providerId: string): Promise<ModelDiscoveryResult> =>
@@ -223,6 +282,11 @@ export const providerCenterApi = {
     appTypes: string[],
   ): Promise<ProviderDefinition> =>
     invoke("import_provider_center_candidate", { sourceRef, appTypes }),
+  attach: (
+    providerId: string,
+    appType: ProviderCenterApp,
+  ): Promise<ProviderBinding> =>
+    invoke("attach_provider_center_binding", { providerId, appType }),
   apply: (providerId: string, appTypes: string[]): Promise<ProviderBinding[]> =>
     invoke("apply_provider_center_bindings", { providerId, appTypes }),
   previewApply: (
@@ -230,6 +294,14 @@ export const providerCenterApi = {
     appTypes: string[],
   ): Promise<ProviderApplyPreview> =>
     invoke("preview_provider_center_apply", { providerId, appTypes }),
+  previewDefinitionCompatibility: (
+    providerId: string,
+    appTypes: string[],
+  ): Promise<ProviderApplyPreview> =>
+    invoke("preview_provider_center_definition_compatibility", {
+      providerId,
+      appTypes,
+    }),
   applyTransaction: (
     providerId: string,
     appTypes: string[],
@@ -265,5 +337,19 @@ export const providerCenterApi = {
       providerId,
       appType,
       removeProjection,
+    }),
+  previewManagedDraft: (
+    input: ManagedProviderDraftInput,
+  ): Promise<ProviderApplyPreview> =>
+    invoke("preview_provider_center_managed_draft", { input }),
+  confirmManagedDraft: (
+    input: ManagedProviderDraftInput,
+    previewToken: string,
+    idempotencyKey = crypto.randomUUID(),
+  ): Promise<ProviderApplyTransaction> =>
+    invoke("confirm_provider_center_managed_draft", {
+      input,
+      previewToken,
+      idempotencyKey,
     }),
 };

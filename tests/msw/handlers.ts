@@ -52,6 +52,18 @@ export const handlers = [
     return success(getProviders(app));
   }),
 
+  http.post(
+    `${TAURI_ENDPOINT}/get_provider_center_agent_provider_catalog`,
+    async ({ request }) => {
+      const { appType } = await withJson<{ appType: AppId }>(request);
+      return success({
+        appType,
+        items: [],
+        generatedAt: Date.now(),
+      });
+    },
+  ),
+
   http.post(`${TAURI_ENDPOINT}/get_current_provider`, async ({ request }) => {
     const { app } = await withJson<{ app: AppId }>(request);
     return success(getCurrentProviderId(app));
@@ -216,6 +228,66 @@ export const handlers = [
   ),
 
   http.post(`${TAURI_ENDPOINT}/restart_app`, () => success(true)),
+
+  http.post(`${TAURI_ENDPOINT}/get_tool_versions`, async ({ request }) => {
+    const { tools = [] } = await withJson<{ tools?: string[] }>(request);
+    return success(
+      tools.map((name) => ({
+        name,
+        version: null,
+        latest_version: null,
+        error: null,
+        installed_but_broken: false,
+        env_type: "windows",
+        wsl_distro: null,
+      })),
+    );
+  }),
+
+  http.post(
+    `${TAURI_ENDPOINT}/get_tool_lifecycle_capabilities`,
+    async ({ request }) => {
+      const { tools = [] } = await withJson<{ tools?: string[] }>(request);
+      return success(
+        tools.map((name) => ({
+          name,
+          can_install: true,
+          can_update: false,
+          can_uninstall: false,
+          can_launch: false,
+          installation_source: "not_installed",
+          reason: null,
+        })),
+      );
+    },
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/list_cli_lifecycle_jobs`, () => success([])),
+
+  http.post(`${TAURI_ENDPOINT}/get_desktop_app_status`, async ({ request }) => {
+    const { app } = await withJson<{
+      app: "codex-desktop" | "claude-desktop";
+    }>(request);
+    return success({
+      id: app,
+      display_name:
+        app === "codex-desktop" ? "Codex Desktop" : "Claude Desktop",
+      installed: false,
+      version: null,
+      latest_version: null,
+      path: null,
+      launch_target: null,
+      package_identity: null,
+      installation_source: "not_installed",
+      can_install: true,
+      can_update: false,
+      can_uninstall: false,
+      can_launch: false,
+      reason: null,
+    });
+  }),
+
+  http.post(`${TAURI_ENDPOINT}/list_desktop_lifecycle_jobs`, () => success([])),
 
   http.post(`${TAURI_ENDPOINT}/get_settings`, () => success(getSettings())),
 

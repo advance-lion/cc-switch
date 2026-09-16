@@ -6,10 +6,11 @@ import {
   ChevronRight,
   CircleAlert,
   CircleStop,
-  FolderOpen,
+  FilePenLine,
   Loader2,
   MessageCircle,
   Send,
+  ShieldAlert,
   Terminal,
   X,
 } from "lucide-react";
@@ -22,8 +23,9 @@ import { cn } from "@/lib/utils";
 import {
   isCodexAssistantWebBridgeActive,
   settingsApi,
+  type CodexAssistantApproval,
+  type CodexAssistantApprovalDecision,
   type CodexAssistantChatTurn,
-  type CodexAssistantPlan,
 } from "@/lib/api";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
@@ -37,17 +39,9 @@ type FloatingPosition = {
   y: number;
 };
 
-type InstallLocationMode = "default" | "custom";
-type InstallVersionMode = "stable" | "latest" | "specific";
-type AssistantMode = "chat" | "plan";
-
-// Keep the visual affordance close to the Codex mark, but retain enough room
-// for a reliable pointer target on desktop.
 const FLOATING_BUTTON_SIZE = 34;
 const FLOATING_BUTTON_MARGIN = 16;
 const FLOATING_POSITION_STORAGE_KEY = "cc-switch-codex-assistant-position";
-const INSTALL_DIRECTORY_STORAGE_KEY =
-  "cc-switch-codex-assistant-install-directory";
 const MAX_VISIBLE_LOG_LINES = 180;
 
 const clampFloatingPosition = (
@@ -92,12 +86,141 @@ interface CodexAssistantDockProps {
   openRequestId?: number;
 }
 
-/**
- * 右侧 Codex 安装助手。
- *
- * 它是受控安装流的入口，而不是一个把聊天文本拼进 shell 的终端。真正的执行器接入后，
- * 只会接受“生成安装计划 / 用户确认 / 查看日志”这类结构化操作。
- */
+function ApprovalCard({
+  approval,
+  responding,
+  onRespond,
+}: {
+  approval: CodexAssistantApproval;
+  responding: boolean;
+  onRespond: (decision: CodexAssistantApprovalDecision) => void;
+}) {
+  const { t } = useTranslation();
+  const isCommand = approval.type === "command";
+  const supports = (decision: CodexAssistantApprovalDecision) =>
+    approval.availableDecisions.includes(decision);
+
+  return (
+    <div
+      className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/[0.055] p-3"
+      data-testid={`codex-approval-${approval.id}`}
+    >
+      <div className="flex items-start gap-2.5">
+        <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-amber-500/15 text-amber-700 dark:text-amber-200">
+          {isCommand ? (
+            <Terminal className="h-3.5 w-3.5" />
+          ) : (
+            <FilePenLine className="h-3.5 w-3.5" />
+          )}
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold">
+            {isCommand
+              ? t("codexAssistant.commandApproval", {
+                  defaultValue: "Command approval",
+                })
+              : t("codexAssistant.fileApproval", {
+                  defaultValue: "File change approval",
+                })}
+          </p>
+          {approval.reason && (
+            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+              {approval.reason}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {approval.command && (
+        <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border/70 bg-background/70 px-2.5 py-2 font-mono text-[11px] leading-relaxed">
+          {approval.command}
+        </pre>
+      )}
+
+      <dl className="space-y-1 text-[11px] text-muted-foreground">
+        {approval.cwd && (
+          <div className="flex gap-2">
+            <dt className="shrink-0 font-medium text-foreground/80">
+              {t("codexAssistant.workingDirectory", {
+                defaultValue: "Working directory",
+              })}
+            </dt>
+            <dd className="min-w-0 break-all">{approval.cwd}</dd>
+          </div>
+        )}
+        {approval.networkHost && (
+          <div className="flex gap-2">
+            <dt className="shrink-0 font-medium text-foreground/80">
+              {t("codexAssistant.networkHost", { defaultValue: "Network" })}
+            </dt>
+            <dd className="min-w-0 break-all">{approval.networkHost}</dd>
+          </div>
+        )}
+        {approval.grantRoot && (
+          <div className="flex gap-2">
+            <dt className="shrink-0 font-medium text-foreground/80">
+              {t("codexAssistant.grantRoot", { defaultValue: "Write access" })}
+            </dt>
+            <dd className="min-w-0 break-all">{approval.grantRoot}</dd>
+          </div>
+        )}
+      </dl>
+
+      <div className="flex flex-wrap justify-end gap-2">
+        {supports("cancel") && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={responding}
+            onClick={() => onRespond("cancel")}
+          >
+            {t("codexAssistant.cancelApproval", {
+              defaultValue: "Cancel task",
+            })}
+          </Button>
+        )}
+        {supports("decline") && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={responding}
+            onClick={() => onRespond("decline")}
+          >
+            {t("codexAssistant.declineApproval", { defaultValue: "Deny" })}
+          </Button>
+        )}
+        {supports("accept") && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={responding}
+            onClick={() => onRespond("accept")}
+          >
+            {t("codexAssistant.approveOnce", { defaultValue: "Allow once" })}
+          </Button>
+        )}
+        {approval.allowForSession && supports("acceptForSession") && (
+          <Button
+            type="button"
+            size="sm"
+            disabled={responding}
+            onClick={() => onRespond("acceptForSession")}
+          >
+            {responding && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {t("codexAssistant.approveForSession", {
+              defaultValue: "Allow for session",
+            })}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** A persistent Codex app-server conversation with explicit approval prompts. */
 export function CodexAssistantDock({
   providerReady,
   onOpenCodexConfiguration,
@@ -110,33 +233,23 @@ export function CodexAssistantDock({
   const webBridgeActive = isCodexAssistantWebBridgeActive();
   const [open, setOpen] = useState(false);
   const [showFloatingGreeting, setShowFloatingGreeting] = useState(true);
-  const [mode, setMode] = useState<AssistantMode>("chat");
   const [chatMessages, setChatMessages] = useState<CodexAssistantChatTurn[]>(
     [],
   );
   const [runtime, setRuntime] = useState<CodexRuntime | null>(null);
-  const supportsCustomInstallLocation =
-    installIntent?.supportsCustomLocation !== false;
-  const supportsVersionPin = installIntent?.supportsVersionPin !== false;
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [request, setRequest] = useState("");
-  const [targetDirectory, setTargetDirectory] = useState("");
-  const [installLocationMode, setInstallLocationMode] =
-    useState<InstallLocationMode>("default");
-  const [installVersionMode, setInstallVersionMode] =
-    useState<InstallVersionMode>("stable");
-  const [specificVersion, setSpecificVersion] = useState("");
-  const [webDirectoryEditorOpen, setWebDirectoryEditorOpen] = useState(false);
-  const [webDirectoryDraft, setWebDirectoryDraft] = useState("");
-  const [plan, setPlan] = useState<CodexAssistantPlan | null>(null);
-  const [planId, setPlanId] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [approvals, setApprovals] = useState<CodexAssistantApproval[]>([]);
+  const [respondingApprovalIds, setRespondingApprovalIds] = useState<
+    Set<string>
+  >(new Set());
   const [runError, setRunError] = useState<string | null>(null);
-  const [planning, setPlanning] = useState(false);
-  const [executing, setExecuting] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
+  const [running, setRunning] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [floatingPosition, setFloatingPosition] =
     useState<FloatingPosition | null>(null);
   const floatingDockRef = useRef<HTMLDivElement>(null);
@@ -151,11 +264,8 @@ export function CodexAssistantDock({
     moved: boolean;
   } | null>(null);
   const suppressOpenRef = useRef(false);
-  const activeRunIdRef = useRef<string | null>(null);
-  const activeRunKindRef = useRef<"plan" | "chat" | "execute" | null>(null);
-  const activeInstallToolRef = useRef<string | null>(null);
-  const planReceivedRef = useRef(false);
-  const messageReceivedRef = useRef(false);
+  const sessionIdRef = useRef<string | null>(null);
+  const streamAssistantMessageRef = useRef(false);
   const lastHandledOpenRequestRef = useRef(0);
 
   const appendLog = useCallback((line: string) => {
@@ -174,17 +284,12 @@ export function CodexAssistantDock({
           return;
         }
       } catch {
-        // A stale or malformed stored value simply falls back to the docked default.
+        // Ignore stale stored coordinates.
       }
     }
     const next = defaultFloatingPosition();
     latestFloatingPositionRef.current = next;
     setFloatingPosition(next);
-  }, []);
-
-  useEffect(() => {
-    const storedDirectory = localStorage.getItem(INSTALL_DIRECTORY_STORAGE_KEY);
-    if (storedDirectory) setTargetDirectory(storedDirectory);
   }, []);
 
   useEffect(() => {
@@ -199,10 +304,6 @@ export function CodexAssistantDock({
       setRequest(
         t("codexAssistant.installRequest", { app: installIntent.appName }),
       );
-      setMode("plan");
-      setInstallLocationMode("default");
-      setInstallVersionMode("stable");
-      setSpecificVersion("");
     }
     setShowFloatingGreeting(false);
     setOpen(true);
@@ -225,6 +326,11 @@ export function CodexAssistantDock({
     () => () => {
       if (dragAnimationFrameRef.current !== null) {
         cancelAnimationFrame(dragAnimationFrameRef.current);
+      }
+      const activeSessionId = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (activeSessionId) {
+        void settingsApi.closeCodexAssistantSession(activeSessionId);
       }
     },
     [],
@@ -250,67 +356,71 @@ export function CodexAssistantDock({
 
     void settingsApi
       .onCodexAssistantEvent((event) => {
-        const knownRunId = activeRunIdRef.current;
-        // The Tauri command returns the run id after the process has started. In
-        // the unlikely event that the first event wins that race, adopt its id.
-        if (!knownRunId && event.kind === "started") {
-          activeRunIdRef.current = event.runId;
-          setActiveRunId(event.runId);
-        } else if (knownRunId !== event.runId) {
-          return;
-        }
+        if (event.sessionId !== sessionIdRef.current) return;
 
-        if (event.kind === "log" || event.kind === "stderr") {
-          const prefix = event.kind === "stderr" ? "stderr · " : "";
-          if (event.message) appendLog(`${prefix}${event.message}`);
-          return;
-        }
-
-        if (event.kind === "plan" && event.plan && event.planId) {
-          planReceivedRef.current = true;
-          setPlan(event.plan);
-          setPlanId(event.planId);
-          return;
-        }
-
-        if (event.kind === "message" && event.message) {
-          messageReceivedRef.current = true;
-          const answer = event.message;
-          setChatMessages((current) => [
-            ...current,
-            { role: "assistant", content: answer },
-          ]);
-          return;
-        }
-
-        if (event.kind === "finished") {
-          const completedKind = activeRunKindRef.current;
-          const success = event.success === true;
-          activeRunIdRef.current = null;
-          activeRunKindRef.current = null;
-          setActiveRunId(null);
-          setPlanning(false);
-          setExecuting(false);
-          setStopping(false);
-
-          if (!success) {
-            const message = event.message || t("codexAssistant.runFailed");
-            activeInstallToolRef.current = null;
-            setRunError(message);
+        switch (event.kind) {
+          case "started":
+            streamAssistantMessageRef.current = false;
+            setRunning(true);
+            return;
+          case "log":
+            if (event.message) appendLog(event.message);
+            return;
+          case "stderr":
+            if (event.message) appendLog(`stderr · ${event.message}`);
+            return;
+          case "disconnected":
+            sessionIdRef.current = null;
+            setSessionId(null);
+            streamAssistantMessageRef.current = false;
+            setRunning(false);
+            setStopping(false);
+            setApprovals([]);
+            setRespondingApprovalIds(new Set());
+            setRunError(event.message);
             toast.error(t("codexAssistant.runFailed"), {
-              description: message,
+              description: event.message,
             });
-          } else if (completedKind === "plan" && !planReceivedRef.current) {
-            setRunError(t("codexAssistant.invalidPlan"));
-          } else if (completedKind === "chat" && !messageReceivedRef.current) {
-            setRunError(t("codexAssistant.invalidAnswer"));
-          } else if (completedKind === "execute") {
-            void refreshRuntime();
-            const tool = activeInstallToolRef.current;
-            if (tool) onInstallationCompleted?.(tool);
-            activeInstallToolRef.current = null;
-            toast.success(t("codexAssistant.executionCompleted"));
-          }
+            return;
+          case "message":
+            if (event.message) {
+              setChatMessages((current) => {
+                if (streamAssistantMessageRef.current) {
+                  const last = current.at(-1);
+                  if (last?.role === "assistant") {
+                    return [
+                      ...current.slice(0, -1),
+                      { ...last, content: last.content + event.message },
+                    ];
+                  }
+                }
+                streamAssistantMessageRef.current = true;
+                return [
+                  ...current,
+                  { role: "assistant", content: event.message },
+                ];
+              });
+            }
+            return;
+          case "approval":
+            setApprovals((current) => [
+              ...current.filter((item) => item.id !== event.approval.id),
+              event.approval,
+            ]);
+            return;
+          case "finished":
+            streamAssistantMessageRef.current = false;
+            setRunning(false);
+            setStopping(false);
+            setApprovals([]);
+            setRespondingApprovalIds(new Set());
+            if (!event.success && !event.cancelled) {
+              const message = event.message || t("codexAssistant.runFailed");
+              setRunError(message);
+              toast.error(t("codexAssistant.runFailed"), {
+                description: message,
+              });
+            }
         }
       })
       .then((listener) => {
@@ -322,7 +432,7 @@ export function CodexAssistantDock({
       dispose = true;
       unlisten?.();
     };
-  }, [appendLog, onInstallationCompleted, refreshRuntime, t]);
+  }, [appendLog, t]);
 
   useEffect(() => {
     if (open) void refreshRuntime();
@@ -333,6 +443,7 @@ export function CodexAssistantDock({
     try {
       await settingsApi.runToolLifecycleAction(["codex"], "install");
       await refreshRuntime();
+      onInstallationCompleted?.("codex");
       toast.success(t("codexAssistant.runtimeInstalled"));
     } catch (error) {
       toast.error(t("codexAssistant.runtimeInstallFailed"), {
@@ -344,176 +455,110 @@ export function CodexAssistantDock({
   };
 
   const cliReady = Boolean(runtime?.version && !runtime?.installed_but_broken);
-  // In Vite development, the bridge uses the current local Codex CLI config.
-  // A failed CLI request remains the source of truth for provider validity.
+  const effectiveCliReady = cliReady || webBridgeActive;
   const effectiveProviderReady = providerReady || webBridgeActive;
-  const ready = cliReady && effectiveProviderReady;
-  const blockedReason = !cliReady
+  const ready = effectiveCliReady && effectiveProviderReady;
+  const blockedReason = !effectiveCliReady
     ? t("codexAssistant.cliRequired")
     : !effectiveProviderReady
       ? t("codexAssistant.providerRequired")
       : null;
 
-  const chooseInstallDirectory = async () => {
+  const ensureSession = async (): Promise<string> => {
+    if (sessionIdRef.current) return sessionIdRef.current;
+    setStartingSession(true);
     try {
-      if (webBridgeActive) {
-        setWebDirectoryDraft(targetDirectory);
-        setWebDirectoryEditorOpen(true);
-        return;
-      }
-      const selected = await settingsApi.pickDirectory(
-        targetDirectory || undefined,
-      );
-      if (!selected) return;
-      setTargetDirectory(selected);
-      localStorage.setItem(INSTALL_DIRECTORY_STORAGE_KEY, selected);
+      const nextSessionId = await settingsApi.startCodexAssistantSession();
+      sessionIdRef.current = nextSessionId;
+      setSessionId(nextSessionId);
+      return nextSessionId;
+    } finally {
+      setStartingSession(false);
+    }
+  };
+
+  const sendMessage = async () => {
+    const text = request.trim();
+    if (!text || running || startingSession) return;
+
+    setRequest("");
+    setRunError(null);
+    setLogs([]);
+    streamAssistantMessageRef.current = false;
+    setChatMessages((current) => [...current, { role: "user", content: text }]);
+    try {
+      const activeSessionId = await ensureSession();
+      setRunning(true);
+      await settingsApi.sendCodexAssistantMessage(activeSessionId, text);
     } catch (error) {
-      toast.error(t("codexAssistant.directorySelectionFailed"), {
-        description: extractErrorMessage(error) || undefined,
+      setRunning(false);
+      const message =
+        extractErrorMessage(error) || t("codexAssistant.runFailed");
+      setRunError(message);
+      toast.error(t("codexAssistant.runFailed"), { description: message });
+    }
+  };
+
+  const respondToApproval = async (
+    approvalId: string,
+    decision: CodexAssistantApprovalDecision,
+  ) => {
+    const activeSessionId = sessionIdRef.current;
+    if (!activeSessionId || respondingApprovalIds.has(approvalId)) return;
+    setRespondingApprovalIds((current) => new Set(current).add(approvalId));
+    try {
+      await settingsApi.respondCodexAssistantApproval(
+        activeSessionId,
+        approvalId,
+        decision,
+      );
+      setApprovals((current) =>
+        current.filter((approval) => approval.id !== approvalId),
+      );
+    } catch (error) {
+      toast.error(
+        t("codexAssistant.approvalFailed", {
+          defaultValue: "Could not send the approval decision",
+        }),
+        { description: extractErrorMessage(error) || undefined },
+      );
+    } finally {
+      setRespondingApprovalIds((current) => {
+        const next = new Set(current);
+        next.delete(approvalId);
+        return next;
       });
     }
   };
 
-  const saveWebDirectory = () => {
-    const selected = webDirectoryDraft.trim();
-    if (!selected) {
-      toast.error(t("codexAssistant.directoryRequired"));
-      return;
-    }
-    setTargetDirectory(selected);
-    localStorage.setItem(INSTALL_DIRECTORY_STORAGE_KEY, selected);
-    setWebDirectoryEditorOpen(false);
-  };
-
-  const requestPlan = async () => {
-    if (!request.trim() || planning || executing) return;
-    if (
-      (!installIntent ||
-        (supportsCustomInstallLocation && installLocationMode === "custom")) &&
-      !targetDirectory
-    ) {
-      toast.error(t("codexAssistant.directoryRequired"));
-      return;
-    }
-    if (
-      installIntent &&
-      supportsVersionPin &&
-      installVersionMode === "specific" &&
-      !specificVersion.trim()
-    ) {
-      toast.error(t("codexAssistant.versionRequired"));
-      return;
-    }
-    setPlan(null);
-    setPlanId(null);
-    setLogs([]);
-    setRunError(null);
-    planReceivedRef.current = false;
-    activeRunKindRef.current = "plan";
-    setPlanning(true);
-    try {
-      const runId = await settingsApi.startCodexAssistantPlan(
-        request.trim(),
-        targetDirectory,
-        installIntent
-          ? {
-              tool: installIntent.tool,
-              requestedVersion:
-                supportsVersionPin && installVersionMode === "specific"
-                  ? specificVersion.trim()
-                  : installVersionMode,
-              customInstallLocation:
-                supportsCustomInstallLocation &&
-                installLocationMode === "custom",
-            }
-          : undefined,
-      );
-      if (activeRunKindRef.current === "plan") {
-        activeRunIdRef.current = runId;
-        setActiveRunId(runId);
-      }
-    } catch (error) {
-      activeRunKindRef.current = null;
-      setPlanning(false);
-      const message =
-        extractErrorMessage(error) || t("codexAssistant.runFailed");
-      setRunError(message);
-      toast.error(t("codexAssistant.runFailed"), { description: message });
-    }
-  };
-
-  const sendChat = async () => {
-    const text = request.trim();
-    if (!text || planning || executing) return;
-    const history = chatMessages.slice(-24);
-    setPlan(null);
-    setPlanId(null);
-    setLogs([]);
-    setRunError(null);
-    setChatMessages((current) => [...current, { role: "user", content: text }]);
-    setRequest("");
-    messageReceivedRef.current = false;
-    activeRunKindRef.current = "chat";
-    setPlanning(true);
-    try {
-      const runId = await settingsApi.startCodexAssistantChat(text, history);
-      if (activeRunKindRef.current === "chat") {
-        activeRunIdRef.current = runId;
-        setActiveRunId(runId);
-      }
-    } catch (error) {
-      activeRunKindRef.current = null;
-      setPlanning(false);
-      const message =
-        extractErrorMessage(error) || t("codexAssistant.runFailed");
-      setRunError(message);
-      toast.error(t("codexAssistant.runFailed"), { description: message });
-    }
-  };
-
-  const submitRequest = () => {
-    if (mode === "chat") {
-      void sendChat();
-    } else {
-      void requestPlan();
-    }
-  };
-
-  const executePlan = async () => {
-    if (!planId || !plan?.executable || planning || executing) return;
-    setRunError(null);
-    activeInstallToolRef.current = plan.install?.tool ?? null;
-    activeRunKindRef.current = "execute";
-    setExecuting(true);
-    try {
-      const runId = await settingsApi.executeCodexAssistantPlan(planId);
-      if (activeRunKindRef.current === "execute") {
-        activeRunIdRef.current = runId;
-        setActiveRunId(runId);
-      }
-    } catch (error) {
-      activeRunKindRef.current = null;
-      activeInstallToolRef.current = null;
-      setExecuting(false);
-      const message =
-        extractErrorMessage(error) || t("codexAssistant.runFailed");
-      setRunError(message);
-      toast.error(t("codexAssistant.runFailed"), { description: message });
-    }
-  };
-
   const cancelRun = async () => {
-    const runId = activeRunIdRef.current;
-    if (!runId || stopping) return;
+    const activeSessionId = sessionIdRef.current;
+    if (!activeSessionId || stopping) return;
     setStopping(true);
     try {
-      await settingsApi.cancelCodexAssistantRun(runId);
+      await settingsApi.cancelCodexAssistantRun(activeSessionId);
       appendLog(t("codexAssistant.cancelling"));
     } catch (error) {
       setStopping(false);
       toast.error(t("codexAssistant.cancelFailed"), {
         description: extractErrorMessage(error) || undefined,
       });
+    }
+  };
+
+  const closeSession = () => {
+    const activeSessionId = sessionIdRef.current;
+    sessionIdRef.current = null;
+    setSessionId(null);
+    streamAssistantMessageRef.current = false;
+    setRunning(false);
+    setStopping(false);
+    setApprovals([]);
+    setRespondingApprovalIds(new Set());
+    if (activeSessionId) {
+      void settingsApi
+        .closeCodexAssistantSession(activeSessionId)
+        .catch(() => undefined);
     }
   };
 
@@ -584,7 +629,6 @@ export function CodexAssistantDock({
     moveFloatingButton(nextPosition);
     setFloatingPosition(nextPosition);
     persistFloatingPosition(nextPosition);
-    // Browsers fire a click after pointerup. A drag must not open the panel.
     suppressOpenRef.current = true;
   };
 
@@ -599,11 +643,10 @@ export function CodexAssistantDock({
 
   const closeAssistant = () => {
     setOpen(false);
+    closeSession();
     onDismiss?.();
   };
 
-  // The assistant intentionally has no click-blocking page overlay, so Escape
-  // is the reliable second exit when it is opened above another dialog.
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -652,7 +695,7 @@ export function CodexAssistantDock({
           onPointerMove={handlePointerMove}
           onPointerUp={finishDrag}
           onPointerCancel={finishDrag}
-          className="flex h-[34px] w-[34px] touch-none select-none items-center justify-center rounded-full border border-violet-500/35 bg-background text-violet-600 shadow-[0_10px_22px_-10px_rgba(109,40,217,0.7)] backdrop-blur transition-[background-color,box-shadow] hover:bg-violet-500/10 active:cursor-grabbing dark:text-violet-300 cursor-grab"
+          className="flex h-[34px] w-[34px] cursor-grab touch-none select-none items-center justify-center rounded-full border border-violet-500/35 bg-background text-violet-600 shadow-[0_10px_22px_-10px_rgba(109,40,217,0.7)] backdrop-blur transition-[background-color,box-shadow] hover:bg-violet-500/10 active:cursor-grabbing dark:text-violet-300"
           aria-label={t("codexAssistant.open")}
           title={t("codexAssistant.open")}
         >
@@ -685,12 +728,7 @@ export function CodexAssistantDock({
             variant="ghost"
             size="icon"
             className="h-8 w-8"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              closeAssistant();
-            }}
+            onClick={closeAssistant}
             aria-label={t("common.close")}
           >
             <X className="h-4 w-4" />
@@ -791,254 +829,56 @@ export function CodexAssistantDock({
             </button>
           </section>
 
-          <section className="space-y-2">
+          <section className="space-y-3">
             <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-              {t("codexAssistant.mode")}
-            </p>
-            <div className="grid grid-cols-2 gap-1 rounded-xl border border-border bg-card p-1">
-              {(["chat", "plan"] as const).map((option) => (
-                <Button
-                  key={option}
-                  type="button"
-                  size="sm"
-                  variant={mode === option ? "default" : "ghost"}
-                  disabled={planning || executing}
-                  onClick={() => {
-                    setMode(option);
-                    setRunError(null);
-                  }}
-                >
-                  {option === "chat"
-                    ? t("codexAssistant.modeChat")
-                    : t("codexAssistant.modePlan")}
-                </Button>
-              ))}
-            </div>
-          </section>
-
-          {mode === "plan" &&
-            (installIntent ? (
-              <>
-                <section className="space-y-2">
-                  <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-                    {t("codexAssistant.installVersion")}
-                  </p>
-                  <div className="rounded-xl border border-border bg-card p-2">
-                    <div className="grid grid-cols-3 gap-1">
-                      {(
-                        [
-                          "stable",
-                          "latest",
-                          ...(supportsVersionPin ? ["specific" as const] : []),
-                        ] as const
-                      ).map((mode) => (
-                        <Button
-                          key={mode}
-                          type="button"
-                          size="sm"
-                          variant={
-                            installVersionMode === mode ? "default" : "ghost"
-                          }
-                          disabled={planning || executing}
-                          onClick={() => setInstallVersionMode(mode)}
-                        >
-                          {t(
-                            `codexAssistant.version${mode[0].toUpperCase()}${mode.slice(1)}`,
-                          )}
-                        </Button>
-                      ))}
-                    </div>
-                    {installVersionMode === "specific" && (
-                      <Input
-                        value={specificVersion}
-                        onChange={(event) =>
-                          setSpecificVersion(event.target.value)
-                        }
-                        disabled={planning || executing}
-                        placeholder={t(
-                          "codexAssistant.specificVersionPlaceholder",
-                        )}
-                        className="mt-2 h-8 text-xs"
-                      />
-                    )}
-                  </div>
-                </section>
-
-                <section className="space-y-2">
-                  <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-                    {t("codexAssistant.installLocation")}
-                  </p>
-                  <div className="rounded-xl border border-border bg-card p-2">
-                    {supportsCustomInstallLocation ? (
-                      <div className="grid grid-cols-2 gap-1">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant={
-                            installLocationMode === "default"
-                              ? "default"
-                              : "ghost"
-                          }
-                          disabled={planning || executing}
-                          onClick={() => setInstallLocationMode("default")}
-                        >
-                          {t("codexAssistant.defaultLocation")}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant={
-                            installLocationMode === "custom"
-                              ? "default"
-                              : "ghost"
-                          }
-                          disabled={planning || executing}
-                          onClick={() => setInstallLocationMode("custom")}
-                        >
-                          {t("codexAssistant.customLocation")}
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="rounded-lg bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-                        桌面应用由系统安装器管理，将安装到系统默认位置。
-                      </div>
-                    )}
-                    <div className="mt-2 flex items-center gap-3 px-1 py-1">
-                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
-                        <FolderOpen className="h-4 w-4" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium">
-                          {installLocationMode === "default"
-                            ? t("codexAssistant.defaultLocationDescription")
-                            : targetDirectory ||
-                              t("codexAssistant.locationNotSelected")}
-                        </span>
-                        <span className="block text-xs text-muted-foreground">
-                          {installLocationMode === "default"
-                            ? t("codexAssistant.defaultLocationHint")
-                            : t("codexAssistant.locationHint")}
-                        </span>
-                      </span>
-                      {supportsCustomInstallLocation &&
-                        installLocationMode === "custom" && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="shrink-0"
-                            disabled={planning || executing}
-                            onClick={() => void chooseInstallDirectory()}
-                          >
-                            {t("codexAssistant.chooseLocation")}
-                          </Button>
-                        )}
-                    </div>
-                    {webBridgeActive &&
-                      supportsCustomInstallLocation &&
-                      installLocationMode === "custom" &&
-                      webDirectoryEditorOpen && (
-                        <div className="mt-2 rounded-lg border border-sky-500/20 bg-sky-500/[0.035] p-2">
-                          <p className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">
-                            {t("codexAssistant.webDirectoryHint")}
-                          </p>
-                          <Input
-                            value={webDirectoryDraft}
-                            onChange={(event) =>
-                              setWebDirectoryDraft(event.target.value)
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") saveWebDirectory();
-                            }}
-                            placeholder="D:\\AI Tools\\node-global"
-                            className="h-8 text-xs"
-                          />
-                          <div className="mt-2 flex justify-end gap-2">
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              onClick={() => setWebDirectoryEditorOpen(false)}
-                            >
-                              {t("common.cancel")}
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              className="h-7 text-xs"
-                              onClick={saveWebDirectory}
-                            >
-                              {t("codexAssistant.saveLocation")}
-                            </Button>
-                          </div>
-                        </div>
-                      )}
-                  </div>
-                </section>
-              </>
-            ) : (
-              <section className="space-y-2">
-                <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-                  {t("codexAssistant.installLocation")}
-                </p>
-                <div className="flex items-center gap-3 rounded-xl border border-border bg-card p-3">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
-                    <FolderOpen className="h-4 w-4" />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium">
-                      {targetDirectory ||
-                        t("codexAssistant.locationNotSelected")}
-                    </span>
-                    <span className="block text-xs text-muted-foreground">
-                      {t("codexAssistant.locationHint")}
-                    </span>
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="shrink-0"
-                    disabled={planning || executing}
-                    onClick={() => void chooseInstallDirectory()}
-                  >
-                    {t("codexAssistant.chooseLocation")}
-                  </Button>
-                </div>
-              </section>
-            ))}
-
-          <section className="space-y-2">
-            <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
-              {mode === "chat"
-                ? t("codexAssistant.chatLabel")
-                : t("codexAssistant.installPlan")}
+              {t("codexAssistant.chatLabel")}
             </p>
             {webBridgeActive && (
               <p className="rounded-lg border border-sky-500/20 bg-sky-500/[0.045] px-3 py-2 text-xs leading-relaxed text-sky-800 dark:text-sky-200">
                 {t("codexAssistant.webBridgeNotice")}
               </p>
             )}
-            {mode === "chat" && (
-              <div className="space-y-2" aria-live="polite">
-                {chatMessages.length === 0 ? (
-                  <p className="rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-                    {t("codexAssistant.chatEmpty")}
-                  </p>
-                ) : (
-                  chatMessages.map((message, index) => (
-                    <div
-                      key={`${message.role}-${index}`}
-                      className={cn(
-                        "max-w-[92%] whitespace-pre-wrap break-words rounded-xl px-3 py-2 text-sm leading-relaxed",
-                        message.role === "user"
-                          ? "ml-auto bg-violet-500/15 text-foreground"
-                          : "mr-auto border border-border bg-card",
-                      )}
-                    >
-                      {message.content}
-                    </div>
-                  ))
-                )}
+
+            <div className="space-y-2" aria-live="polite">
+              {chatMessages.length === 0 ? (
+                <p className="rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                  {t("codexAssistant.chatEmpty")}
+                </p>
+              ) : (
+                chatMessages.map((message, index) => (
+                  <div
+                    key={`${message.role}-${index}`}
+                    className={cn(
+                      "max-w-[92%] whitespace-pre-wrap break-words rounded-xl px-3 py-2 text-sm leading-relaxed",
+                      message.role === "user"
+                        ? "ml-auto bg-violet-500/15 text-foreground"
+                        : "mr-auto border border-border bg-card",
+                    )}
+                  >
+                    {message.content}
+                  </div>
+                ))
+              )}
+            </div>
+
+            {approvals.length > 0 && (
+              <div className="space-y-2" aria-live="assertive">
+                <p className="flex items-center gap-1.5 px-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  {t("codexAssistant.approvalRequired", {
+                    defaultValue: "Your approval is required",
+                  })}
+                </p>
+                {approvals.map((approval) => (
+                  <ApprovalCard
+                    key={approval.id}
+                    approval={approval}
+                    responding={respondingApprovalIds.has(approval.id)}
+                    onRespond={(decision) =>
+                      void respondToApproval(approval.id, decision)
+                    }
+                  />
+                ))}
               </div>
             )}
 
@@ -1047,38 +887,30 @@ export function CodexAssistantDock({
                 value={request}
                 onChange={(event) => setRequest(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") submitRequest();
+                  if (event.key === "Enter") void sendMessage();
                 }}
-                disabled={!ready || planning || executing}
+                disabled={!ready || running || startingSession}
                 placeholder={
                   ready
-                    ? mode === "chat"
-                      ? t("codexAssistant.chatPlaceholder")
-                      : t("codexAssistant.requestPlaceholder")
+                    ? t("codexAssistant.chatPlaceholder")
                     : (blockedReason ?? undefined)
                 }
                 className="border-0 bg-transparent px-0 shadow-none focus:ring-0"
               />
               <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-2">
                 <span className="text-[11px] text-muted-foreground">
-                  {ready
-                    ? mode === "chat"
-                      ? t("codexAssistant.chatHint")
-                      : t("codexAssistant.planFirst")
-                    : blockedReason}
+                  {ready ? t("codexAssistant.chatHint") : blockedReason}
                 </span>
                 <Button
                   size="icon"
                   className="h-8 w-8 rounded-lg"
-                  disabled={!ready || !request.trim() || planning || executing}
-                  onClick={submitRequest}
-                  aria-label={
-                    mode === "chat"
-                      ? t("codexAssistant.sendChat")
-                      : t("codexAssistant.createPlan")
+                  disabled={
+                    !ready || !request.trim() || running || startingSession
                   }
+                  onClick={() => void sendMessage()}
+                  aria-label={t("codexAssistant.sendChat")}
                 >
-                  {planning ? (
+                  {running || startingSession ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : (
                     <Send className="h-3.5 w-3.5" />
@@ -1087,7 +919,7 @@ export function CodexAssistantDock({
               </div>
             </div>
 
-            {(planning || executing) && activeRunId && (
+            {running && sessionId && (
               <Button
                 variant="outline"
                 size="sm"
@@ -1110,109 +942,6 @@ export function CodexAssistantDock({
               <p className="rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-destructive">
                 {runError}
               </p>
-            )}
-
-            {plan && planId && (
-              <div className="space-y-3 rounded-xl border border-violet-500/20 bg-violet-500/[0.035] p-3">
-                <div>
-                  <p className="text-sm font-semibold">{plan.title}</p>
-                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                    {plan.summary}
-                  </p>
-                </div>
-                {plan.sources.length > 0 && (
-                  <div>
-                    <p className="text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
-                      {t("codexAssistant.sources")}
-                    </p>
-                    <ul className="mt-1.5 space-y-1 text-xs text-muted-foreground">
-                      {plan.sources.map((source) => (
-                        <li key={source} className="break-all">
-                          • {source}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {plan.install && (
-                  <div className="rounded-lg border border-violet-500/15 bg-background/55 px-2.5 py-2 text-xs leading-relaxed">
-                    <p className="font-medium text-foreground">
-                      {plan.install.displayName} · {plan.install.version}
-                    </p>
-                    <p className="mt-0.5 break-all text-muted-foreground">
-                      {t("codexAssistant.installingTo", {
-                        location: plan.install.usesDefaultLocation
-                          ? t("codexAssistant.defaultLocationDescription")
-                          : plan.install.installLocation,
-                      })}
-                    </p>
-                    <p className="mt-0.5 break-all text-muted-foreground">
-                      {t("codexAssistant.registeredSource", {
-                        source: plan.install.officialSource,
-                      })}
-                    </p>
-                  </div>
-                )}
-                {plan.steps.length > 0 && (
-                  <ol className="space-y-2">
-                    {plan.steps.map((step, index) => (
-                      <li
-                        key={`${step.label}-${index}`}
-                        className="flex gap-2 text-xs"
-                      >
-                        <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-violet-500/10 text-[10px] font-medium text-violet-700 dark:text-violet-200">
-                          {index + 1}
-                        </span>
-                        <span>
-                          <span className="font-medium text-foreground">
-                            {step.label}
-                          </span>
-                          {step.requiresNetwork && (
-                            <span className="ml-1 text-muted-foreground">
-                              · {t("codexAssistant.networkRequired")}
-                            </span>
-                          )}
-                          <span className="block leading-relaxed text-muted-foreground">
-                            {step.description}
-                          </span>
-                        </span>
-                      </li>
-                    ))}
-                  </ol>
-                )}
-                {plan.limitations.length > 0 && (
-                  <div className="rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-200">
-                    <p className="font-medium">
-                      {t("codexAssistant.limitations")}
-                    </p>
-                    <ul className="mt-1 space-y-1">
-                      {plan.limitations.map((limitation) => (
-                        <li key={limitation}>• {limitation}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {plan.executable ? (
-                  <Button
-                    className="w-full"
-                    disabled={planning || executing}
-                    onClick={() => void executePlan()}
-                  >
-                    {executing ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Check className="h-4 w-4" />
-                    )}
-                    {executing
-                      ? t("codexAssistant.installingPlan")
-                      : t("codexAssistant.confirmInstall")}
-                  </Button>
-                ) : (
-                  <p className="rounded-lg bg-muted/60 px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
-                    {t("codexAssistant.manualOnly")}
-                  </p>
-                )}
-              </div>
             )}
 
             {logs.length > 0 && (

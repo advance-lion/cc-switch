@@ -1,20 +1,38 @@
 import {
   act,
   fireEvent,
-  render,
+  render as testingRender,
   screen,
   waitFor,
 } from "@testing-library/react";
-import { useEffect } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect, type ReactElement, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
+import { providerCenterApi } from "@/lib/api/providerCenter";
 import type { ProviderFormValues } from "@/components/providers/forms/ProviderForm";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 
+vi.mock("@/lib/api/providerCenter", () => ({
+  providerCenterApi: {
+    get: vi.fn().mockResolvedValue({
+      definitions: [],
+      bindings: [],
+      transactions: [],
+    }),
+    save: vi.fn(),
+    previewApply: vi.fn(),
+    applyTransaction: vi.fn(),
+    startImportSession: vi.fn(),
+    commitImportCandidate: vi.fn(),
+    previewManagedDraft: vi.fn(),
+    confirmManagedDraft: vi.fn(),
+  },
+}));
+
 vi.mock("@/components/ui/dialog", () => ({
-  Dialog: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
+  Dialog: ({ children, open }: { children: React.ReactNode; open?: boolean }) =>
+    open ? <div>{children}</div> : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => (
     <div>{children}</div>
   ),
@@ -35,6 +53,19 @@ vi.mock("@/components/ui/dialog", () => ({
 let mockFormValues: ProviderFormValues;
 let mockFormReady = true;
 let submitReadyCallbacks: Array<(isReady: boolean) => void> = [];
+
+const render = (ui: ReactElement) => {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  const Wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return testingRender(ui, { wrapper: Wrapper });
+};
 
 vi.mock("@/components/providers/forms/ProviderForm", () => ({
   ProviderForm: ({
@@ -76,8 +107,32 @@ vi.mock("@/components/providers/AuthSettingsPanel", () => ({
     target ? <div data-testid="auth-settings-panel">{target}</div> : null,
 }));
 
+vi.mock("@/components/ConfirmDialog", () => ({
+  ConfirmDialog: ({ isOpen, onConfirm, confirmText }: any) =>
+    isOpen ? (
+      <div>
+        <button onClick={() => onConfirm(false)}>{confirmText}</button>
+      </div>
+    ) : null,
+}));
+
 describe("AddProviderDialog", () => {
+  const selectAgentOnly = () => {
+    const btn = screen.queryByRole("button", { name: "仅当前 Agent" });
+    if (btn) fireEvent.click(btn);
+  };
+
   beforeEach(() => {
+    vi.mocked(providerCenterApi.get).mockResolvedValue({
+      definitions: [],
+      bindings: [],
+      transactions: [],
+    });
+    vi.mocked(providerCenterApi.save).mockReset();
+    vi.mocked(providerCenterApi.previewApply).mockReset();
+    vi.mocked(providerCenterApi.applyTransaction).mockReset();
+    vi.mocked(providerCenterApi.previewManagedDraft).mockReset();
+    vi.mocked(providerCenterApi.confirmManagedDraft).mockReset();
     mockFormReady = true;
     submitReadyCallbacks = [];
     mockFormValues = {
@@ -95,6 +150,77 @@ describe("AddProviderDialog", () => {
     };
   });
 
+  it("defaults to agent-only save scope", async () => {
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={vi.fn()}
+        appId="codex"
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    // Save-scope toggle is visible
+    expect(
+      screen.getByRole("button", { name: "仅当前 Agent" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "通用 Provider" }),
+    ).toBeInTheDocument();
+    // Submit button uses common.add label (agent-only default, not universal)
+    expect(
+      screen.getByRole("button", { name: "common.add" }),
+    ).toBeInTheDocument();
+  });
+
+  it("calls previewManagedDraft (no writes) when switching to universal scope and submitting", async () => {
+    const onOpenChange = vi.fn();
+    vi.mocked(providerCenterApi.previewManagedDraft).mockResolvedValue({
+      token: "preview-token",
+      providerId: "shared-provider",
+      providerRevision: 1,
+      createdAt: 1,
+      targets: [
+        {
+          appType: "codex",
+          operation: "create",
+          compatible: true,
+          connectionMode: "direct",
+          requiresTakeover: false,
+          drifted: false,
+        },
+      ],
+    });
+
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={onOpenChange}
+        appId="codex"
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    // Switch to universal scope
+    fireEvent.click(
+      screen.getByRole("button", { name: "通用 Provider" }),
+    );
+
+    // Submit the form (ProviderForm is mocked, triggers onSubmit handler)
+    fireEvent.click(
+      screen.getByRole("button", { name: /universalProvider\.add/ }),
+    );
+
+    // Preview is generated, no confirm yet
+    await waitFor(() =>
+      expect(providerCenterApi.previewManagedDraft).toHaveBeenCalledWith(
+        expect.objectContaining({ appType: "codex" }),
+      ),
+    );
+    // confirmManagedDraft must NOT be called before user confirms
+    expect(providerCenterApi.confirmManagedDraft).not.toHaveBeenCalled();
+  });
+
   it("使用 ProviderForm 返回的自定义端点", async () => {
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
     const handleOpenChange = vi.fn();
@@ -108,6 +234,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    selectAgentOnly();
     fireEvent.click(
       screen.getByRole("button", {
         name: "common.add",
@@ -144,6 +271,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    selectAgentOnly();
     fireEvent.click(
       screen.getByRole("button", {
         name: "common.add",
@@ -195,6 +323,7 @@ describe("AddProviderDialog", () => {
       />,
     );
 
+    selectAgentOnly();
     fireEvent.click(screen.getByRole("button", { name: "common.add" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
@@ -223,6 +352,7 @@ describe("AddProviderDialog", () => {
     };
     const { rerender } = render(<AddProviderDialog open {...props} />);
 
+    selectAgentOnly();
     fireEvent.click(screen.getByRole("button", { name: "manage-auth" }));
     expect(screen.getByTestId("auth-settings-panel")).toHaveTextContent(
       "codex_oauth",
@@ -270,6 +400,7 @@ context_window = 500000
       />,
     );
 
+    selectAgentOnly();
     fireEvent.click(screen.getByRole("button", { name: "common.add" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
@@ -313,6 +444,7 @@ context_window = 500000
       />,
     );
 
+    selectAgentOnly();
     fireEvent.click(screen.getByRole("button", { name: "common.add" }));
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
     expect(handleSubmit.mock.calls[0][0]).toMatchObject({
@@ -332,6 +464,7 @@ context_window = 500000
     };
     const { rerender } = render(<AddProviderDialog open {...props} />);
 
+    selectAgentOnly();
     const addButton = await screen.findByRole("button", { name: "common.add" });
     await waitFor(() => expect(addButton).toBeEnabled());
     const staleCallback = submitReadyCallbacks.at(-1);
@@ -340,6 +473,7 @@ context_window = 500000
     rerender(<AddProviderDialog open={false} {...props} />);
     mockFormReady = false;
     rerender(<AddProviderDialog open {...props} />);
+    selectAgentOnly();
     const reopenedButton = await screen.findByRole("button", {
       name: "common.add",
     });

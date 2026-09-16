@@ -23,6 +23,33 @@ pub(super) fn list(state: &AppState) -> Result<IndexMap<String, Provider>, AppEr
     state.db.get_all_providers(PI_APP)
 }
 
+/// Read Pi's native provider nodes for inspection without synchronizing them
+/// into the saved catalog. Provider Center imports use this path so scanning
+/// cannot turn a native-only Pi model into a CC Switch-managed DB row.
+pub(super) fn list_read_only(state: &AppState) -> Result<IndexMap<String, Provider>, AppError> {
+    let _guard = futures::executor::block_on(state.proxy_service.lock_switch_for_app(PI_APP));
+    let mut providers = state.db.get_all_providers(PI_APP)?;
+    match crate::pi_config::read_pi_native_providers() {
+        Ok(native) => {
+            for (id, config) in native {
+                let mut provider = providers.shift_remove(&id).unwrap_or_else(|| {
+                    let name = native_provider_name(&config).unwrap_or(&id).to_string();
+                    let mut native = Provider::with_id(id.clone(), name, config.clone(), None);
+                    native.category = Some("custom".to_string());
+                    native.icon = Some("pi".to_string());
+                    native
+                });
+                merge_native_config(&mut provider, config);
+                providers.insert(id, provider);
+            }
+        }
+        Err(error) => {
+            log::warn!("Failed to read Pi providers; showing saved catalog: {error}");
+        }
+    }
+    Ok(providers)
+}
+
 pub(super) fn import_from_live(state: &AppState) -> Result<usize, AppError> {
     let _guard = futures::executor::block_on(state.proxy_service.lock_switch_for_app(PI_APP));
     let native = crate::pi_config::read_pi_native_providers()?;
@@ -351,6 +378,46 @@ mod tests {
             team_organization_id: None,
             team_project_id: None,
         }
+    }
+
+    #[test]
+    #[serial]
+    fn provider_center_read_only_list_does_not_sync_native_nodes_to_database() {
+        let _agent = TestAgentDir::new();
+        let state = state();
+        let path = crate::pi_config::get_pi_models_path().expect("models path");
+        fs::create_dir_all(path.parent().expect("models directory"))
+            .expect("create models directory");
+        fs::write(
+            &path,
+            r#"{
+                "providers": {
+                    "native-only": {
+                        "name": "Native only",
+                        "baseUrl": "https://api.example.com/v1",
+                        "apiKey": "secret",
+                        "api": "openai-completions",
+                        "models": [{ "id": "model-a" }]
+                    }
+                }
+            }"#,
+        )
+        .expect("write native provider");
+
+        let providers = list_read_only(&state).expect("read native catalog");
+        assert_eq!(providers["native-only"].name, "Native only");
+        assert!(state
+            .db
+            .get_provider_by_id("native-only", PI_APP)
+            .expect("query saved provider")
+            .is_none());
+
+        ProviderService::list(&state, AppType::Pi).expect("normal list still syncs");
+        assert!(state
+            .db
+            .get_provider_by_id("native-only", PI_APP)
+            .expect("query synced provider")
+            .is_some());
     }
 
     #[test]

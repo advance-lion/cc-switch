@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
@@ -390,6 +390,8 @@ pub struct ProxyService {
     db: Arc<Database>,
     codex_oauth_manager: Arc<CodexOAuthManager>,
     server: Arc<RwLock<Option<ProxyServer>>>,
+    /// 串行化 listener 的启动、停止与重启，避免并发生命周期操作竞态。
+    lifecycle_lock: Arc<Mutex<()>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
@@ -416,6 +418,7 @@ impl ProxyService {
             db,
             codex_oauth_manager,
             server: Arc::new(RwLock::new(None)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
         }
@@ -935,6 +938,12 @@ impl ProxyService {
 
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.start_locked().await
+    }
+
+    /// 在持有 `lifecycle_lock` 时启动 listener。
+    async fn start_locked(&self) -> Result<ProxyServerInfo, String> {
         // 1. 启动时自动设置 proxy_enabled = true
         let mut global_config = self
             .db
@@ -1717,7 +1726,14 @@ impl ProxyService {
 
     /// 停止代理服务器
     pub async fn stop(&self) -> Result<(), String> {
-        if let Some(server) = self.server.write().await.take() {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.stop_locked().await
+    }
+
+    /// 在持有 `lifecycle_lock` 时停止 listener。
+    async fn stop_locked(&self) -> Result<(), String> {
+        let server = self.server.write().await.take();
+        if let Some(server) = server {
             server
                 .stop()
                 .await
@@ -3950,6 +3966,36 @@ impl ProxyService {
 
     /// 更新代理配置
     pub async fn update_config(&self, config: &ProxyConfig) -> Result<(), String> {
+        let restarted = {
+            let _lifecycle_guard = self.lifecycle_lock.lock().await;
+            self.update_config_locked(config).await?
+        };
+
+        // Live 重投影使用每应用 switch lock。这里必须先释放全局 lifecycle lock，
+        // 因为接管切换路径会按 switch lock -> lifecycle lock 的顺序启动 listener。
+        if restarted {
+            let mut updated_any = false;
+            for app_type in [
+                AppType::Claude,
+                AppType::Codex,
+                AppType::Gemini,
+                AppType::GrokBuild,
+            ] {
+                updated_any |= self
+                    .reproject_takeover_live_config_if_enabled(&app_type)
+                    .await?;
+            }
+
+            if updated_any {
+                log::info!("已同步更新 Live 配置中的代理地址");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 在持有 `lifecycle_lock` 时更新配置并按需重启 listener。
+    async fn update_config_locked(&self, config: &ProxyConfig) -> Result<bool, String> {
         // 记录旧配置用于判定是否需要重启
         let previous = self
             .db
@@ -3969,7 +4015,7 @@ impl ProxyService {
         // 检查服务器当前状态
         let mut server_guard = self.server.write().await;
         if server_guard.is_none() {
-            return Ok(());
+            return Ok(false);
         }
 
         // 判断是否需要重启（地址或端口变更）
@@ -4000,34 +4046,13 @@ impl ProxyService {
 
             *server_guard = Some(new_server);
             log::info!("代理配置已更新，服务器已自动重启应用最新配置");
-
-            // 如果当前存在任意 app 的 Live 接管，需要同步更新 Live 中的代理地址（否则客户端仍指向旧端口）。
-            // 必须先释放 server 写锁，再逐 app 获取 switch lock：set_takeover_for_app
-            // 按 switch lock -> server lock 的顺序执行，反向持锁会造成死锁。
-            drop(server_guard);
-            let mut updated_any = false;
-            for app_type in [
-                AppType::Claude,
-                AppType::Codex,
-                AppType::Gemini,
-                AppType::GrokBuild,
-            ] {
-                updated_any |= self
-                    .reproject_takeover_live_config_if_enabled(&app_type)
-                    .await?;
-            }
-
-            if updated_any {
-                log::info!("已同步更新 Live 配置中的代理地址");
-            }
-
-            return Ok(());
+            return Ok(true);
         } else if let Some(server) = server_guard.as_ref() {
             server.apply_runtime_config(&new_config).await;
             log::info!("代理配置已实时应用，无需重启代理服务器");
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// 检查服务器是否正在运行
@@ -4151,6 +4176,38 @@ mod tests {
         db.update_proxy_config(proxy_config)
             .await
             .expect("set test proxy config to an ephemeral port");
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_uses_one_listener_and_persists_ephemeral_port() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+
+        let first_service = service.clone();
+        let second_service = service.clone();
+        let (first, second) =
+            tokio::join!(async move { first_service.start().await }, async move {
+                second_service.start().await
+            });
+        let first = first.expect("first concurrent start");
+        let second = second.expect("second concurrent start");
+
+        assert_ne!(first.port, 0);
+        assert_eq!(
+            first.port, second.port,
+            "both callers must observe one listener"
+        );
+        assert_eq!(
+            db.get_proxy_config()
+                .await
+                .expect("read persisted proxy config")
+                .listen_port,
+            first.port,
+            "the single resolved ephemeral port must be persisted"
+        );
+
+        service.stop().await.expect("stop proxy server");
     }
 
     #[tokio::test]

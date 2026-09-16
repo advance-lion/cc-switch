@@ -680,60 +680,6 @@ pub(super) enum ToolLifecycleAction {
     Update,
 }
 
-/// 由 Codex 助手调用的、已经过登记校验的安装动作。
-///
-/// 这不是前端或 AI 传入的 shell 命令：`tool` 必须来自 `VALID_TOOLS`，包名由
-/// `npm_package_for` 固定映射，版本和安装目录也会在构造时校验。这样 AI 只能解释和
-/// 选择方案，不能扩大 CC Switch 原有的执行范围。
-#[derive(Debug, Clone)]
-pub(super) struct RegisteredAssistantInstall {
-    pub tool: String,
-    pub display_name: String,
-    pub version: String,
-    pub install_dir: Option<PathBuf>,
-    pub official_source: String,
-    installer: RegisteredAssistantInstaller,
-}
-
-/// An installer is selected exclusively from CC Switch's own registry. The
-/// npm branch is invoked with argument vectors (never through a shell), which
-/// keeps a user-selected directory from becoming shell syntax.
-#[derive(Debug, Clone)]
-enum RegisteredAssistantInstaller {
-    Npm { package: String },
-    Standard { command_line: String },
-}
-
-/// 带有临时批处理文件清理信息的受控安装进程。
-pub(super) struct RegisteredAssistantInstallChild {
-    pub child: std::process::Child,
-    cleanup_file: Option<PathBuf>,
-}
-
-impl RegisteredAssistantInstallChild {
-    pub fn into_parts(self) -> (std::process::Child, Option<PathBuf>) {
-        (self.child, self.cleanup_file)
-    }
-}
-
-fn normalize_assistant_install_version(raw: &str) -> Result<String, String> {
-    let value = raw.trim();
-    if value.is_empty() || value == "stable" || value == "latest" {
-        return Ok("latest".to_string());
-    }
-    // npm version / dist-tag is deliberately limited to a small literal set.
-    // It is later embedded in a registered package argument, never interpreted
-    // as a command fragment.
-    if value.len() > 80
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
-    {
-        return Err("指定版本只能包含字母、数字、点、连字符或下划线".to_string());
-    }
-    Ok(value.to_string())
-}
-
 fn managed_assistant_install_registry_path() -> PathBuf {
     crate::config::get_app_config_dir()
         .join("codex-assistant")
@@ -829,17 +775,7 @@ fn update_managed_assistant_install(tool: &str, install_dir: &Path) -> Result<()
         .output()
         .map_err(|error| format!("无法启动自定义目录更新进程: {error}"))?;
     finish_lifecycle_output(&output)?;
-    let install = RegisteredAssistantInstall {
-        tool: tool.to_string(),
-        display_name: tool_display_name(tool).to_string(),
-        version: "latest".to_string(),
-        install_dir: Some(install_dir.to_path_buf()),
-        official_source: format!("https://www.npmjs.com/package/{package}"),
-        installer: RegisteredAssistantInstaller::Npm {
-            package: package.to_string(),
-        },
-    };
-    verify_registered_assistant_install(&install).map(|_| ())
+    verify_managed_assistant_install(tool, install_dir).map(|_| ())
 }
 
 /// Uninstall a CLI from the exact npm prefix previously chosen in the AI flow.
@@ -871,233 +807,49 @@ fn uninstall_managed_assistant_install(tool: &str, install_dir: &Path) -> Result
     remove_managed_assistant_install_dir(tool)
 }
 
-/// Builds a fixed install command from the existing CC Switch registry. A
-/// custom directory uses npm's documented `--prefix` mode and is therefore
-/// available only to tools with an explicit npm package mapping.
-pub(super) fn plan_registered_assistant_install(
-    tool: &str,
-    install_dir: Option<&Path>,
-    requested_version: &str,
-) -> Result<RegisteredAssistantInstall, String> {
-    if !VALID_TOOLS.contains(&tool) {
-        return Err("当前应用不支持 AI 辅助安装".to_string());
-    }
-    let version = normalize_assistant_install_version(requested_version)?;
-    let display_name = tool_display_name(tool).to_string();
-
-    let (installer, official_source) = if install_dir.is_some() {
-        let package = npm_package_for(tool)
-            .ok_or_else(|| format!("{} 暂不支持自定义安装位置，请使用标准安装", display_name))?;
-        (
-            RegisteredAssistantInstaller::Npm {
-                package: package.to_string(),
-            },
-            format!("https://www.npmjs.com/package/{package}"),
-        )
-    } else {
-        if version != "latest" {
-            return Err(format!(
-                "{} 的标准安装不支持指定版本；请选择稳定版或最新版，或改用自定义位置",
-                display_name
-            ));
-        }
-        (
-            RegisteredAssistantInstaller::Standard {
-                command_line: build_tool_lifecycle_command(
-                    &[tool],
-                    ToolLifecycleAction::Install,
-                    None,
-                )?,
-            },
-            npm_package_for(tool)
-                .map(|package| format!("https://www.npmjs.com/package/{package}"))
-                .unwrap_or_else(|| "CC Switch 已登记的官方安装器".to_string()),
-        )
-    };
-
-    Ok(RegisteredAssistantInstall {
-        tool: tool.to_string(),
-        display_name,
-        version,
-        install_dir: install_dir.map(Path::to_path_buf),
-        official_source,
-        installer,
-    })
-}
-
-/// Spawn only a command line manufactured by `plan_registered_assistant_install`.
-/// Its stdout/stderr are piped so the assistant can show observable progress.
-#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
-pub(super) fn spawn_registered_assistant_install(
-    install: &RegisteredAssistantInstall,
-) -> Result<RegisteredAssistantInstallChild, String> {
-    if crate::config::is_test_sandbox() {
-        let expected = sandbox_managed_install_dir(&install.tool)?;
-        if install.install_dir.as_deref() != Some(expected.as_path()) {
-            return Err("开发沙箱只允许安装到其受控测试目录。".to_string());
-        }
-    }
-    use std::process::{Command, Stdio};
-
-    if let RegisteredAssistantInstaller::Npm { package } = &install.installer {
-        let mut command = npm_command();
-        command.arg("install").arg("--global");
-        if let Some(dir) = &install.install_dir {
-            command.arg("--prefix").arg(dir);
-            command.current_dir(dir);
-        }
-        command
-            .arg(format!("{package}@{}", install.version))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+fn verify_managed_assistant_install(tool: &str, dir: &Path) -> Result<String, String> {
+    let bin_dir = assistant_install_bin_dir(dir);
+    let current_path = {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let child = command
-            .spawn()
-            .map_err(|error| format!("无法启动受控安装进程: {error}"))?;
-        return Ok(RegisteredAssistantInstallChild {
-            child,
-            cleanup_file: None,
-        });
-    }
-
-    let RegisteredAssistantInstaller::Standard { command_line } = &install.installer else {
-        unreachable!("all registered installers are handled above")
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut command = Command::new("bash");
-        command
-            .args(["-c", command_line])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(login_path) = login_shell_path() {
-            let inherited = std::env::var("PATH").unwrap_or_default();
-            command.env("PATH", merge_path_segments(&login_path, &inherited));
-        }
-        if let Some(dir) = &install.install_dir {
-            command.current_dir(dir);
-        }
-        let child = command
-            .spawn()
-            .map_err(|error| format!("无法启动受控安装进程: {error}"))?;
-        return Ok(RegisteredAssistantInstallChild {
-            child,
-            cleanup_file: None,
-        });
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-
-        let file = std::env::temp_dir().join(format!(
-            "cc_switch_ai_install_{}_{}.bat",
-            install.tool,
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&file, command_line)
-            .map_err(|error| format!("无法写入受控安装脚本: {error}"))?;
-        let mut command = Command::new("cmd");
-        command
-            .args(["/D", "/S", "/C"])
-            .arg(&file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
-        if let Some(dir) = &install.install_dir {
-            command.current_dir(dir);
-        }
-        let child = command.spawn().map_err(|error| {
-            let _ = std::fs::remove_file(&file);
-            format!("无法启动受控安装进程: {error}")
-        })?;
-        return Ok(RegisteredAssistantInstallChild {
-            child,
-            cleanup_file: Some(file),
-        });
-    }
-}
-
-/// Re-detects the actual executable after an AI installation. For managed npm
-/// prefix installs, the selected directory becomes a documented search path so
-/// later CC Switch status probes and launches discover the same installation.
-pub(super) fn verify_registered_assistant_install(
-    install: &RegisteredAssistantInstall,
-) -> Result<String, String> {
-    if let Some(dir) = &install.install_dir {
-        let bin_dir = assistant_install_bin_dir(dir);
-        let current_path = {
-            #[cfg(target_os = "windows")]
-            {
-                format!("{};{}", bin_dir.display(), effective_path_string())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current = effective_path_os().unwrap_or_default();
-                prepend_search_dir_to_path(&bin_dir, &current)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        for candidate in tool_executable_candidates(&install.tool, &bin_dir) {
-            if !candidate.is_file() {
-                continue;
-            }
-            #[cfg(target_os = "windows")]
-            let output = run_windows_tool_version_command(&candidate, &current_path);
-            #[cfg(not(target_os = "windows"))]
-            let output = std::process::Command::new(&candidate)
-                .arg("--version")
-                .env("PATH", &current_path)
-                .output();
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = decode_command_output(&output.stdout);
-                    let stderr = decode_command_output(&output.stderr);
-                    let version = extract_version(if stdout.trim().is_empty() {
-                        stderr.trim()
-                    } else {
-                        stdout.trim()
-                    });
-                    if !version.is_empty() {
-                        save_managed_assistant_install_dir(&install.tool, dir)?;
-                        return Ok(version);
-                    }
-                }
-            }
-        }
-        return Err("安装命令已结束，但在所选位置未检测到可运行的命令行".to_string());
-    }
-
-    let probe = {
-        #[cfg(target_os = "windows")]
-        {
-            match probe_path_default_version(&install.tool) {
-                ShellProbe::NotFound(_) => scan_cli_version(&install.tool),
-                probe => probe,
-            }
+            format!("{};{}", bin_dir.display(), effective_path_string())
         }
         #[cfg(not(target_os = "windows"))]
         {
-            match try_get_version(&install.tool) {
-                ShellProbe::NotFound(_) => scan_cli_version(&install.tool),
-                probe => probe,
-            }
+            let current = effective_path_os().unwrap_or_default();
+            prepend_search_dir_to_path(&bin_dir, &current)
+                .to_string_lossy()
+                .into_owned()
         }
     };
-    match probe {
-        ShellProbe::Found(version) => Ok(version),
-        ShellProbe::FoundButFailed(detail) => Err(format!("安装后命令无法运行: {detail}")),
-        ShellProbe::NotFound(_) => Err("安装命令已结束，但未检测到可运行的命令行".to_string()),
+    for candidate in tool_executable_candidates(tool, &bin_dir) {
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(target_os = "windows")]
+        let output = run_windows_tool_version_command(&candidate, &current_path);
+        #[cfg(not(target_os = "windows"))]
+        let output = std::process::Command::new(&candidate)
+            .arg("--version")
+            .env("PATH", &current_path)
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = decode_command_output(&output.stdout);
+                let stderr = decode_command_output(&output.stderr);
+                let version = extract_version(if stdout.trim().is_empty() {
+                    stderr.trim()
+                } else {
+                    stdout.trim()
+                });
+                if !version.is_empty() {
+                    save_managed_assistant_install_dir(tool, dir)?;
+                    return Ok(version);
+                }
+            }
+        }
     }
+    Err("安装命令已结束，但在所选位置未检测到可运行的命令行".to_string())
 }
 
 #[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform

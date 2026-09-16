@@ -1,5 +1,7 @@
 # CC Switch 增强补丁需求（草案）
 
+> **通用 Provider 设计更新：** 本文记录早期补丁需求。涉及通用 Provider 的最终产品行为，以 [`UNIVERSAL_PROVIDER_PRODUCT_DESIGN_ZH.md`](./UNIVERSAL_PROVIDER_PRODUCT_DESIGN_ZH.md) 为准；应用安装、启动、更新与卸载部分仍按本文执行。
+
 ## 目标
 
 在不重做 CC Switch 现有 Provider 与安装体系的前提下，补齐两个独立能力：

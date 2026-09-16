@@ -19,6 +19,10 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
+import {
+  providerCenterApi,
+  type AgentProviderCatalogItem,
+} from "@/lib/api/providerCenter";
 import { providersApi } from "@/lib/api/providers";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { useDragSort } from "@/hooks/useDragSort";
@@ -49,6 +53,11 @@ import { Button } from "@/components/ui/button";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { usePiCurrentState } from "@/lib/query/pi";
 import { isProxyAppId } from "@/config/appConfig";
+import {
+  classifyProviderForList,
+  type ProviderListCategory,
+} from "@/components/providers/providerListSections";
+import { LayoutGrid, List } from "lucide-react";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -70,6 +79,8 @@ interface ProviderListProps {
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管）
   activeProviderId?: string; // 代理当前实际使用的供应商 ID（用于故障转移模式下标注绿色边框）
   onSetAsDefault?: (provider: Provider, modelId?: string) => void; // OpenClaw: set as default model
+  onManageScope?: (definitionId: string, definitionName: string) => void;
+  onManagedDelete?: (provider: Provider, definitionId: string) => void;
 }
 
 export function ProviderList({
@@ -92,12 +103,25 @@ export function ProviderList({
   isProxyTakeover = false,
   activeProviderId,
   onSetAsDefault,
+  onManageScope,
+  onManagedDelete,
 }: ProviderListProps) {
   const { t } = useTranslation();
   const { checkProvider, isChecking } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
     appId,
+  );
+  const { data: providerCatalog } = useQuery({
+    queryKey: ["provider-center", "agent-catalog", appId],
+    queryFn: () => providerCenterApi.getAgentProviderCatalog(appId),
+  });
+  const catalogByProviderId = useMemo(
+    () =>
+      new Map<string, AgentProviderCatalogItem>(
+        (providerCatalog?.items ?? []).map((item) => [item.providerId, item]),
+      ),
+    [providerCatalog?.items],
   );
 
   const { data: opencodeLiveIds } = useQuery({
@@ -201,6 +225,22 @@ export function ProviderList({
   const [searchTerm, setSearchTerm] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const [viewMode, setViewMode] = useState<"flat" | "grouped">(() => {
+    try {
+      const stored = localStorage.getItem("provider-view-mode");
+      return stored === "grouped" ? "grouped" : "flat";
+    } catch {
+      return "flat";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("provider-view-mode", viewMode);
+    } catch {
+      // ignore
+    }
+  }, [viewMode]);
   const { data: claudeDesktopStatus } = useQuery({
     queryKey: ["claudeDesktopStatus"],
     queryFn: () => providersApi.getClaudeDesktopStatus(),
@@ -317,6 +357,20 @@ export function ProviderList({
     });
   }, [searchTerm, sortedProviders]);
 
+  const groupedProviders = useMemo(() => {
+    const groups: { category: ProviderListCategory; items: Provider[] }[] = [
+      { category: "native-account", items: [] },
+      { category: "universal", items: [] },
+      { category: "agent-only", items: [] },
+    ];
+    for (const provider of filteredProviders) {
+      const cat = classifyProviderForList(provider, appId);
+      const group = groups.find((g) => g.category === cat);
+      if (group) group.items.push(provider);
+    }
+    return groups.filter((g) => g.items.length > 0);
+  }, [filteredProviders, appId]);
+
   const claudeDesktopStatusMessages = useMemo(() => {
     if (appId !== "claude-desktop" || !claudeDesktopStatus) return [];
 
@@ -424,100 +478,152 @@ export function ProviderList({
     );
   }
 
+  const renderProviderCard = (provider: Provider) => {
+    const catalogItem = catalogByProviderId.get(provider.id);
+    const isOmo = provider.category === "omo";
+    const isOmoSlim = provider.category === "omo-slim";
+    const isOmoCurrent = isOmo && provider.id === (currentOmoId || "");
+    const isOmoSlimCurrent =
+      isOmoSlim && provider.id === (currentOmoSlimId || "");
+    const isHermesCurrent =
+      appId === "hermes" && hermesCurrentProviderId === provider.id;
+    const isCurrent =
+      appId === "pi"
+        ? false
+        : isOmo
+          ? isOmoCurrent
+          : isOmoSlim
+            ? isOmoSlimCurrent
+            : appId === "hermes"
+              ? isHermesCurrent
+              : provider.id === currentProviderId;
+    return (
+      <SortableProviderCard
+        key={provider.id}
+        provider={provider}
+        isCurrent={isCurrent}
+        appId={appId}
+        isInConfig={
+          appId === "pi"
+            ? isPiProviderInConfig(provider)
+            : isProviderInConfig(provider.id)
+        }
+        isOmo={isOmo}
+        isOmoSlim={isOmoSlim}
+        onSwitch={onSwitch}
+        onEdit={onEdit}
+        onDelete={onDelete}
+        onRemoveFromConfig={onRemoveFromConfig}
+        onDisableOmo={onDisableOmo}
+        onDisableOmoSlim={onDisableOmoSlim}
+        onDuplicate={onDuplicate}
+        onConfigureUsage={onConfigureUsage}
+        onOpenWebsite={onOpenWebsite}
+        onOpenTerminal={onOpenTerminal}
+        onTest={handleTest}
+        isTesting={isChecking(provider.id)}
+        isProxyRunning={supportsFailover && isProxyRunning}
+        isProxyTakeover={supportsFailover && isProxyTakeover}
+        isAutoFailoverEnabled={isFailoverModeActive}
+        failoverPriority={getFailoverPriority(provider.id)}
+        isInFailoverQueue={isInFailoverQueue(provider.id)}
+        onToggleFailover={
+          supportsFailover
+            ? (enabled) => handleToggleFailover(provider.id, enabled)
+            : undefined
+        }
+        activeProviderId={
+          supportsFailover ? activeProviderId : undefined
+        }
+        isDefaultModel={
+          appId === "hermes"
+            ? isHermesCurrent
+            : isProviderDefaultModel(provider.id)
+        }
+        isRemovalProtected={
+          appId === "pi"
+            ? false
+            : appId === "hermes"
+              ? isHermesCurrent
+              : appId === "openclaw"
+                ? isProviderDefaultModel(provider.id)
+                : false
+        }
+        isStateChangeProtected={
+          appId === "pi" && !isPiAuthoritativeStateReady
+        }
+        managedByProviderCenter={
+          catalogItem?.ownership === "providerCenterProjection"
+        }
+        onManageScope={
+          onManageScope && catalogItem?.definitionId
+            ? () =>
+                onManageScope(
+                  catalogItem.definitionId!,
+                  provider.name,
+                )
+            : undefined
+        }
+        onManagedDelete={
+          onManagedDelete && catalogItem?.definitionId
+            ? () => onManagedDelete(provider, catalogItem.definitionId!)
+            : undefined
+        }
+        onSetAsDefault={
+          onSetAsDefault
+            ? (modelId) => onSetAsDefault(provider, modelId)
+            : undefined
+        }
+      />
+    );
+  };
+
+  const categoryLabels: Record<ProviderListCategory, string> = {
+    "native-account": t("provider.category.nativeAccount", {
+      defaultValue: "官方账号与 Coding Plan",
+    }),
+    universal: t("provider.category.universal", {
+      defaultValue: "通用 Provider",
+    }),
+    "agent-only": t("provider.category.agentOnly", {
+      defaultValue: "仅当前 Agent",
+    }),
+  };
+
   const renderProviderList = () => (
     <DndContext
       sensors={sensors}
       collisionDetection={closestCenter}
       onDragEnd={handleDragEnd}
     >
-      <SortableContext
-        items={filteredProviders.map((provider) => provider.id)}
-        strategy={verticalListSortingStrategy}
-      >
-        <div className="space-y-3">
-          {filteredProviders.map((provider) => {
-            const isOmo = provider.category === "omo";
-            const isOmoSlim = provider.category === "omo-slim";
-            const isOmoCurrent = isOmo && provider.id === (currentOmoId || "");
-            const isOmoSlimCurrent =
-              isOmoSlim && provider.id === (currentOmoSlimId || "");
-            const isHermesCurrent =
-              appId === "hermes" && hermesCurrentProviderId === provider.id;
-            const isCurrent =
-              appId === "pi"
-                ? false
-                : isOmo
-                  ? isOmoCurrent
-                  : isOmoSlim
-                    ? isOmoSlimCurrent
-                    : appId === "hermes"
-                      ? isHermesCurrent
-                      : provider.id === currentProviderId;
-            return (
-              <SortableProviderCard
-                key={provider.id}
-                provider={provider}
-                isCurrent={isCurrent}
-                appId={appId}
-                isInConfig={
-                  appId === "pi"
-                    ? isPiProviderInConfig(provider)
-                    : isProviderInConfig(provider.id)
-                }
-                isOmo={isOmo}
-                isOmoSlim={isOmoSlim}
-                onSwitch={onSwitch}
-                onEdit={onEdit}
-                onDelete={onDelete}
-                onRemoveFromConfig={onRemoveFromConfig}
-                onDisableOmo={onDisableOmo}
-                onDisableOmoSlim={onDisableOmoSlim}
-                onDuplicate={onDuplicate}
-                onConfigureUsage={onConfigureUsage}
-                onOpenWebsite={onOpenWebsite}
-                onOpenTerminal={onOpenTerminal}
-                onTest={handleTest}
-                isTesting={isChecking(provider.id)}
-                isProxyRunning={supportsFailover && isProxyRunning}
-                isProxyTakeover={supportsFailover && isProxyTakeover}
-                isAutoFailoverEnabled={isFailoverModeActive}
-                failoverPriority={getFailoverPriority(provider.id)}
-                isInFailoverQueue={isInFailoverQueue(provider.id)}
-                onToggleFailover={
-                  supportsFailover
-                    ? (enabled) => handleToggleFailover(provider.id, enabled)
-                    : undefined
-                }
-                activeProviderId={
-                  supportsFailover ? activeProviderId : undefined
-                }
-                isDefaultModel={
-                  appId === "hermes"
-                    ? isHermesCurrent
-                    : isProviderDefaultModel(provider.id)
-                }
-                isRemovalProtected={
-                  appId === "pi"
-                    ? false
-                    : appId === "hermes"
-                      ? isHermesCurrent
-                      : appId === "openclaw"
-                        ? isProviderDefaultModel(provider.id)
-                        : false
-                }
-                isStateChangeProtected={
-                  appId === "pi" && !isPiAuthoritativeStateReady
-                }
-                onSetAsDefault={
-                  onSetAsDefault
-                    ? (modelId) => onSetAsDefault(provider, modelId)
-                    : undefined
-                }
-              />
-            );
-          })}
+      {viewMode === "flat" ? (
+        <SortableContext
+          items={filteredProviders.map((provider) => provider.id)}
+          strategy={verticalListSortingStrategy}
+        >
+          <div className="space-y-3">
+            {filteredProviders.map(renderProviderCard)}
+          </div>
+        </SortableContext>
+      ) : (
+        <div className="space-y-6">
+          {groupedProviders.map((group) => (
+            <div key={group.category}>
+              <h3 className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                {categoryLabels[group.category]}
+              </h3>
+              <SortableContext
+                items={group.items.map((provider) => provider.id)}
+                strategy={verticalListSortingStrategy}
+              >
+                <div className="space-y-3">
+                  {group.items.map(renderProviderCard)}
+                </div>
+              </SortableContext>
+            </div>
+          ))}
         </div>
-      </SortableContext>
+      )}
     </DndContext>
   );
 
@@ -603,6 +709,33 @@ export function ProviderList({
         )}
       </AnimatePresence>
 
+      {filteredProviders.length > 0 && (
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            variant={viewMode === "flat" ? "default" : "ghost"}
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => setViewMode("flat")}
+            title={t("provider.viewMode.flat", {
+              defaultValue: "普通列表",
+            })}
+          >
+            <List className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant={viewMode === "grouped" ? "default" : "ghost"}
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => setViewMode("grouped")}
+            title={t("provider.viewMode.grouped", {
+              defaultValue: "分类视图",
+            })}
+          >
+            <LayoutGrid className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      )}
+
       {filteredProviders.length === 0 ? (
         <div className="px-6 py-8 text-sm text-center border border-dashed rounded-lg border-border text-muted-foreground">
           {t("provider.noSearchResults", {
@@ -646,6 +779,9 @@ interface SortableProviderCardProps {
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
   isStateChangeProtected?: boolean;
+  managedByProviderCenter?: boolean;
+  onManageScope?: () => void;
+  onManagedDelete?: () => void;
   onSetAsDefault?: (modelId?: string) => void;
 }
 
@@ -678,6 +814,9 @@ function SortableProviderCard({
   isDefaultModel,
   isRemovalProtected,
   isStateChangeProtected,
+  managedByProviderCenter,
+  onManageScope,
+  onManagedDelete,
   onSetAsDefault,
 }: SortableProviderCardProps) {
   const {
@@ -733,6 +872,9 @@ function SortableProviderCard({
         isDefaultModel={isDefaultModel}
         isRemovalProtected={isRemovalProtected}
         isStateChangeProtected={isStateChangeProtected}
+        managedByProviderCenter={managedByProviderCenter}
+        onManageScope={onManageScope}
+        onManagedDelete={onManagedDelete}
         onSetAsDefault={onSetAsDefault}
       />
     </div>

@@ -1,6 +1,6 @@
 export type { AppId } from "./types";
 export { piApi } from "./pi";
-export { providersApi, universalProvidersApi } from "./providers";
+export { providersApi } from "./providers";
 export { providerCenterApi } from "./providerCenter";
 export type {
   ImportCandidate,
@@ -12,10 +12,10 @@ export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
 export { isCodexAssistantWebBridgeActive } from "./settings";
 export type {
+  CodexAssistantApproval,
+  CodexAssistantApprovalDecision,
   CodexAssistantChatTurn,
   CodexAssistantEvent,
-  CodexAssistantPlan,
-  CodexAssistantPlanStep,
   CodexDesktopStatus,
   DesktopAppId,
   DesktopAppStatus,

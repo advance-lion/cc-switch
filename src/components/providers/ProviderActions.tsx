@@ -51,8 +51,12 @@ interface ProviderActionsProps {
   isInFailoverQueue?: boolean;
   onToggleFailover?: (enabled: boolean) => void;
   isOfficialBlockedByProxy?: boolean;
-  // Hermes v12+ providers: dict overlay — edit/delete must go through Web UI
+  // Hermes and other external catalogs may be fully read-only.
   isReadOnly?: boolean;
+  isEditDisabled?: boolean;
+  isDeleteDisabled?: boolean;
+  readOnlyHint?: string;
+  isManagedDelete?: boolean;
   // OpenClaw: default model
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
@@ -94,6 +98,10 @@ export function ProviderActions({
   onToggleFailover,
   isOfficialBlockedByProxy = false,
   isReadOnly = false,
+  isEditDisabled = isReadOnly,
+  isDeleteDisabled = isReadOnly,
+  readOnlyHint: readOnlyHintOverride,
+  isManagedDelete = false,
   // OpenClaw: default model
   isDefaultModel = false,
   isRemovalProtected = false,
@@ -260,19 +268,22 @@ export function ProviderActions({
 
   const buttonState = getMainButtonState();
   const canDelete =
-    !isReadOnly &&
-    (appId === "pi"
-      ? !isStateChangeProtected
-      : isOmo || isAdditiveMode
-        ? true
-        : !isCurrent);
-  const readOnlyHint = t("provider.managedByHermesHint", {
-    defaultValue: "由 Hermes 管理，请在 Hermes Web UI 中编辑",
-  });
+    !isDeleteDisabled &&
+    (isManagedDelete ||
+      (appId === "pi"
+        ? !isStateChangeProtected
+        : isOmo || isAdditiveMode
+          ? true
+          : !isCurrent));
+  const readOnlyHint =
+    readOnlyHintOverride ??
+    t("provider.managedByHermesHint", {
+      defaultValue: "由外部来源管理，请在对应管理页面中编辑",
+    });
   const deleteHint =
     appId === "pi" && isStateChangeProtected
       ? piStateChangeHint
-      : isReadOnly
+      : isDeleteDisabled
         ? readOnlyHint
         : t("common.delete");
 
@@ -388,13 +399,14 @@ export function ProviderActions({
         <Button
           size="icon"
           variant="ghost"
-          onClick={isReadOnly ? undefined : onEdit}
-          disabled={isReadOnly}
+          onClick={isEditDisabled ? undefined : onEdit}
+          disabled={isEditDisabled}
           aria-label={t("common.edit")}
-          title={isReadOnly ? readOnlyHint : t("common.edit")}
+          title={isEditDisabled ? readOnlyHint : t("common.edit")}
           className={cn(
             iconButtonClass,
-            isReadOnly && "opacity-40 cursor-not-allowed text-muted-foreground",
+            isEditDisabled &&
+              "opacity-40 cursor-not-allowed text-muted-foreground",
           )}
         >
           <Edit className="h-4 w-4" />
@@ -459,21 +471,21 @@ export function ProviderActions({
           </Button>
         )}
 
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={canDelete ? onDelete : undefined}
-          disabled={!canDelete}
-          aria-label={t("common.delete")}
-          title={deleteHint}
-          className={cn(
-            iconButtonClass,
-            canDelete && "hover:text-red-500 dark:hover:text-red-400",
-            !canDelete && "opacity-40 cursor-not-allowed text-muted-foreground",
-          )}
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={canDelete ? onDelete : undefined}
+        disabled={!canDelete}
+        aria-label={t("common.delete")}
+        title={deleteHint}
+        className={cn(
+          iconButtonClass,
+          canDelete && "hover:text-red-500 dark:hover:text-red-400",
+          !canDelete && "opacity-40 cursor-not-allowed text-muted-foreground",
+        )}
+      >
+        <Trash2 className="h-4 w-4" />
+      </Button>
       </div>
     </div>
   );

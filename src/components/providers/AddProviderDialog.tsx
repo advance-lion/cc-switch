@@ -2,28 +2,38 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
+import { info as tauriLogInfo } from "@tauri-apps/plugin-log";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
-import type { Provider, CustomEndpoint, UniversalProvider } from "@/types";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import type { Provider, CustomEndpoint } from "@/types";
 import type { AppId } from "@/lib/api";
-import { universalProvidersApi } from "@/lib/api";
+import { providerCenterApi } from "@/lib/api";
+import type {
+  ManagedProviderDraftInput,
+  ProviderApplyPreview,
+  ProviderCenterApp,
+} from "@/lib/api/providerCenter";
+import { UniversalProviderTargetDialog } from "@/components/providers/UniversalProviderTargetDialog";
+import {
+  PROVIDER_CENTER_APPS,
+  providerCenterAppLabel,
+} from "@/components/providers/providerCenterApps";
 import {
   ProviderForm,
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
 import { AuthSettingsPanel } from "@/components/providers/AuthSettingsPanel";
-import { UniversalProviderFormModal } from "@/components/universal/UniversalProviderFormModal";
-import { UniversalProviderPanel } from "@/components/universal";
 import { providerPresets } from "@/config/claudeProviderPresets";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { geminiProviderPresets } from "@/config/geminiProviderPresets";
 import { claudeDesktopProviderPresets } from "@/config/claudeDesktopProviderPresets";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import { extractGrokBuildBaseUrl } from "@/utils/grokBuildConfig";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
-import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 import type { ManagedAuthProvider } from "@/lib/api";
 
 interface AddProviderDialogProps {
@@ -40,6 +50,12 @@ interface AddProviderDialogProps {
   ) => Promise<void> | void;
 }
 
+const dbg = (msg: string, data?: unknown) => {
+  const text = data ? `${msg} ${JSON.stringify(data)}` : msg;
+  console.log(text);
+  void tauriLogInfo(text, { file: "AddProviderDialog" }).catch(() => undefined);
+};
+
 export function AddProviderDialog({
   open,
   onOpenChange,
@@ -47,30 +63,43 @@ export function AddProviderDialog({
   onSubmit,
 }: AddProviderDialogProps) {
   const { t } = useTranslation();
-  // OpenCode and OpenClaw don't support universal providers
-  const showUniversalTab =
-    appId !== "opencode" &&
-    appId !== "openclaw" &&
-    appId !== "hermes" &&
-    appId !== "pi" &&
-    appId !== "grokbuild" &&
-    appId !== "claude-desktop";
-  const [activeTab, setActiveTab] = useState<"app-specific" | "universal">(
-    "app-specific",
+  // All agents can potentially save as universal; only Official/OAuth
+  // presets are excluded at submit time based on the form values.
+  const canSaveAsUniversal = true;
+  const [saveScope, setSaveScope] = useState<"universal" | "agentOnly">(
+    "agentOnly",
   );
-  const [universalFormOpen, setUniversalFormOpen] = useState(false);
-  const [selectedUniversalPreset, setSelectedUniversalPreset] =
-    useState<UniversalProviderPreset | null>(null);
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
   const [authSettingsTarget, setAuthSettingsTarget] =
     useState<ManagedAuthProvider | null>(null);
+  const [managedDraftDiscovery, setManagedDraftDiscovery] = useState<{
+    preview: ProviderApplyPreview;
+    input: ManagedProviderDraftInput;
+  } | null>(null);
+  const [selectedTargetApps, setSelectedTargetApps] = useState<
+    ProviderCenterApp[]
+  >([]);
+  const [managedDraftPreview, setManagedDraftPreview] = useState<{
+    preview: ProviderApplyPreview;
+    input: ManagedProviderDraftInput;
+  } | null>(null);
+  const [managedDraftPreviewing, setManagedDraftPreviewing] = useState(false);
+  const [managedDraftApplying, setManagedDraftApplying] = useState(false);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     setAuthSettingsTarget(null);
-  }, [appId, open]);
+    setSaveScope("agentOnly");
+    setManagedDraftDiscovery(null);
+    setManagedDraftPreview(null);
+    setSelectedTargetApps([]);
+  }, [appId, open, canSaveAsUniversal]);
 
   const closeDialog = useCallback(() => {
     setAuthSettingsTarget(null);
+    setManagedDraftDiscovery(null);
+    setManagedDraftPreview(null);
+    setSelectedTargetApps([]);
     onOpenChange(false);
   }, [onOpenChange]);
 
@@ -104,60 +133,14 @@ export function AddProviderDialog({
     [formReadyToken],
   );
 
-  const handleUniversalProviderSave = useCallback(
-    async (provider: UniversalProvider) => {
-      try {
-        await universalProvidersApi.upsert(provider);
-      } catch (error) {
-        console.error(
-          "[AddProviderDialog] Failed to save universal provider",
-          error,
-        );
-        toast.error(
-          t("universalProvider.addFailed", {
-            defaultValue: "统一供应商添加失败",
-          }),
-        );
-        return;
-      }
-
-      try {
-        await universalProvidersApi.sync(provider.id);
-        toast.success(
-          t("universalProvider.addedAndSynced", {
-            defaultValue: "统一供应商已添加并同步",
-          }),
-        );
-      } catch (error) {
-        console.error(
-          "[AddProviderDialog] Provider saved but sync failed",
-          error,
-        );
-        toast.warning(
-          t("universalProvider.addedButSyncFailed", {
-            defaultValue: "统一供应商已添加，但同步失败",
-          }),
-        );
-      }
-
-      setUniversalFormOpen(false);
-      setSelectedUniversalPreset(null);
-      onOpenChange(false);
-    },
-    [t, onOpenChange],
-  );
-
-  const handleUniversalFormClose = useCallback(() => {
-    setUniversalFormOpen(false);
-    setSelectedUniversalPreset(null);
-  }, []);
-
   const handleSubmit = useCallback(
     async (values: ProviderFormValues) => {
+      dbg("[AddProviderDialog] handleSubmit entered", { saveScope, appId });
       const parsedConfig = JSON.parse(values.settingsConfig) as Record<
         string,
         unknown
       >;
+      dbg("[AddProviderDialog] parsedConfig ok");
 
       // 构造基础提交数据
       const providerData: Omit<Provider, "id"> & {
@@ -349,57 +332,153 @@ export function AddProviderDialog({
         providerData.suggestedDefaults = values.suggestedDefaults;
       }
 
+      if (saveScope === "universal") {
+        dbg("[AddProviderDialog] universal scope, building input");
+        const definitionId = crypto.randomUUID();
+        const provider: Provider = {
+          ...providerData,
+          id: crypto.randomUUID(),
+        };
+        try {
+          const input: ManagedProviderDraftInput = {
+            appType: appId,
+            provider,
+            definitionId,
+            targetAppTypes: PROVIDER_CENTER_APPS,
+          };
+          dbg("[AddProviderDialog] calling previewManagedDraft", {
+            appType: appId,
+            definitionId,
+            targetCount: PROVIDER_CENTER_APPS.length,
+          });
+          setManagedDraftPreviewing(true);
+          const preview = await providerCenterApi.previewManagedDraft(input);
+          dbg("[AddProviderDialog] previewManagedDraft returned", {
+            token: preview.token,
+            targetCount: preview.targets.length,
+            targets: preview.targets.map((t) => ({
+              appType: t.appType,
+              compatible: t.compatible,
+              connectionMode: t.connectionMode,
+            })),
+          });
+          setManagedDraftDiscovery({ preview, input });
+          setSelectedTargetApps(
+            PROVIDER_CENTER_APPS.filter((candidate) =>
+              preview.targets.some(
+                (target) =>
+                  target.appType === candidate && target.compatible,
+              ),
+            ),
+          );
+          return;
+        } catch (error) {
+          console.error("[AddProviderDialog] previewManagedDraft error", error);
+          dbg("[AddProviderDialog] previewManagedDraft error: " + String(error));
+          toast.error(extractErrorMessage(error));
+          return;
+        } finally {
+          dbg("[AddProviderDialog] finally, setting previewing=false");
+          setManagedDraftPreviewing(false);
+        }
+      }
+
+      dbg("[AddProviderDialog] non-universal path, calling onSubmit");
       await onSubmit(providerData);
       closeDialog();
     },
-    [appId, onSubmit, closeDialog],
+    [appId, onSubmit, closeDialog, saveScope],
   );
 
-  const footer =
-    !showUniversalTab || activeTab === "app-specific" ? (
-      <>
-        <span className="mr-auto min-w-0 text-xs text-muted-foreground truncate">
-          {t("provider.addFooterHint")}
-        </span>
-        <Button
-          variant="outline"
-          onClick={closeDialog}
-          className="border-border/20 hover:bg-accent hover:text-accent-foreground"
-        >
-          {t("common.cancel")}
-        </Button>
-        <Button
-          type="submit"
-          form="provider-form"
-          disabled={isFormSubmitting || !isFormReady}
-          className="bg-primary text-primary-foreground hover:bg-primary/90"
-        >
-          {isFormSubmitting ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <Plus className="mr-2 h-4 w-4" />
-          )}
-          {t("common.add")}
-        </Button>
-      </>
-    ) : (
-      <>
-        <Button
-          variant="outline"
-          onClick={closeDialog}
-          className="border-border/20 hover:bg-accent hover:text-accent-foreground"
-        >
-          {t("common.cancel")}
-        </Button>
-        <Button
-          onClick={() => setUniversalFormOpen(true)}
-          className="bg-primary text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4 mr-2" />
-          {t("universalProvider.add")}
-        </Button>
-      </>
-    );
+  const handlePreviewSelectedTargets = useCallback(async () => {
+    if (!managedDraftDiscovery || selectedTargetApps.length === 0) return;
+    setManagedDraftPreviewing(true);
+    try {
+      const input: ManagedProviderDraftInput = {
+        ...managedDraftDiscovery.input,
+        targetAppTypes: selectedTargetApps,
+      };
+      const preview = await providerCenterApi.previewManagedDraft(input);
+      const incompatible = preview.targets.find((target) => !target.compatible);
+      if (incompatible) {
+        toast.error(
+          `${providerCenterAppLabel(incompatible.appType)} 不兼容${incompatible.message ? `：${incompatible.message}` : ""}`,
+        );
+        return;
+      }
+      setManagedDraftDiscovery(null);
+      setManagedDraftPreview({ preview, input });
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setManagedDraftPreviewing(false);
+    }
+  }, [managedDraftDiscovery, selectedTargetApps]);
+
+  const handleCancelTargetSelection = useCallback(() => {
+    setManagedDraftDiscovery(null);
+    setSelectedTargetApps([]);
+  }, []);
+
+  const handleConfirmManagedDraft = useCallback(async () => {
+    if (!managedDraftPreview) return;
+    const { preview, input } = managedDraftPreview;
+    setManagedDraftApplying(true);
+    try {
+      await providerCenterApi.confirmManagedDraft(input, preview.token);
+      await queryClient.invalidateQueries({
+        queryKey: ["providers", appId],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["provider-center"],
+      });
+      toast.success("通用 Provider 已添加");
+      setManagedDraftPreview(null);
+      closeDialog();
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setManagedDraftApplying(false);
+    }
+  }, [managedDraftPreview, queryClient, appId, closeDialog]);
+
+  const handleCancelManagedDraft = useCallback(() => {
+    setManagedDraftPreview(null);
+  }, []);
+
+  const footer = (
+    <>
+      <span className="mr-auto min-w-0 text-xs text-muted-foreground truncate">
+        {t("provider.addFooterHint")}
+      </span>
+      <Button
+        variant="outline"
+        onClick={closeDialog}
+        className="border-border/20 hover:bg-accent hover:text-accent-foreground"
+      >
+        {t("common.cancel")}
+      </Button>
+      <Button
+        type="submit"
+        form="provider-form"
+        disabled={
+          isFormSubmitting ||
+          managedDraftPreviewing ||
+          !isFormReady
+        }
+        className="bg-primary text-primary-foreground hover:bg-primary/90"
+      >
+        {isFormSubmitting || managedDraftPreviewing ? (
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        ) : (
+          <Plus className="mr-2 h-4 w-4" />
+        )}
+        {saveScope === "universal"
+          ? t("universalProvider.add")
+          : t("common.add")}
+      </Button>
+    </>
+  );
 
   return (
     <FullScreenPanel
@@ -409,63 +488,76 @@ export function AddProviderDialog({
       footer={footer}
       contentClassName={appId === "pi" ? "pt-3 pb-0" : "pt-3"}
     >
-      {showUniversalTab ? (
-        <Tabs
-          value={activeTab}
-          onValueChange={(v) => setActiveTab(v as "app-specific" | "universal")}
-        >
-          <TabsList className="grid w-full grid-cols-2 mb-6">
-            <TabsTrigger value="app-specific">
-              {t(`apps.${appId}`)} {t("provider.tabProvider")}
-            </TabsTrigger>
-            <TabsTrigger value="universal">
-              {t("provider.tabUniversal")}
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="app-specific" className="mt-0">
-            <ProviderForm
-              appId={appId}
-              submitLabel={t("common.add")}
-              onSubmit={handleSubmit}
-              onCancel={closeDialog}
-              onManageAuthAccounts={setAuthSettingsTarget}
-              onSubmittingChange={setIsFormSubmitting}
-              onSubmitReadyChange={handleSubmitReadyChange}
-              showButtons={false}
-            />
-          </TabsContent>
-
-          <TabsContent value="universal" className="mt-0">
-            <UniversalProviderPanel />
-          </TabsContent>
-        </Tabs>
-      ) : (
-        // OpenCode/OpenClaw: directly show form without tabs
-        <ProviderForm
-          appId={appId}
-          submitLabel={t("common.add")}
-          onSubmit={handleSubmit}
-          onCancel={closeDialog}
-          onManageAuthAccounts={setAuthSettingsTarget}
-          onSubmittingChange={setIsFormSubmitting}
-          onSubmitReadyChange={handleSubmitReadyChange}
-          showButtons={false}
-        />
+      {canSaveAsUniversal && (
+        <div className="flex items-center gap-2 mb-4 px-1">
+          <span className="text-xs text-muted-foreground shrink-0">
+            保存范围
+          </span>
+          <Button
+            variant={saveScope === "universal" ? "default" : "outline"}
+            size="sm"
+            onClick={() => { dbg("[AddProviderDialog] toggle to universal"); setSaveScope("universal"); }}
+            className="h-7 text-xs"
+          >
+            通用 Provider
+          </Button>
+          <Button
+            variant={saveScope === "agentOnly" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setSaveScope("agentOnly")}
+            className="h-7 text-xs"
+          >
+            仅当前 Agent
+          </Button>
+        </div>
       )}
 
-      {showUniversalTab && (
-        <UniversalProviderFormModal
-          isOpen={universalFormOpen}
-          onClose={handleUniversalFormClose}
-          onSave={handleUniversalProviderSave}
-          initialPreset={selectedUniversalPreset}
-        />
-      )}
+      <ProviderForm
+        appId={appId}
+        submitLabel={t("common.add")}
+        onSubmit={handleSubmit}
+        onCancel={closeDialog}
+        onManageAuthAccounts={setAuthSettingsTarget}
+        onSubmittingChange={setIsFormSubmitting}
+        onSubmitReadyChange={handleSubmitReadyChange}
+        showButtons={false}
+      />
 
       <AuthSettingsPanel
         target={authSettingsTarget}
         onClose={() => setAuthSettingsTarget(null)}
+      />
+
+      <UniversalProviderTargetDialog
+        open={Boolean(managedDraftDiscovery)}
+        targets={managedDraftDiscovery?.preview.targets ?? []}
+        selectedAppTypes={selectedTargetApps}
+        pending={managedDraftPreviewing}
+        onSelectedAppTypesChange={setSelectedTargetApps}
+        onConfirm={() => void handlePreviewSelectedTargets()}
+        onCancel={handleCancelTargetSelection}
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(managedDraftPreview)}
+        title="添加通用 Provider"
+        message={
+          managedDraftPreview
+            ? managedDraftPreview.preview.targets
+                .map(
+                  (target) =>
+                    `${providerCenterAppLabel(target.appType)}：${target.operation === "create" ? "创建" : "更新"} · ${target.connectionMode === "proxy" ? "需要路由" : "直接兼容"}${target.drifted ? "（检测到漂移）" : ""}${target.message ? ` — ${target.message}` : ""}`,
+                )
+                .join("\n")
+            : ""
+        }
+        confirmText="确认添加"
+        cancelText={t("common.cancel")}
+        variant="info"
+        zIndex="top"
+        pending={managedDraftApplying}
+        onConfirm={() => void handleConfirmManagedDraft()}
+        onCancel={handleCancelManagedDraft}
       />
     </FullScreenPanel>
   );

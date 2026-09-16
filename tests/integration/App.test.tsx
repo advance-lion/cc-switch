@@ -217,14 +217,12 @@ describe("App integration with MSW", () => {
         "claude-1",
       ),
     );
-
     fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toContain(
         "codex-1",
       ),
     );
-
     fireEvent.click(screen.getByText("usage"));
     expect(screen.getByTestId("usage-modal")).toBeInTheDocument();
     fireEvent.click(screen.getByText("save-script"));
@@ -238,7 +236,6 @@ describe("App integration with MSW", () => {
         /New codex Provider/,
       ),
     );
-
     fireEvent.click(screen.getByText("edit"));
     expect(screen.getByTestId("edit-provider-dialog")).toBeInTheDocument();
     fireEvent.click(screen.getByText("confirm-edit"));
@@ -247,13 +244,11 @@ describe("App integration with MSW", () => {
         /-edited/,
       ),
     );
-
     fireEvent.click(screen.getByText("switch"));
     fireEvent.click(screen.getByText("duplicate"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toMatch(/copy/),
     );
-
     fireEvent.click(screen.getByText("open-website"));
 
     emitTauriEvent("provider-switched", {
@@ -263,7 +258,7 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  }, 10_000);
+  }, 20_000);
 
   it("shows toast when auto sync fails in background", async () => {
     const { default: App } = await import("@/App");

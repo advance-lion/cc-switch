@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
-import readline from "node:readline";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
@@ -12,47 +11,19 @@ import { codeInspectorPlugin } from "code-inspector-plugin";
 const WEB_ASSISTANT_BASE = "/__cc-switch-dev/codex-assistant";
 const MAX_REQUEST_LENGTH = 6_000;
 
-type AssistantPlan = {
-  title: string;
-  summary: string;
-  sources: string[];
-  steps: Array<{
-    label: string;
-    description: string;
-    requiresNetwork: boolean;
-  }>;
-  limitations: string[];
-  executable?: boolean;
-  install?: {
-    tool: string;
-    displayName: string;
-    version: string;
-    installLocation: string;
-    usesDefaultLocation: boolean;
-    officialSource: string;
-  };
+type PreviewAssistantSession = {
+  id: string;
+  history: ChatTurn[];
+  pendingApprovalId?: string;
 };
 
-type RegisteredInstall = {
-  kind: "npm" | "desktop";
-  tool: string;
-  packageName?: string;
-  displayName: string;
-  version: string;
-  targetDir: string;
-  usesDefaultLocation: boolean;
-  officialSource: string;
-};
-
-type StoredPlan = {
-  request: string;
-  targetDir: string;
-  plan: AssistantPlan;
-  install?: RegisteredInstall;
-};
+type PreviewApprovalDecision =
+  | "accept"
+  | "acceptForSession"
+  | "decline"
+  | "cancel";
 
 type DesktopAppId = "codex-desktop" | "claude-desktop";
-type DesktopLifecycleAction = "install" | "update" | "uninstall";
 
 type DesktopAppStatus = {
   id: DesktopAppId;
@@ -108,67 +79,8 @@ const DESKTOP_APPS: Record<DesktopAppId, DesktopAppManifest> = {
   },
 };
 
-const planSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["title", "summary", "sources", "steps", "limitations"],
-  properties: {
-    title: { type: "string" },
-    summary: { type: "string" },
-    sources: { type: "array", items: { type: "string" } },
-    limitations: { type: "array", items: { type: "string" } },
-    steps: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["label", "description", "requiresNetwork"],
-        properties: {
-          label: { type: "string" },
-          description: { type: "string" },
-          requiresNetwork: { type: "boolean" },
-        },
-      },
-    },
-  },
-};
-
-const REGISTERED_NPM_INSTALLS: Record<
-  string,
-  { packageName: string; displayName: string }
-> = {
-  claude: {
-    packageName: "@anthropic-ai/claude-code",
-    displayName: "Claude Code",
-  },
-  codex: { packageName: "@openai/codex", displayName: "Codex" },
-  gemini: { packageName: "@google/gemini-cli", displayName: "Gemini CLI" },
-  grok: { packageName: "@xai-official/grok", displayName: "Grok Build" },
-  opencode: { packageName: "opencode-ai", displayName: "OpenCode" },
-  openclaw: { packageName: "openclaw", displayName: "OpenClaw" },
-  pi: { packageName: "@earendil-works/pi-coding-agent", displayName: "Pi" },
-};
-
-function normalizeInstallVersion(value: unknown) {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    value === "stable" ||
-    value === "latest"
-  ) {
-    return "latest";
-  }
-  const normalized = value.trim();
-  if (!/^[A-Za-z0-9._-]{1,80}$/.test(normalized)) {
-    throw new Error("指定版本只能包含字母、数字、点、连字符或下划线");
-  }
-  return normalized;
-}
-
 function webAssistantBridge() {
-  const pendingPlans = new Map<string, StoredPlan>();
-  const running = new Map<string, ReturnType<typeof spawn>>();
-  const managedInstallDirectories = new Map<string, string>();
+  const sessions = new Map<string, PreviewAssistantSession>();
   const listeners = new Set<ServerResponse>();
   const recentEvents: Array<Record<string, unknown>> = [];
 
@@ -361,23 +273,6 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     };
   };
 
-  const numericVersionParts = (value: string) =>
-    value
-      .split(/[^0-9]+/)
-      .filter(Boolean)
-      .map((part) => Number.parseInt(part, 10));
-
-  const versionIsNewer = (latest: string, current: string) => {
-    const latestParts = numericVersionParts(latest);
-    const currentParts = numericVersionParts(current);
-    const length = Math.max(latestParts.length, currentParts.length);
-    for (let index = 0; index < length; index += 1) {
-      const difference = (latestParts[index] ?? 0) - (currentParts[index] ?? 0);
-      if (difference !== 0) return difference > 0;
-    }
-    return false;
-  };
-
   const latestDesktopVersion = async (manifest: DesktopAppManifest) => {
     if (process.platform !== "win32") {
       throw new Error(
@@ -415,99 +310,6 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     return { ...status, latest_version: latest };
   };
 
-  const runWingetDesktopAction = async (
-    manifest: DesktopAppManifest,
-    action: "install" | "update",
-  ) => {
-    await commandOutput(
-      "winget.exe",
-      [
-        action === "install" ? "install" : "upgrade",
-        "--id",
-        manifest.wingetId,
-        "--exact",
-        "--source",
-        manifest.wingetSource,
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-        "--silent",
-        "--disable-interactivity",
-      ],
-      "desktop lifecycle action",
-    );
-  };
-
-  const uninstallDesktopApp = async (
-    manifest: DesktopAppManifest,
-    packageIdentity: string,
-  ) => {
-    if (
-      !/^[A-Za-z0-9._-]+$/.test(packageIdentity) ||
-      !packageIdentity.startsWith(manifest.windowsPackageName)
-    ) {
-      throw new Error(
-        "Refusing to remove an unverified desktop package identity",
-      );
-    }
-    const script = `$pkg = Get-AppxPackage -Name '${manifest.windowsPackageName}'; if ($null -eq $pkg) { exit 0 }; $pkg | Where-Object { $_.PackageFullName -eq '${packageIdentity}' } | Remove-AppxPackage -ErrorAction Stop`;
-    await powershellOutput(script, "desktop application uninstall");
-  };
-
-  const runDesktopLifecycleAction = async (
-    manifest: DesktopAppManifest,
-    action: DesktopLifecycleAction,
-  ): Promise<DesktopAppStatus> => {
-    if (process.platform !== "win32") {
-      throw new Error(
-        "Automatic desktop lifecycle actions are supported on Windows only",
-      );
-    }
-    const before = await detectDesktopApp(manifest);
-    if (action === "install") {
-      if (before.installed) {
-        throw new Error(`${manifest.displayName} is already installed`);
-      }
-      await runWingetDesktopAction(manifest, "install");
-    } else if (action === "update") {
-      if (!before.installed) {
-        throw new Error(`${manifest.displayName} is not installed`);
-      }
-      const latest = await latestDesktopVersion(manifest);
-      if (!versionIsNewer(latest, before.version ?? "")) {
-        return { ...before, latest_version: latest };
-      }
-      await runWingetDesktopAction(manifest, "update");
-    } else {
-      if (!before.installed) return before;
-      if (!before.package_identity) {
-        throw new Error("Desktop package identity is unavailable");
-      }
-      await uninstallDesktopApp(manifest, before.package_identity);
-    }
-
-    const after = await detectDesktopApp(manifest);
-    if (action === "install" && !after.installed) {
-      throw new Error(
-        `${manifest.displayName} installer completed but the application was not detected`,
-      );
-    }
-    if (
-      action === "update" &&
-      (!after.installed ||
-        (before.version !== null && after.version === before.version))
-    ) {
-      throw new Error(
-        `${manifest.displayName} update completed but the installed version did not change`,
-      );
-    }
-    if (action === "uninstall" && after.installed) {
-      throw new Error(
-        `${manifest.displayName} uninstall completed but the package is still installed`,
-      );
-    }
-    return after;
-  };
-
   const launchDesktopApp = async (manifest: DesktopAppManifest) => {
     if (process.platform !== "win32") {
       throw new Error(
@@ -525,52 +327,6 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     );
     child.unref();
   };
-
-  const resolveTargetDirectory = async (raw: unknown) => {
-    if (typeof raw !== "string" || !raw.trim())
-      throw new Error("请先选择安装目录");
-    const targetDir = await fs.realpath(raw.trim());
-    const stat = await fs.stat(targetDir);
-    if (!stat.isDirectory()) throw new Error("安装位置必须是文件夹");
-    if (path.parse(targetDir).root === targetDir)
-      throw new Error("不能使用系统磁盘根目录");
-    if (path.resolve(targetDir) === path.resolve(os.homedir())) {
-      throw new Error("不能使用整个用户主目录");
-    }
-    return targetDir;
-  };
-
-  const defaultPlanWorkspace = async () => {
-    const directory = path.join(
-      os.tmpdir(),
-      "cc-switch-codex-assistant",
-      "plan-workspace",
-    );
-    await fs.mkdir(directory, { recursive: true });
-    return await fs.realpath(directory);
-  };
-
-  const schemaPath = async () => {
-    const directory = path.join(os.tmpdir(), "cc-switch-codex-assistant");
-    await fs.mkdir(directory, { recursive: true });
-    const filename = path.join(directory, "install-plan.schema.json");
-    await fs.writeFile(filename, JSON.stringify(planSchema), "utf8");
-    return { directory, filename };
-  };
-
-  const createPlanPrompt = (
-    request: string,
-    targetDir: string,
-    install?: RegisteredInstall,
-  ) =>
-    `You are CC Switch's installation planner. Do not install, download, modify files, or run shell commands.\n` +
-    `Create a concise installation explanation for the user's request.\n` +
-    (install
-      ? `This is a registered CC Switch install for ${install.displayName}. The backend, not you, executes a fixed installer after confirmation. Use only this source in your explanation: ${install.officialSource}. The selected installation location is ${install.usesDefaultLocation ? "CC Switch default installation location" : install.targetDir}. Requested version: ${install.version}. Do not suggest another package, URL, installer, or shell command.\n`
-      : "This request is not a registered CC Switch install action. Offer safe manual next steps only and do not present it as executable.\n") +
-    `If reliable source or install instructions cannot be established, say so in limitations and propose a manual next step.\n` +
-    `Never propose deleting existing files, changing CC Switch configuration, changing Codex configuration, elevation, or disabling safety controls.\n` +
-    `Return only the JSON object required by the output schema.\n\nUser request:\n${request}`;
 
   const MAX_CHAT_HISTORY_TURNS = 12;
   const MAX_CHAT_TURN_LENGTH = 2_000;
@@ -609,152 +365,87 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     return normalized;
   };
 
-  // Mirrors build_chat_prompt in src-tauri/src/commands/codex_assistant.rs.
-  const createChatPrompt = (request: string, history: ChatTurn[]) => {
-    const transcript = history.length
-      ? "\n\nConversation so far:\n" +
-        history
-          .map(
-            (turn) =>
-              `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`,
-          )
-          .join("\n") +
-        "\n"
-      : "";
-    return (
-      `You are CC Switch's in-app assistant. Answer questions about AI CLI and desktop agents, their installation, providers, and configuration.\n` +
-      `You run in a read-only sandbox: you cannot install, download, modify files, or run shell commands. Never claim to have done any of these.\n` +
-      `If the user wants to install, update, or uninstall an agent, explain that the Install plan flow in this panel performs it safely after user confirmation.\n` +
-      `Never propose deleting existing files, changing CC Switch configuration, changing Codex configuration, elevation, or disabling safety controls.\n` +
-      `Answer concisely and in the user's language.${transcript}\n\nUser message:\n${request}`
-    );
+  const getSession = (value: unknown) => {
+    if (typeof value !== "string" || !value.trim()) return undefined;
+    return sessions.get(value.trim());
   };
 
-  const isValidPlan = (value: unknown): value is AssistantPlan => {
-    if (!value || typeof value !== "object") return false;
-    const plan = value as Partial<AssistantPlan>;
-    return (
-      typeof plan.title === "string" &&
-      plan.title.trim().length > 0 &&
-      typeof plan.summary === "string" &&
-      plan.summary.trim().length > 0 &&
-      Array.isArray(plan.sources) &&
-      Array.isArray(plan.steps) &&
-      Array.isArray(plan.limitations)
-    );
-  };
-
-  const registeredInstall = (
-    tool: unknown,
-    targetDir: string,
-    requestedVersion: unknown,
-    customInstallLocation: boolean,
-  ): RegisteredInstall | undefined => {
-    if (typeof tool !== "string" || !tool) return undefined;
-    if (tool === "codex-desktop" || tool === "claude-desktop") {
-      const manifest = DESKTOP_APPS[tool];
-      if (customInstallLocation) {
-        throw new Error(
-          `${manifest.displayName} 由系统安装器管理，不支持自定义安装位置`,
-        );
-      }
-      const version = normalizeInstallVersion(requestedVersion);
-      if (version !== "latest") {
-        throw new Error(`${manifest.displayName} 的桌面安装器不支持指定版本`);
-      }
-      return {
-        kind: "desktop",
-        tool,
-        displayName: manifest.displayName,
-        version,
-        targetDir,
-        usesDefaultLocation: true,
-        officialSource:
-          tool === "codex-desktop"
-            ? "https://apps.microsoft.com/detail/9PLM9XGG6VKS"
-            : "https://claude.ai/download",
-      };
-    }
-    const entry = REGISTERED_NPM_INSTALLS[tool];
-    if (!entry) throw new Error("当前应用不支持 AI 辅助安装");
-    const version = normalizeInstallVersion(requestedVersion);
-    return {
-      kind: "npm",
-      tool,
-      packageName: entry.packageName,
-      displayName: entry.displayName,
-      version,
-      targetDir,
-      usesDefaultLocation: !customInstallLocation,
-      officialSource: `https://www.npmjs.com/package/${entry.packageName}`,
+  const createSession = (history: unknown) => {
+    const session: PreviewAssistantSession = {
+      id: randomUUID(),
+      history: normalizeChatHistory(history),
     };
+    sessions.set(session.id, session);
+    return session;
   };
 
-  const enrichPlan = (
-    plan: AssistantPlan,
-    targetDir: string,
-    install?: RegisteredInstall,
-  ): AssistantPlan => {
-    if (!install) {
-      return {
-        ...plan,
-        executable: false,
-        limitations: [
-          ...plan.limitations,
-          "该应用尚未登记受控安装器；可查看建议，但不能由 CC Switch 自动执行。",
-        ],
-      };
+  const resolveSession = (body: Record<string, unknown>) =>
+    getSession(body.sessionId ?? body.session_id) ??
+    createSession(body.history);
+
+  const approvalDecision = (body: Record<string, unknown>) => {
+    const raw = body.decision ?? body.approved ?? body.action;
+    if (
+      raw === true ||
+      raw === "accept" ||
+      raw === "acceptForSession" ||
+      raw === "approved" ||
+      raw === "approve"
+    ) {
+      return raw === "acceptForSession"
+        ? "acceptForSession"
+        : ("accept" as PreviewApprovalDecision);
     }
-    return {
-      ...plan,
-      executable: true,
-      install: {
-        tool: install.tool,
-        displayName: install.displayName,
-        version: install.version,
-        installLocation: install.usesDefaultLocation
-          ? "CC Switch default location"
-          : targetDir,
-        usesDefaultLocation: install.usesDefaultLocation,
-        officialSource: install.officialSource,
-      },
-    };
+    if (
+      raw === false ||
+      raw === "decline" ||
+      raw === "denied" ||
+      raw === "deny"
+    ) {
+      return "decline" as PreviewApprovalDecision;
+    }
+    if (raw === "cancel") return "cancel" as PreviewApprovalDecision;
+    throw new Error("请选择允许、拒绝或取消任务");
   };
 
-  const runCodex = (
-    runId: string,
-    targetDir: string,
-    args: string[],
-    onClose: (success: boolean) => Promise<void>,
+  const emitPreviewApproval = (
+    session: PreviewAssistantSession,
+    request: string,
   ) => {
-    const child = spawn("codex", args, {
-      cwd: targetDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
+    const approvalId = randomUUID();
+    session.pendingApprovalId = approvalId;
+    emit({
+      sessionId: session.id,
+      kind: "started",
     });
-    running.set(runId, child);
-    emit({ runId, kind: "started" });
-    readline
-      .createInterface({ input: child.stdout })
-      .on("line", (message) => emit({ runId, kind: "log", message }));
-    readline
-      .createInterface({ input: child.stderr })
-      .on("line", (message) => emit({ runId, kind: "stderr", message }));
-    child.on("error", (error) =>
-      emit({ runId, kind: "stderr", message: error.message }),
-    );
-    child.on("close", async (code) => {
-      running.delete(runId);
-      const success = code === 0;
-      await onClose(success);
-      emit({
-        runId,
-        kind: "finished",
-        message: code === null ? "cancelled" : `exit code: ${code}`,
-        success,
-      });
+    emit({
+      sessionId: session.id,
+      kind: "message",
+      message:
+        "这是浏览器预览。我可以展示操作确认，但不会安装软件、修改配置或执行真实命令。",
+    });
+    emit({
+      sessionId: session.id,
+      kind: "approval",
+      approval: {
+        id: approvalId,
+        type: "command",
+        command: request,
+        cwd: null,
+        reason: "浏览器预览仅模拟操作确认，不会执行真实命令。",
+        networkHost: null,
+        grantRoot: null,
+        allowForSession: false,
+        availableDecisions: ["accept", "cancel"],
+      },
+      message: "浏览器预览不会执行真实操作。你可以允许或取消此模拟确认。",
     });
   };
+
+  const looksLikeOperationRequest = (request: string) =>
+    /(?:安装|卸载|更新|升级|配置|修改|删除|install|uninstall|update|upgrade|configure|modify|delete|インストール|アンインストール|更新|設定|削除)/i.test(
+      request,
+    );
 
   const probeToolVersion = async (
     executable: string,
@@ -781,118 +472,6 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
         );
       },
     );
-  };
-
-  const verifyRegisteredInstall = async (install: RegisteredInstall) => {
-    if (install.kind === "desktop") {
-      const status = await detectDesktopApp(desktopManifest(install.tool));
-      if (!status.installed) {
-        throw new Error("安装器已结束，但未检测到桌面应用");
-      }
-      if (!status.version) throw new Error("桌面应用已安装，但无法读取版本");
-      return status.version;
-    }
-    const resolvedExecutable = install.usesDefaultLocation
-      ? install.tool
-      : process.platform === "win32"
-        ? path.join(install.targetDir, `${install.tool}.cmd`)
-        : path.join(install.targetDir, "bin", install.tool);
-    const output = await probeToolVersion(
-      resolvedExecutable,
-      install.targetDir,
-      install.usesDefaultLocation
-        ? process.env
-        : {
-            ...process.env,
-            PATH: `${
-              process.platform === "win32"
-                ? install.targetDir
-                : path.join(install.targetDir, "bin")
-            }${path.delimiter}${process.env.PATH ?? ""}`,
-          },
-    );
-    if (!output.success) {
-      throw new Error("安装命令已结束，但未检测到可运行的命令行");
-    }
-    if (!install.usesDefaultLocation) {
-      managedInstallDirectories.set(install.tool, install.targetDir);
-    }
-    return output.output;
-  };
-
-  const runRegisteredInstall = (runId: string, install: RegisteredInstall) => {
-    const desktop =
-      install.kind === "desktop" ? desktopManifest(install.tool) : null;
-    const executable = desktop ? "winget.exe" : "npm";
-    const args = desktop
-      ? [
-          "install",
-          "--id",
-          desktop.wingetId,
-          "--exact",
-          "--source",
-          desktop.wingetSource,
-          "--accept-package-agreements",
-          "--accept-source-agreements",
-          "--silent",
-          "--disable-interactivity",
-        ]
-      : install.usesDefaultLocation
-        ? ["install", "--global", `${install.packageName}@${install.version}`]
-        : [
-            "install",
-            "--global",
-            "--prefix",
-            install.targetDir,
-            `${install.packageName}@${install.version}`,
-          ];
-    const child = spawn(executable, args, {
-      cwd: install.targetDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    running.set(runId, child);
-    emit({
-      runId,
-      kind: "started",
-      message: `install: ${install.displayName}`,
-    });
-    readline
-      .createInterface({ input: child.stdout })
-      .on("line", (message) => emit({ runId, kind: "log", message }));
-    readline
-      .createInterface({ input: child.stderr })
-      .on("line", (message) => emit({ runId, kind: "stderr", message }));
-    child.on("error", (error) =>
-      emit({ runId, kind: "stderr", message: error.message }),
-    );
-    child.on("close", async (code) => {
-      running.delete(runId);
-      let success = code === 0;
-      let message = code === null ? "cancelled" : `exit code: ${code}`;
-      if (success) {
-        emit({
-          runId,
-          kind: "log",
-          message: "安装命令已结束，正在重新检测版本…",
-        });
-        try {
-          const version = await verifyRegisteredInstall(install);
-          message = `${install.displayName} 已安装并验证：${version}`;
-          emit({ runId, kind: "log", message });
-        } catch (error) {
-          success = false;
-          message = error instanceof Error ? error.message : String(error);
-          emit({ runId, kind: "stderr", message });
-        }
-      }
-      emit({
-        runId,
-        kind: "finished",
-        message,
-        success,
-      });
-    });
   };
 
   return {
@@ -937,24 +516,7 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
           route === `${WEB_ASSISTANT_BASE}/status`
         ) {
           void (async () => {
-            let result = await probeToolVersion("codex");
-            if (!result.success) {
-              const managedDirectory = managedInstallDirectories.get("codex");
-              if (managedDirectory) {
-                const executable =
-                  process.platform === "win32"
-                    ? path.join(managedDirectory, "codex.cmd")
-                    : path.join(managedDirectory, "bin", "codex");
-                result = await probeToolVersion(executable, managedDirectory, {
-                  ...process.env,
-                  PATH: `${
-                    process.platform === "win32"
-                      ? managedDirectory
-                      : path.join(managedDirectory, "bin")
-                  }${path.delimiter}${process.env.PATH ?? ""}`,
-                });
-              }
-            }
+            const result = await probeToolVersion("codex");
             sendJson(response, 200, {
               available: result.success,
               version: result.output || null,
@@ -1003,153 +565,148 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
           return sendJson(response, 405, { error: "Method not allowed" });
         void readJson(request)
           .then(async (body) => {
-            if (route === `${WEB_ASSISTANT_BASE}/plan`) {
-              if (typeof body.request !== "string" || !body.request.trim())
-                throw new Error("请输入需要安装或配置的 Agent");
-              if (body.request.length > MAX_REQUEST_LENGTH)
-                throw new Error("请求过长");
-              const customInstallLocation =
-                body.customInstallLocation !== false;
-              const targetDir =
-                typeof body.tool === "string" && !customInstallLocation
-                  ? await defaultPlanWorkspace()
-                  : await resolveTargetDirectory(body.targetDir);
-              const install = registeredInstall(
-                body.tool,
-                targetDir,
-                body.requestedVersion,
-                customInstallLocation,
-              );
-              const runId = randomUUID();
-              const { directory, filename } = await schemaPath();
-              const outputPath = path.join(
-                directory,
-                `plan-output-${runId}.json`,
-              );
-              runCodex(
-                runId,
-                targetDir,
-                [
-                  "exec",
-                  "--json",
-                  "--ephemeral",
-                  "--skip-git-repo-check",
-                  "--ignore-rules",
-                  "--cd",
-                  targetDir,
-                  "--sandbox",
-                  "read-only",
-                  "--output-schema",
-                  filename,
-                  "--output-last-message",
-                  outputPath,
-                  createPlanPrompt(body.request.trim(), targetDir, install),
-                ],
-                async (success) => {
-                  if (!success) return;
-                  try {
-                    const parsed = JSON.parse(
-                      await fs.readFile(outputPath, "utf8"),
-                    );
-                    if (!isValidPlan(parsed))
-                      throw new Error("Codex 未返回可用的结构化安装计划");
-                    const planId = randomUUID();
-                    const plan = enrichPlan(parsed, targetDir, install);
-                    pendingPlans.set(planId, {
-                      request: body.request.trim(),
-                      targetDir,
-                      plan,
-                      install,
-                    });
-                    emit({ runId, kind: "plan", planId, plan });
-                  } catch (error) {
-                    emit({
-                      runId,
-                      kind: "stderr",
-                      message:
-                        error instanceof Error ? error.message : String(error),
-                    });
-                  } finally {
-                    await fs.rm(outputPath, { force: true });
-                  }
-                },
-              );
-              return sendJson(response, 202, { runId });
+            if (
+              route === `${WEB_ASSISTANT_BASE}/session` ||
+              route === `${WEB_ASSISTANT_BASE}/sessions`
+            ) {
+              const session = createSession(body.history);
+              emit({ sessionId: session.id, kind: "session", status: "ready" });
+              return sendJson(response, 201, { sessionId: session.id });
             }
-            if (route === `${WEB_ASSISTANT_BASE}/chat`) {
-              if (typeof body.request !== "string" || !body.request.trim())
-                throw new Error("请输入想问的内容");
-              if (body.request.length > MAX_REQUEST_LENGTH)
+            if (
+              route === `${WEB_ASSISTANT_BASE}/chat` ||
+              route === `${WEB_ASSISTANT_BASE}/message` ||
+              route === `${WEB_ASSISTANT_BASE}/messages`
+            ) {
+              const requestText =
+                typeof body.request === "string"
+                  ? body.request
+                  : typeof body.message === "string"
+                    ? body.message
+                    : typeof body.content === "string"
+                      ? body.content
+                      : "";
+              if (!requestText.trim()) throw new Error("请输入想问的内容");
+              if (requestText.length > MAX_REQUEST_LENGTH)
                 throw new Error("请求过长");
-              const history = normalizeChatHistory(body.history);
-              const targetDir = await defaultPlanWorkspace();
-              const runId = randomUUID();
-              const { directory } = await schemaPath();
-              const outputPath = path.join(
-                directory,
-                `run-output-${runId}.txt`,
-              );
-              runCodex(
-                runId,
-                targetDir,
-                [
-                  "exec",
-                  "--json",
-                  "--ephemeral",
-                  "--skip-git-repo-check",
-                  "--ignore-rules",
-                  "--cd",
-                  targetDir,
-                  "--sandbox",
-                  "read-only",
-                  "--output-last-message",
-                  outputPath,
-                  createChatPrompt(body.request.trim(), history),
-                ],
-                async (success) => {
-                  try {
-                    if (!success) return;
-                    const answer = (
-                      await fs.readFile(outputPath, "utf8")
-                    ).trim();
-                    if (!answer) throw new Error("Codex 未返回回答");
-                    emit({ runId, kind: "message", message: answer });
-                  } catch (error) {
-                    emit({
-                      runId,
-                      kind: "stderr",
-                      message:
-                        error instanceof Error ? error.message : String(error),
-                    });
-                  } finally {
-                    await fs.rm(outputPath, { force: true });
-                  }
-                },
-              );
-              return sendJson(response, 202, { runId });
+
+              const session = resolveSession(body);
+              const requestContent = requestText.trim();
+              const suppliedHistory =
+                body.history === undefined
+                  ? session.history
+                  : normalizeChatHistory(body.history);
+              const history = normalizeChatHistory(suppliedHistory);
+
+              if (looksLikeOperationRequest(requestContent)) {
+                const previewMessage =
+                  "这是浏览器预览。我可以展示操作确认，但不会安装软件、修改配置或执行真实命令。";
+                session.history = normalizeChatHistory([
+                  ...history,
+                  { role: "user", content: requestContent },
+                  { role: "assistant", content: previewMessage },
+                ]);
+                emitPreviewApproval(session, requestContent);
+                return sendJson(response, 202, {
+                  accepted: true,
+                  sessionId: session.id,
+                });
+              }
+
+              const answer =
+                "这是浏览器开发预览中的模拟回答。我可以在同一个对话里帮助你了解 AI Agent、安装方式、Provider 和配置流程；涉及操作时会先展示确认卡，而且预览不会执行真实命令或修改系统。";
+              session.history = normalizeChatHistory([
+                ...history,
+                { role: "user", content: requestContent },
+                { role: "assistant", content: answer },
+              ]);
+              emit({ sessionId: session.id, kind: "started" });
+              emit({
+                sessionId: session.id,
+                kind: "message",
+                message: answer,
+              });
+              emit({
+                sessionId: session.id,
+                kind: "finished",
+                success: true,
+                cancelled: false,
+                message: answer,
+              });
+              return sendJson(response, 202, {
+                accepted: true,
+                sessionId: session.id,
+              });
             }
-            if (route === `${WEB_ASSISTANT_BASE}/execute`) {
-              if (typeof body.planId !== "string")
-                throw new Error("安装计划不存在或已失效，请重新生成");
-              const stored = pendingPlans.get(body.planId);
-              if (!stored)
-                throw new Error("安装计划不存在或已失效，请重新生成");
-              pendingPlans.delete(body.planId);
-              if (!stored.install)
-                throw new Error(
-                  "该计划没有已登记的受控安装器，只能查看建议和复制手动命令",
-                );
-              const runId = randomUUID();
-              runRegisteredInstall(runId, stored.install);
-              return sendJson(response, 202, { runId });
+            if (
+              route === `${WEB_ASSISTANT_BASE}/approval` ||
+              route === `${WEB_ASSISTANT_BASE}/approvals`
+            ) {
+              const session = getSession(body.sessionId ?? body.session_id);
+              if (!session) throw new Error("Codex 对话不存在或已失效");
+              const approvalId = body.approvalId ?? body.approval_id;
+              if (
+                typeof approvalId !== "string" ||
+                approvalId !== session.pendingApprovalId
+              ) {
+                throw new Error("确认请求不存在或已失效");
+              }
+              const decision = approvalDecision(body);
+              delete session.pendingApprovalId;
+              const message =
+                decision === "accept" || decision === "acceptForSession"
+                  ? "已记录允许。浏览器预览不会执行真实操作。"
+                  : decision === "cancel"
+                    ? "已取消任务。浏览器预览未执行任何更改。"
+                    : "已拒绝操作。浏览器预览未执行任何更改。";
+              session.history = normalizeChatHistory([
+                ...session.history,
+                { role: "assistant", content: message },
+              ]);
+              emit({
+                sessionId: session.id,
+                kind: "message",
+                message,
+              });
+              emit({
+                sessionId: session.id,
+                kind: "finished",
+                success: true,
+                cancelled: decision === "cancel",
+                message,
+              });
+              return sendJson(response, 200, {
+                accepted: true,
+                sessionId: session.id,
+                approvalId,
+                decision,
+                simulated: true,
+                message,
+              });
             }
             if (route === `${WEB_ASSISTANT_BASE}/cancel`) {
-              if (typeof body.runId !== "string")
+              const session = getSession(
+                body.sessionId ?? body.session_id ?? body.runId,
+              );
+              if (!session || !session.pendingApprovalId) {
                 throw new Error("没有正在运行的 Codex 任务");
-              const child = running.get(body.runId);
-              if (!child) throw new Error("没有正在运行的 Codex 任务");
-              child.kill();
+              }
+              delete session.pendingApprovalId;
+              emit({
+                sessionId: session.id,
+                kind: "finished",
+                success: false,
+                cancelled: true,
+                message: "已取消任务。浏览器预览未执行任何更改。",
+              });
               return sendJson(response, 200, { cancelled: true });
+            }
+            if (route === `${WEB_ASSISTANT_BASE}/close`) {
+              const sessionId = body.sessionId ?? body.session_id;
+              if (typeof sessionId !== "string")
+                throw new Error("Codex 对话不存在或已失效");
+              const closed = sessions.delete(sessionId);
+              return sendJson(response, 200, { closed });
             }
             if (route === `${WEB_ASSISTANT_BASE}/desktop-app-check-updates`) {
               const status = await checkDesktopAppUpdates(
@@ -1158,6 +715,7 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
               return sendJson(response, 200, status);
             }
             if (route === `${WEB_ASSISTANT_BASE}/desktop-app-action`) {
+              const manifest = desktopManifest(body.app);
               if (
                 body.action !== "install" &&
                 body.action !== "update" &&
@@ -1167,11 +725,11 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
                   `Unsupported desktop lifecycle action: ${String(body.action ?? "")}`,
                 );
               }
-              const status = await runDesktopLifecycleAction(
-                desktopManifest(body.app),
-                body.action,
-              );
-              return sendJson(response, 200, status);
+              const status = await detectDesktopApp(manifest);
+              return sendJson(response, 200, {
+                ...status,
+                reason: `${manifest.displayName} ${body.action} is not executed in the browser preview`,
+              });
             }
             if (route === `${WEB_ASSISTANT_BASE}/desktop-app-launch`) {
               await launchDesktopApp(desktopManifest(body.app));

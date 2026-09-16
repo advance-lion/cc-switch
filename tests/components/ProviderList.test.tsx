@@ -311,6 +311,107 @@ describe("ProviderList Component", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows Provider Center ownership badge and keeps edit enabled for managed projections", async () => {
+    const projected = createProvider({ id: "shared", name: "Shared API" });
+    const local = createProvider({ id: "local", name: "Local API" });
+    const official = createProvider({
+      id: "codex-official",
+      name: "OpenAI Official",
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [projected, local, official],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    server.use(
+      http.post(
+        `${TAURI_ENDPOINT}/get_provider_center_agent_provider_catalog`,
+        () =>
+          HttpResponse.json({
+            appType: "codex",
+            generatedAt: 1,
+            items: [
+              {
+                providerId: projected.id,
+                providerName: projected.name,
+                scope: "universal",
+                ownership: "providerCenterProjection",
+                definitionId: "definition-1",
+                bindingStatus: "applied",
+                appliedRevision: 1,
+                drifted: false,
+                readOnly: true,
+              },
+              {
+                providerId: local.id,
+                providerName: local.name,
+                scope: "agentOnly",
+                ownership: "ccSwitchManaged",
+                drifted: false,
+                readOnly: false,
+              },
+              {
+                providerId: official.id,
+                providerName: official.name,
+                scope: "nativeAccount",
+                ownership: "agentNative",
+                drifted: false,
+                readOnly: false,
+              },
+            ],
+          }),
+      ),
+    );
+
+    const onEdit = vi.fn();
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ shared: projected, local, "codex-official": official }}
+        currentProviderId="shared"
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={onEdit}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    // Flat list: all three providers appear without section grouping
+    expect(
+      await screen.findByTestId("provider-card-shared"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("provider-card-local")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("provider-card-codex-official"),
+    ).toBeInTheDocument();
+
+    const latestProps = (id: string) =>
+      providerCardRenderSpy.mock.calls
+        .map(([props]) => props)
+        .filter((props) => props.provider.id === id)
+        .at(-1);
+
+    // Managed projection: wait for catalog query to resolve, then
+    // managedByProviderCenter=true, edit still works via onEdit
+    await waitFor(() => {
+      expect(latestProps("shared")).toMatchObject({
+        isCurrent: true,
+        managedByProviderCenter: true,
+      });
+    });
+    fireEvent.click(screen.getByTestId("edit-shared"));
+    expect(onEdit).toHaveBeenCalledWith(projected);
+
+    // Local and official: not managed by Provider Center
+    expect(latestProps("local")).toMatchObject({
+      managedByProviderCenter: false,
+    });
+    expect(latestProps("codex-official")).toMatchObject({
+      managedByProviderCenter: false,
+    });
+  });
+
   it("does not manufacture a Pi selection summary card", async () => {
     server.use(
       http.post(`${TAURI_ENDPOINT}/get_pi_current_state`, () =>

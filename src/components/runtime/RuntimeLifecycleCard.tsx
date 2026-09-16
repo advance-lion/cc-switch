@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Download,
+  ChevronDown,
   Loader2,
   MonitorPlay,
   RefreshCw,
@@ -12,6 +13,11 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   Dialog,
@@ -77,6 +83,15 @@ const cliCache = new Map<
   }
 >();
 const desktopCache = new Map<DesktopAppId, DesktopAppStatus>();
+
+type CliRefreshResult = {
+  status: ToolVersion | null;
+  capabilities: ToolLifecycleCapabilities | null;
+};
+type DesktopRefreshResult = DesktopAppStatus | null;
+
+const cliRefreshInFlight = new Map<RuntimeTool, Promise<CliRefreshResult>>();
+const desktopRefreshInFlight = new Map<DesktopAppId, Promise<DesktopRefreshResult>>();
 
 interface RuntimeLifecycleCardProps {
   appId: AppId;
@@ -395,31 +410,78 @@ function CliLifecycleRow({
 
   const refresh = useCallback(
     async (includeLatest = false) => {
+      // Only "check for updates" (includeLatest) calls are slow enough to
+      // warrant in-flight deduplication. Local version detection is fast.
+      if (includeLatest) {
+        const existing = cliRefreshInFlight.get(tool);
+        if (existing) {
+          setLoading(true);
+          try {
+            const result = await existing;
+            setStatus(result.status);
+            setCapabilities(result.capabilities);
+            return result.status;
+          } finally {
+            setLoading(false);
+          }
+        }
+      }
+
       setLoading(true);
+      const promise = (async (): Promise<CliRefreshResult> => {
+        try {
+          const [versions, lifecycleCapabilities] = await Promise.all([
+            includeLatest
+              ? settingsApi.checkToolUpdates([tool])
+              : settingsApi.getToolVersions([tool]),
+            settingsApi.getToolLifecycleCapabilities([tool]),
+          ]);
+          const next = versions[0] ?? null;
+          const nextCapabilities = lifecycleCapabilities[0] ?? null;
+          cliCache.set(tool, { status: next, capabilities: nextCapabilities });
+          return { status: next, capabilities: nextCapabilities };
+        } catch (error) {
+          toast.error(t("appLifecycle.detectFailed"), {
+            description: extractErrorMessage(error),
+          });
+          return { status: null, capabilities: null };
+        }
+      })();
+
+      if (includeLatest) cliRefreshInFlight.set(tool, promise);
       try {
-        const [versions, lifecycleCapabilities] = await Promise.all([
-          includeLatest
-            ? settingsApi.checkToolUpdates([tool])
-            : settingsApi.getToolVersions([tool]),
-          settingsApi.getToolLifecycleCapabilities([tool]),
-        ]);
-        const next = versions[0] ?? null;
-        const nextCapabilities = lifecycleCapabilities[0] ?? null;
-        setStatus(next);
-        setCapabilities(nextCapabilities);
-        cliCache.set(tool, { status: next, capabilities: nextCapabilities });
-        return next;
-      } catch (error) {
-        toast.error(t("appLifecycle.detectFailed"), {
-          description: extractErrorMessage(error),
-        });
-        return null;
+        const result = await promise;
+        setStatus(result.status);
+        setCapabilities(result.capabilities);
+        return result.status;
       } finally {
         setLoading(false);
+        if (includeLatest) cliRefreshInFlight.delete(tool);
       }
     },
     [t, tool],
   );
+
+  // On remount after agent switch: if a refresh is still in-flight,
+  // restore the loading indicator and apply the result when it settles.
+  useEffect(() => {
+    const inFlight = cliRefreshInFlight.get(tool);
+    if (!inFlight) return;
+    let cancelled = false;
+    setLoading(true);
+    inFlight
+      .then((result) => {
+        if (cancelled) return;
+        setStatus(result.status);
+        setCapabilities(result.capabilities);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tool]);
 
   useEffect(() => {
     if (!cliCache.has(tool)) void refresh(false);
@@ -649,25 +711,70 @@ function DesktopLifecycleRow({
 
   const refresh = useCallback(
     async (includeLatest = false) => {
+      // Only "check for updates" (includeLatest) calls are slow enough to
+      // warrant in-flight deduplication. Local status detection is fast.
+      if (includeLatest) {
+        const existing = desktopRefreshInFlight.get(app);
+        if (existing) {
+          setLoading(true);
+          try {
+            const next = await existing;
+            if (next) setStatus(next);
+            return next;
+          } finally {
+            setLoading(false);
+          }
+        }
+      }
+
       setLoading(true);
+      const promise = (async (): Promise<DesktopRefreshResult> => {
+        try {
+          const next = includeLatest
+            ? await settingsApi.checkDesktopAppUpdates(app)
+            : await settingsApi.getDesktopAppStatus(app);
+          desktopCache.set(app, next);
+          return next;
+        } catch (error) {
+          toast.error(t("appLifecycle.detectFailed"), {
+            description: extractErrorMessage(error),
+          });
+          return null;
+        }
+      })();
+
+      if (includeLatest) desktopRefreshInFlight.set(app, promise);
       try {
-        const next = includeLatest
-          ? await settingsApi.checkDesktopAppUpdates(app)
-          : await settingsApi.getDesktopAppStatus(app);
-        setStatus(next);
-        desktopCache.set(app, next);
+        const next = await promise;
+        if (next) setStatus(next);
         return next;
-      } catch (error) {
-        toast.error(t("appLifecycle.detectFailed"), {
-          description: extractErrorMessage(error),
-        });
-        return null;
       } finally {
         setLoading(false);
+        if (includeLatest) desktopRefreshInFlight.delete(app);
       }
     },
     [app, t],
   );
+
+  // On remount after agent switch: if a refresh is still in-flight,
+  // restore the loading indicator and apply the result when it settles.
+  useEffect(() => {
+    const inFlight = desktopRefreshInFlight.get(app);
+    if (!inFlight) return;
+    let cancelled = false;
+    setLoading(true);
+    inFlight
+      .then((next) => {
+        if (cancelled) return;
+        if (next) setStatus(next);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [app]);
 
   useEffect(() => {
     if (!desktopCache.has(app)) void refresh(false);
@@ -910,6 +1017,7 @@ export function RuntimeLifecycleCard({
   onAiInstall,
 }: RuntimeLifecycleCardProps) {
   const { t } = useTranslation();
+  const [isExpanded, setIsExpanded] = useState(true);
   const app = APP_ICON_MAP[appId];
   const tool = TOOL_BY_APP[appId];
   const desktop = DESKTOP_BY_APP[appId];
@@ -922,73 +1030,90 @@ export function RuntimeLifecycleCard({
 
   return (
     <section className="sticky top-0 z-20 rounded-2xl border bg-background/95 p-4 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/85">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border bg-muted/40">
-            {app.icon}
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="truncate text-sm font-semibold">
-                {t("appLifecycle.title", { app: app.label })}
-              </h2>
-              <Badge
-                variant="outline"
-                className={
-                  isConfigured
-                    ? "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-                    : "text-muted-foreground"
-                }
-              >
-                {isConfigured
-                  ? t("appLifecycle.connected")
-                  : t("appLifecycle.notConnected")}
-              </Badge>
+      <Collapsible open={isExpanded} onOpenChange={setIsExpanded}>
+        <CollapsibleTrigger
+          className="flex w-full items-start justify-between gap-3 text-left"
+          aria-label={t(
+            isExpanded
+              ? "appLifecycle.collapseDetails"
+              : "appLifecycle.expandDetails",
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border bg-muted/40">
+              {app.icon}
             </div>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              {desktop && tool
-                ? t("appLifecycle.componentsIndependent")
-                : t("appLifecycle.description")}
-            </p>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="truncate text-sm font-semibold">
+                  {t("appLifecycle.title", { app: app.label })}
+                </h2>
+                <Badge
+                  variant="outline"
+                  className={
+                    isConfigured
+                      ? "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+                      : "text-muted-foreground"
+                  }
+                >
+                  {isConfigured
+                    ? t("appLifecycle.connected")
+                    : t("appLifecycle.notConnected")}
+                </Badge>
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {desktop && tool
+                  ? t("appLifecycle.componentsIndependent")
+                  : t("appLifecycle.description")}
+              </p>
+            </div>
           </div>
-        </div>
-      </div>
+          <ChevronDown
+            className={`mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
+              isExpanded ? "rotate-180" : ""
+            }`}
+            aria-hidden="true"
+          />
+        </CollapsibleTrigger>
 
-      <div className="space-y-2.5">
-        {tool && (
-          <CliLifecycleRow
-            tool={tool}
-            title={cliTitle}
-            subtitle={t("appLifecycle.cliDescription")}
-            refreshRequestId={refreshRequestId}
-            onAiInstall={
-              onAiInstall
-                ? () => onAiInstall({ tool, appName: cliTitle })
-                : undefined
-            }
-          />
-        )}
-        {desktop && (
-          <DesktopLifecycleRow
-            app={desktop}
-            refreshRequestId={refreshRequestId}
-            onAiInstall={
-              onAiInstall
-                ? () =>
-                    onAiInstall({
-                      tool: desktop,
-                      appName:
-                        desktop === "codex-desktop"
-                          ? "Codex Desktop"
-                          : "Claude Desktop",
-                      supportsCustomLocation: false,
-                      supportsVersionPin: false,
-                    })
-                : undefined
-            }
-          />
-        )}
-      </div>
+        <CollapsibleContent className="pt-3">
+          <div className="space-y-2.5">
+            {tool && (
+              <CliLifecycleRow
+                tool={tool}
+                title={cliTitle}
+                subtitle={t("appLifecycle.cliDescription")}
+                refreshRequestId={refreshRequestId}
+                onAiInstall={
+                  onAiInstall
+                    ? () => onAiInstall({ tool, appName: cliTitle })
+                    : undefined
+                }
+              />
+            )}
+            {desktop && (
+              <DesktopLifecycleRow
+                app={desktop}
+                refreshRequestId={refreshRequestId}
+                onAiInstall={
+                  onAiInstall
+                    ? () =>
+                        onAiInstall({
+                          tool: desktop,
+                          appName:
+                            desktop === "codex-desktop"
+                              ? "Codex Desktop"
+                              : "Claude Desktop",
+                          supportsCustomLocation: false,
+                          supportsVersionPin: false,
+                        })
+                    : undefined
+                }
+              />
+            )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
     </section>
   );
 }

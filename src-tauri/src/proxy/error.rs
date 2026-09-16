@@ -20,6 +20,9 @@ pub enum ProxyError {
     #[error("地址绑定失败: {0}")]
     BindFailed(String),
 
+    #[error("代理地址 {address}:{port} 已被占用，可能由另一个 CC Switch 实例或其他程序占用；请关闭占用程序或修改代理端口")]
+    AddressInUse { address: String, port: u16 },
+
     #[error("停止超时")]
     StopTimeout,
 
@@ -118,7 +121,7 @@ impl IntoResponse for ProxyError {
                 let (http_status, message) = match &self {
                     ProxyError::AlreadyRunning => (StatusCode::CONFLICT, self.to_string()),
                     ProxyError::NotRunning => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-                    ProxyError::BindFailed(_) => {
+                    ProxyError::BindFailed(_) | ProxyError::AddressInUse { .. } => {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::StopTimeout => {

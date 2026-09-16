@@ -2975,7 +2975,7 @@ mod tests {
             let source_conn = Connection::open(&source_path)?;
             source_conn.execute_batch(&format!(
                 "PRAGMA user_version = {};",
-                crate::database::SCHEMA_VERSION + 1
+                crate::database::SCHEMA_VERSION + 2
             ))?;
         }
 

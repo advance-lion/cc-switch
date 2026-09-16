@@ -7,9 +7,8 @@
 
 use crate::app_config::AppType;
 use crate::error::AppError;
-use crate::provider::{
-    ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, Provider, UniversalProvider,
-};
+use crate::provider::Provider;
+use crate::proxy::providers::capabilities::{self, Compatibility};
 use crate::services::ProviderService;
 use crate::store::AppState;
 use serde_json::json;
@@ -18,6 +17,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use super::ProviderDefinition;
+use super::ProviderModelDefinition;
 
 pub(crate) struct AppAdapterRegistry {
     adapters: Vec<AppAdapter>,
@@ -146,14 +146,18 @@ impl AppAdapter {
     }
 
     pub(crate) fn validate_protocol(&self, protocol: &str) -> Result<(), AppError> {
-        if self.supported_protocols.contains(&protocol) {
-            Ok(())
-        } else {
-            Err(AppError::Message(format!(
-                "{} 当前不能直接使用 {protocol} 协议；请保留单应用配置或选择兼容协议",
-                self.app_id()
-            )))
+        let compat = self.resolve_compatibility(protocol);
+        match compat {
+            Compatibility::Direct | Compatibility::Proxy { .. } => Ok(()),
+            Compatibility::Unsupported { reason } => Err(AppError::Message(reason)),
         }
+    }
+
+    /// Resolve how this Agent can reach a provider with the given upstream
+    /// protocol, using the unified capability registry that also powers the
+    /// local proxy.
+    pub(crate) fn resolve_compatibility(&self, protocol: &str) -> Compatibility {
+        capabilities::resolve_compatibility(protocol, self.app_id())
     }
 
     pub(crate) fn infer_protocol(&self, provider: &Provider) -> String {
@@ -241,6 +245,15 @@ impl AppAdapter {
         ProviderService::list(state, self.app_type())
     }
 
+    /// Lists providers for an import scan without allowing app-specific list
+    /// routines to persist native state as a side effect.
+    pub(crate) fn list_for_scan(
+        &self,
+        state: &AppState,
+    ) -> Result<indexmap::IndexMap<String, Provider>, AppError> {
+        ProviderService::list_for_provider_center_scan(state, self.app_type())
+    }
+
     pub(crate) fn current(&self, state: &AppState) -> Result<String, AppError> {
         ProviderService::current(state, self.app_type())
     }
@@ -254,10 +267,7 @@ impl AppAdapter {
         if state.db.get_provider_by_id(&id, self.app_id())?.is_some() {
             ProviderService::update(state, self.app_type(), Some(&id), provider)?;
         } else {
-            ProviderService::add(state, self.app_type(), provider, true)?;
-        }
-        if !self.app_type.is_additive_mode() {
-            ProviderService::switch(state, self.app_type(), &id)?;
+            ProviderService::add(state, self.app_type(), provider, false)?;
         }
         Ok(())
     }
@@ -275,43 +285,128 @@ fn models(definition: &ProviderDefinition) -> Vec<String> {
     }
 }
 
-fn universal(definition: &ProviderDefinition, secret: &str) -> UniversalProvider {
-    UniversalProvider::new(
-        format!("pc-{}", definition.id),
-        definition.name.clone(),
-        definition.protocol.clone(),
-        definition.base_url.clone(),
-        secret.to_string(),
-    )
+/// Return normalized model definitions, falling back to bare IDs when the
+/// definition predates the `model_definitions` field.
+fn model_defs(definition: &ProviderDefinition) -> Vec<ProviderModelDefinition> {
+    if definition.model_definitions.is_empty() {
+        definition
+            .models
+            .iter()
+            .map(|id| ProviderModelDefinition {
+                id: id.clone(),
+                ..Default::default()
+            })
+            .collect()
+    } else {
+        definition.model_definitions.clone()
+    }
+}
+
+fn first_model_id(definition: &ProviderDefinition, fallback: &str) -> String {
+    models(definition)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn render_claude(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let mut universal = universal(definition, secret);
-    universal.apps.claude = true;
-    universal.models.claude = Some(ClaudeModelConfig {
-        model: models(definition).first().cloned(),
-        ..Default::default()
-    });
-    universal.to_claude_provider().ok_or_else(render_error)
+    let model = first_model_id(definition, "claude-sonnet-4-20250514");
+    Ok(Provider::with_id(
+        String::new(),
+        definition.name.clone(),
+        json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": definition.base_url,
+                "ANTHROPIC_AUTH_TOKEN": secret,
+                "ANTHROPIC_MODEL": model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            }
+        }),
+        None,
+    ))
 }
 
 fn render_codex(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let mut universal = universal(definition, secret);
-    universal.apps.codex = true;
-    universal.models.codex = Some(CodexModelConfig {
-        model: models(definition).first().cloned(),
-        reasoning_effort: Some("medium".to_string()),
+    let model = first_model_id(definition, "gpt-4o");
+    let reasoning_effort = "medium";
+    let base_trimmed = definition.base_url.trim_end_matches('/');
+    let origin_only = match base_trimmed.split_once("://") {
+        Some((_scheme, rest)) => !rest.contains('/'),
+        None => !base_trimmed.contains('/'),
+    };
+    let codex_base_url = if base_trimmed.ends_with("/v1") {
+        base_trimmed.to_string()
+    } else if origin_only {
+        format!("{base_trimmed}/v1")
+    } else {
+        base_trimmed.to_string()
+    };
+    let config_toml = format!(
+        r#"model_provider = "custom"
+model = "{model}"
+model_reasoning_effort = "{reasoning_effort}"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "NewAPI"
+base_url = "{codex_base_url}"
+wire_api = "responses"
+requires_openai_auth = true"#
+    );
+    let mut settings = json!({
+        "auth": {
+            "OPENAI_API_KEY": secret
+        },
+        "config": config_toml
     });
-    universal.to_codex_provider().ok_or_else(render_error)
+    let defs = model_defs(definition);
+    if !defs.is_empty() {
+        let catalog_models: Vec<serde_json::Value> = defs
+            .iter()
+            .map(|d| {
+                let mut entry = json!({
+                    "model": d.id,
+                });
+                if let Some(name) = &d.display_name {
+                    entry["displayName"] = json!(name);
+                } else {
+                    entry["displayName"] = json!(d.id);
+                }
+                if let Some(cw) = d.context_window {
+                    entry["contextWindow"] = json!(cw);
+                }
+                if !d.input_modalities.is_empty() {
+                    entry["inputModalities"] = json!(d.input_modalities);
+                }
+                entry
+            })
+            .collect();
+        settings["modelCatalog"] = json!({ "models": catalog_models });
+    }
+    Ok(Provider::with_id(
+        String::new(),
+        definition.name.clone(),
+        settings,
+        None,
+    ))
 }
 
 fn render_gemini(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let mut universal = universal(definition, secret);
-    universal.apps.gemini = true;
-    universal.models.gemini = Some(GeminiModelConfig {
-        model: models(definition).first().cloned(),
-    });
-    universal.to_gemini_provider().ok_or_else(render_error)
+    let model = first_model_id(definition, "gemini-2.5-pro");
+    Ok(Provider::with_id(
+        String::new(),
+        definition.name.clone(),
+        json!({
+            "env": {
+                "GOOGLE_GEMINI_BASE_URL": definition.base_url,
+                "GEMINI_API_KEY": secret,
+                "GEMINI_MODEL": model,
+            }
+        }),
+        None,
+    ))
 }
 
 fn render_claude_desktop(
@@ -331,17 +426,21 @@ fn toml_string(value: &str) -> String {
 }
 
 fn render_grokbuild(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let model = models(definition)
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "gpt-4o".to_string());
+    let model = first_model_id(definition, "gpt-4o");
     let model_key = "shared";
+    // Use context_window from normalized model metadata when available,
+    // falling back to a conservative default.
+    let context_window = model_defs(definition)
+        .first()
+        .and_then(|d| d.context_window)
+        .unwrap_or(128_000);
     let config = format!(
-        "[models]\ndefault = \"{model_key}\"\n\n[model.{model_key}]\nmodel = \"{}\"\nbase_url = \"{}\"\napi_key = \"{}\"\nname = \"{}\"\napi_backend = \"openai\"\ncontext_window = 128000\n",
+        "[models]\ndefault = \"{model_key}\"\n\n[model.{model_key}]\nmodel = \"{}\"\nbase_url = \"{}\"\napi_key = \"{}\"\nname = \"{}\"\napi_backend = \"openai\"\ncontext_window = {}\n",
         toml_string(&model),
         toml_string(&definition.base_url),
         toml_string(secret),
-        toml_string(&definition.name)
+        toml_string(&definition.name),
+        context_window
     );
     Ok(Provider::with_id(
         String::new(),
@@ -361,14 +460,31 @@ fn openai_compatible_base_url(definition: &ProviderDefinition) -> String {
 }
 
 fn render_opencode(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let models = models(definition);
+    let defs = model_defs(definition);
+    let model_map: serde_json::Map<String, serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            let mut entry = json!({ "name": d.display_name.as_deref().unwrap_or(&d.id) });
+            if let Some(cw) = d.context_window {
+                entry["limit"] = json!({ "context": cw });
+            }
+            if let Some(mot) = d.max_output_tokens {
+                if let Some(limit) = entry.get_mut("limit").and_then(|v| v.as_object_mut()) {
+                    limit.insert("output".to_string(), json!(mot));
+                } else {
+                    entry["limit"] = json!({ "output": mot });
+                }
+            }
+            (d.id.clone(), entry)
+        })
+        .collect();
     Ok(Provider::with_id(
         String::new(),
         definition.name.clone(),
         json!({
             "npm": "@ai-sdk/openai-compatible", "name": definition.name,
             "options": { "baseURL": openai_compatible_base_url(definition), "apiKey": secret },
-            "models": models.iter().map(|item| (item.clone(), json!({ "name": item }))).collect::<serde_json::Map<String, serde_json::Value>>()
+            "models": model_map
         }),
         None,
     ))
@@ -386,27 +502,62 @@ fn native_api_name(protocol: &str) -> Option<&'static str> {
 
 fn render_openclaw(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
     let api = native_api_name(&definition.protocol).ok_or_else(render_error)?;
-    let models = models(definition);
+    let defs = model_defs(definition);
+    let models: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            let mut entry = json!({
+                "id": d.id,
+                "name": d.display_name.as_deref().unwrap_or(&d.id),
+            });
+            if let Some(r) = d.reasoning {
+                entry["reasoning"] = json!(r);
+            }
+            if !d.input_modalities.is_empty() {
+                entry["input"] = json!(d.input_modalities);
+            }
+            if let Some(cw) = d.context_window {
+                entry["contextWindow"] = json!(cw);
+            }
+            if let Some(mot) = d.max_output_tokens {
+                entry["maxTokens"] = json!(mot);
+            }
+            entry
+        })
+        .collect();
     Ok(Provider::with_id(
         String::new(),
         definition.name.clone(),
         json!({
             "baseUrl": openai_compatible_base_url(definition), "apiKey": secret,
             "api": api,
-            "models": models.iter().map(|item| json!({ "id": item, "name": item })).collect::<Vec<_>>()
+            "models": models
         }),
         None,
     ))
 }
 
 fn render_hermes(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
-    let models = models(definition);
+    let defs = model_defs(definition);
+    // Hermes' database/UI shape is an ordered array of objects with `id`
+    // and optional `context_length`. The YAML writer converts this to a
+    // dict at activation time.
+    let models: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            let mut entry = json!({ "id": d.id });
+            if let Some(cw) = d.context_window {
+                entry["context_length"] = json!(cw);
+            }
+            entry
+        })
+        .collect();
     Ok(Provider::with_id(
         String::new(),
         definition.name.clone(),
         json!({
             "base_url": openai_compatible_base_url(definition), "api_key": secret,
-            "models": models.iter().map(|item| (item.clone(), json!({}))).collect::<serde_json::Map<String, serde_json::Value>>()
+            "models": models
         }),
         None,
     ))
@@ -414,18 +565,38 @@ fn render_hermes(definition: &ProviderDefinition, secret: &str) -> Result<Provid
 
 fn render_pi(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
     let api = native_api_name(&definition.protocol).ok_or_else(render_error)?;
-    let models = models(definition);
+    let defs = model_defs(definition);
+    let base_url = openai_compatible_base_url(definition);
+    let models: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            let mut entry = json!({
+                "id": d.id,
+                "name": d.display_name.as_deref().unwrap_or(&d.id),
+                "api": api,
+                "baseUrl": base_url,
+            });
+            if let Some(r) = d.reasoning {
+                entry["reasoning"] = json!(r);
+            }
+            if !d.input_modalities.is_empty() {
+                entry["input"] = json!(d.input_modalities);
+            }
+            if let Some(cw) = d.context_window {
+                entry["contextWindow"] = json!(cw);
+            }
+            if let Some(mot) = d.max_output_tokens {
+                entry["maxTokens"] = json!(mot);
+            }
+            entry
+        })
+        .collect();
     Ok(Provider::with_id(
         String::new(),
         definition.name.clone(),
         json!({
             "apiKey": secret,
-            "models": models.iter().map(|item| json!({
-                "id": item,
-                "name": item,
-                "api": api,
-                "baseUrl": openai_compatible_base_url(definition)
-            })).collect::<Vec<_>>()
+            "models": models
         }),
         None,
     ))
@@ -445,17 +616,64 @@ pub(crate) fn projected_provider_id(definition: &ProviderDefinition, app: &str) 
         .unwrap_or_else(|| format!("provider-center-{app}-{}", definition.id))
 }
 
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized == "token"
+        || normalized.contains("apikey")
+        || normalized.contains("accesstoken")
+        || normalized.contains("refreshtoken")
+        || normalized.contains("authtoken")
+        || normalized.contains("authorization")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+}
+
+fn redact_embedded_config(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let key = trimmed
+                .split_once('=')
+                .map(|(key, _)| key)
+                .or_else(|| trimmed.split_once(':').map(|(key, _)| key));
+            if key.is_some_and(is_sensitive_key) {
+                let indentation = &line[..line.len() - trimmed.len()];
+                format!("{indentation}{} = <redacted>", key.unwrap().trim())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn credential_safe_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| !is_sensitive_key(key))
+                .map(|(key, value)| (key.clone(), credential_safe_value(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(credential_safe_value).collect())
+        }
+        serde_json::Value::String(value) => {
+            serde_json::Value::String(redact_embedded_config(value))
+        }
+        _ => value.clone(),
+    }
+}
+
 pub(crate) fn provider_fingerprint(provider: &Provider) -> Result<String, AppError> {
     let stable = json!({
-        "id": provider.id,
-        "name": provider.name,
-        "settingsConfig": provider.settings_config,
-        "websiteUrl": provider.website_url,
-        "category": provider.category,
-        "notes": provider.notes,
-        "meta": provider.meta,
-        "icon": provider.icon,
-        "iconColor": provider.icon_color,
+        "settingsConfig": credential_safe_value(&provider.settings_config),
     });
     let bytes = serde_json::to_vec(&stable)
         .map_err(|error| AppError::Message(format!("无法计算配置指纹: {error}")))?;
@@ -486,5 +704,45 @@ mod tests {
                 .resolve(app.as_str())
                 .unwrap_or_else(|error| panic!("{} has no adapter: {error}", app.as_str()));
         }
+    }
+
+    #[test]
+    fn fingerprint_ignores_plain_token_fields_and_embedded_tokens() {
+        let first = Provider::with_id(
+            "first".to_string(),
+            "First".to_string(),
+            json!({
+                "token": "token-first",
+                "config": "model = \"gpt-5\"\ntoken = \"embedded-first\"\n",
+            }),
+            None,
+        );
+        let second = Provider::with_id(
+            "second".to_string(),
+            "Second".to_string(),
+            json!({
+                "token": "token-second",
+                "config": "model = \"gpt-5\"\ntoken = \"embedded-second\"\n",
+            }),
+            None,
+        );
+        assert_eq!(
+            provider_fingerprint(&first).expect("fingerprint first"),
+            provider_fingerprint(&second).expect("fingerprint second")
+        );
+
+        let changed_model = Provider::with_id(
+            "third".to_string(),
+            "Third".to_string(),
+            json!({
+                "token": "token-third",
+                "config": "model = \"gpt-5.1\"\ntoken = \"embedded-third\"\n",
+            }),
+            None,
+        );
+        assert_ne!(
+            provider_fingerprint(&first).expect("fingerprint first"),
+            provider_fingerprint(&changed_model).expect("fingerprint changed model")
+        );
     }
 }

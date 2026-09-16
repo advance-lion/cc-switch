@@ -12,10 +12,13 @@ use crate::database::LifecycleJobRecord;
 use crate::store::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::State;
 use uuid::Uuid;
@@ -61,7 +64,7 @@ impl CliJobAction {
 
 /// 任务前后各做一次的本地探测快照。只含展示与校验所需的最小字段，
 /// 不含路径或环境细节。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliToolProbe {
     pub installed: bool,
@@ -498,14 +501,65 @@ fn execute_action(
     }
 }
 
-#[tauri::command]
-pub async fn run_cli_lifecycle_action(
-    state: State<'_, AppState>,
-    operations: State<'_, DesktopLifecycleOperationState>,
+type CliProbeFuture = Pin<Box<dyn Future<Output = CliToolProbe> + Send>>;
+
+trait CliLifecycleRuntime: Send + Sync {
+    fn probe(&self, tool: &str, preference: Option<&WslShellPreferenceInput>) -> CliProbeFuture;
+
+    fn execute(
+        &self,
+        db: &crate::database::Database,
+        job: &mut CliLifecycleJob,
+        tool: &str,
+        action: CliJobAction,
+        wsl_shell_by_tool: Option<&HashMap<String, WslShellPreferenceInput>>,
+        cancellation: &AtomicBool,
+    ) -> Result<(), String>;
+}
+
+struct SystemCliLifecycleRuntime;
+
+impl CliLifecycleRuntime for SystemCliLifecycleRuntime {
+    fn probe(&self, tool: &str, preference: Option<&WslShellPreferenceInput>) -> CliProbeFuture {
+        let tool = tool.to_string();
+        let wsl_shell = preference.and_then(|item| item.wsl_shell.clone());
+        let wsl_shell_flag = preference.and_then(|item| item.wsl_shell_flag.clone());
+        Box::pin(async move {
+            let detected = misc::get_single_tool_version_impl(
+                &tool,
+                wsl_shell.as_deref(),
+                wsl_shell_flag.as_deref(),
+                false,
+            )
+            .await;
+            CliToolProbe {
+                installed: detected.version.is_some() || detected.installed_but_broken,
+                version: detected.version,
+            }
+        })
+    }
+
+    fn execute(
+        &self,
+        db: &crate::database::Database,
+        job: &mut CliLifecycleJob,
+        tool: &str,
+        action: CliJobAction,
+        wsl_shell_by_tool: Option<&HashMap<String, WslShellPreferenceInput>>,
+        cancellation: &AtomicBool,
+    ) -> Result<(), String> {
+        execute_action(db, job, tool, action, wsl_shell_by_tool, cancellation)
+    }
+}
+
+async fn run_cli_lifecycle_action_with_runtime(
+    db: Arc<crate::database::Database>,
+    operations: &DesktopLifecycleOperationState,
     tool: String,
     action: String,
-    #[allow(non_snake_case)] jobId: Option<String>,
+    job_id: Option<String>,
     wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
+    runtime: Arc<dyn CliLifecycleRuntime>,
 ) -> Result<(), String> {
     let action = CliJobAction::parse(&action)?;
     let requested = misc::normalize_requested_tools(&[tool]);
@@ -514,15 +568,12 @@ pub async fn run_cli_lifecycle_action(
     }
     let tool = requested[0];
     let _guard = operations.lock(tool).await;
-    let job_id = jobId.unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(existing) = state
-        .db
+    let job_id = job_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(existing) = db
         .get_lifecycle_job(&job_id)
         .map_err(|error| error.to_string())?
     {
         let existing = cli_job_from_record(existing)?;
-        // 相同 jobId 的重复提交幂等：已成功直接返回，否则把既有失败/进行中的
-        // 信息原样交回，绝不重复执行安装脚本。
         if existing.state == "succeeded" {
             return Ok(());
         }
@@ -531,7 +582,6 @@ pub async fn run_cli_lifecycle_action(
             .unwrap_or_else(|| "相同请求仍在处理中，请稍后重试".to_string()));
     }
     let cancellation = operations.register_job(&job_id).await;
-    let db = state.db.clone();
 
     let created_at = now();
     let mut job = CliLifecycleJob {
@@ -566,17 +616,7 @@ pub async fn run_cli_lifecycle_action(
     save_job(&db, &job)?;
 
     let pref = wsl_shell_by_tool.as_ref().and_then(|prefs| prefs.get(tool));
-    let before = misc::get_single_tool_version_impl(
-        tool,
-        pref.and_then(|p| p.wsl_shell.as_deref()),
-        pref.and_then(|p| p.wsl_shell_flag.as_deref()),
-        false,
-    )
-    .await;
-    job.pre_probe = Some(CliToolProbe {
-        installed: before.version.is_some() || before.installed_but_broken,
-        version: before.version.clone(),
-    });
+    job.pre_probe = Some(runtime.probe(tool, pref).await);
     let detected_message = match &job.pre_probe {
         Some(probe) if probe.installed => format!(
             "已检测到 {}{}",
@@ -596,7 +636,6 @@ pub async fn run_cli_lifecycle_action(
         return Err(message);
     }
 
-    // 卸载一个本就不存在的工具视为成功空操作，与桌面任务语义一致。
     if matches!(action, CliJobAction::Uninstall)
         && !job.pre_probe.as_ref().is_some_and(|probe| probe.installed)
     {
@@ -626,9 +665,10 @@ pub async fn run_cli_lifecycle_action(
         let db = db.clone();
         let cancellation = cancellation.clone();
         let wsl_shell_by_tool = wsl_shell_by_tool.clone();
+        let runtime = runtime.clone();
         move || {
             let mut job = job;
-            let result = execute_action(
+            let result = runtime.execute(
                 &db,
                 &mut job,
                 tool,
@@ -659,17 +699,7 @@ pub async fn run_cli_lifecycle_action(
     );
     save_job(&db, &job)?;
 
-    let after = misc::get_single_tool_version_impl(
-        tool,
-        pref.and_then(|p| p.wsl_shell.as_deref()),
-        pref.and_then(|p| p.wsl_shell_flag.as_deref()),
-        false,
-    )
-    .await;
-    let after_probe = CliToolProbe {
-        installed: after.version.is_some() || after.installed_but_broken,
-        version: after.version.clone(),
-    };
+    let after_probe = runtime.probe(tool, pref).await;
     job.post_probe = Some(after_probe.clone());
 
     let verification_error = match action {
@@ -716,6 +746,27 @@ pub async fn run_cli_lifecycle_action(
 }
 
 #[tauri::command]
+pub async fn run_cli_lifecycle_action(
+    state: State<'_, AppState>,
+    operations: State<'_, DesktopLifecycleOperationState>,
+    tool: String,
+    action: String,
+    #[allow(non_snake_case)] jobId: Option<String>,
+    wsl_shell_by_tool: Option<HashMap<String, WslShellPreferenceInput>>,
+) -> Result<(), String> {
+    run_cli_lifecycle_action_with_runtime(
+        state.db.clone(),
+        &operations,
+        tool,
+        action,
+        jobId,
+        wsl_shell_by_tool,
+        Arc::new(SystemCliLifecycleRuntime),
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn cancel_cli_lifecycle_job(
     operations: State<'_, DesktopLifecycleOperationState>,
     #[allow(non_snake_case)] jobId: String,
@@ -753,6 +804,89 @@ pub async fn list_cli_lifecycle_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct FakeCliLifecycleRuntime {
+        probes: Mutex<Vec<CliToolProbe>>,
+        executions: Mutex<Vec<(String, CliJobAction)>>,
+        execution_result: Result<(), String>,
+    }
+
+    impl FakeCliLifecycleRuntime {
+        fn new(probes: Vec<CliToolProbe>, execution_result: Result<(), String>) -> Self {
+            Self {
+                probes: Mutex::new(probes),
+                executions: Mutex::new(Vec::new()),
+                execution_result,
+            }
+        }
+
+        fn executions(&self) -> Vec<(String, CliJobAction)> {
+            self.executions.lock().expect("execution lock").clone()
+        }
+    }
+
+    impl CliLifecycleRuntime for FakeCliLifecycleRuntime {
+        fn probe(
+            &self,
+            _tool: &str,
+            _preference: Option<&WslShellPreferenceInput>,
+        ) -> CliProbeFuture {
+            let probe = self.probes.lock().expect("probe lock").remove(0);
+            Box::pin(async move { probe })
+        }
+
+        fn execute(
+            &self,
+            _db: &crate::database::Database,
+            job: &mut CliLifecycleJob,
+            tool: &str,
+            action: CliJobAction,
+            _wsl_shell_by_tool: Option<&HashMap<String, WslShellPreferenceInput>>,
+            cancellation: &AtomicBool,
+        ) -> Result<(), String> {
+            self.executions
+                .lock()
+                .expect("execution lock")
+                .push((tool.to_string(), action));
+            push_log(
+                job,
+                "info",
+                "executing",
+                "deepseek-harness simulated output".to_string(),
+            );
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("JOB_CANCELLED".to_string());
+            }
+            self.execution_result.clone()
+        }
+    }
+
+    fn probe(installed: bool, version: Option<&str>) -> CliToolProbe {
+        CliToolProbe {
+            installed,
+            version: version.map(str::to_string),
+        }
+    }
+
+    async fn run_fake_lifecycle(
+        db: Arc<crate::database::Database>,
+        runtime: Arc<FakeCliLifecycleRuntime>,
+        tool: &str,
+        action: &str,
+        job_id: &str,
+    ) -> Result<(), String> {
+        run_cli_lifecycle_action_with_runtime(
+            db,
+            &DesktopLifecycleOperationState::default(),
+            tool.to_string(),
+            action.to_string(),
+            Some(job_id.to_string()),
+            None,
+            runtime,
+        )
+        .await
+    }
 
     fn sample_job() -> CliLifecycleJob {
         CliLifecycleJob {
@@ -778,6 +912,206 @@ mod tests {
             started_at: Some(2),
             completed_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn fake_harness_persists_install_success_with_probes_and_logs() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(false, None), probe(true, Some("1.2.3"))],
+            Ok(()),
+        ));
+
+        run_fake_lifecycle(
+            db.clone(),
+            runtime.clone(),
+            "gemini",
+            "install",
+            "deepseek-harness-install",
+        )
+        .await
+        .expect("fake install succeeds");
+
+        assert_eq!(
+            runtime.executions(),
+            vec![("gemini".to_string(), CliJobAction::Install)]
+        );
+        let job = db
+            .get_lifecycle_job("deepseek-harness-install")
+            .expect("load job")
+            .map(cli_job_from_record)
+            .expect("job exists")
+            .expect("parse job");
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.pre_probe, Some(probe(false, None)));
+        assert_eq!(job.post_probe, Some(probe(true, Some("1.2.3"))));
+        assert!(job
+            .logs
+            .iter()
+            .any(|entry| entry.message == "deepseek-harness simulated output"));
+        assert_eq!(
+            job.logs.last().map(|entry| entry.step.as_str()),
+            Some("completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_harness_persists_update_success_with_version_recheck() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(true, Some("1.2.3")), probe(true, Some("1.2.4"))],
+            Ok(()),
+        ));
+
+        run_fake_lifecycle(
+            db.clone(),
+            runtime.clone(),
+            "codex",
+            "update",
+            "deepseek-harness-update",
+        )
+        .await
+        .expect("fake update succeeds");
+
+        assert_eq!(
+            runtime.executions(),
+            vec![("codex".to_string(), CliJobAction::Update)]
+        );
+        let job = db
+            .get_lifecycle_job("deepseek-harness-update")
+            .expect("load job")
+            .map(cli_job_from_record)
+            .expect("job exists")
+            .expect("parse job");
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.pre_probe, Some(probe(true, Some("1.2.3"))));
+        assert_eq!(job.post_probe, Some(probe(true, Some("1.2.4"))));
+        assert!(job.logs.iter().any(|entry| entry.step == "verifying"));
+        assert_eq!(
+            job.logs.last().map(|entry| entry.message.as_str()),
+            Some("更新完成并已通过检测")
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_harness_persists_execution_failure_without_post_probe() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(true, Some("1.0.0"))],
+            Err("harness package manager failed".to_string()),
+        ));
+
+        let error = run_fake_lifecycle(
+            db.clone(),
+            runtime,
+            "codex",
+            "update",
+            "deepseek-harness-failure",
+        )
+        .await
+        .expect_err("fake update fails");
+
+        assert_eq!(error, "harness package manager failed");
+        let job = db
+            .get_lifecycle_job("deepseek-harness-failure")
+            .expect("load job")
+            .map(cli_job_from_record)
+            .expect("job exists")
+            .expect("parse job");
+        assert_eq!(job.state, "failed");
+        assert_eq!(
+            job.error_code.as_deref(),
+            Some("LIFECYCLE_EXECUTION_FAILED")
+        );
+        assert!(job.post_probe.is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_harness_marks_cancelled_execution_with_job_cancelled_code() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(true, Some("1.0.0"))],
+            Err("JOB_CANCELLED".to_string()),
+        ));
+
+        let error = run_fake_lifecycle(
+            db.clone(),
+            runtime,
+            "codex",
+            "update",
+            "deepseek-harness-cancelled",
+        )
+        .await
+        .expect_err("fake update is cancelled");
+
+        assert_eq!(error, "操作已停止");
+        let job = db
+            .get_lifecycle_job("deepseek-harness-cancelled")
+            .expect("load job")
+            .map(cli_job_from_record)
+            .expect("job exists")
+            .expect("parse job");
+        assert_eq!(job.state, "cancelled");
+        assert_eq!(job.error_code.as_deref(), Some("JOB_CANCELLED"));
+    }
+
+    #[tokio::test]
+    async fn fake_harness_uninstall_absent_tool_is_successful_noop() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(false, None)],
+            Ok(()),
+        ));
+
+        run_fake_lifecycle(
+            db.clone(),
+            runtime.clone(),
+            "opencode",
+            "uninstall",
+            "deepseek-harness-uninstall-noop",
+        )
+        .await
+        .expect("absent uninstall is a no-op");
+
+        assert!(runtime.executions().is_empty());
+        let job = db
+            .get_lifecycle_job("deepseek-harness-uninstall-noop")
+            .expect("load job")
+            .map(cli_job_from_record)
+            .expect("job exists")
+            .expect("parse job");
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.post_probe, Some(probe(false, None)));
+    }
+
+    #[tokio::test]
+    async fn repeated_successful_job_id_does_not_execute_twice() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeCliLifecycleRuntime::new(
+            vec![probe(false, None), probe(true, Some("1.0.0"))],
+            Ok(()),
+        ));
+
+        run_fake_lifecycle(
+            db.clone(),
+            runtime.clone(),
+            "pi",
+            "install",
+            "deepseek-harness-idempotent",
+        )
+        .await
+        .expect("first install succeeds");
+        run_fake_lifecycle(
+            db,
+            runtime.clone(),
+            "pi",
+            "install",
+            "deepseek-harness-idempotent",
+        )
+        .await
+        .expect("repeated job is idempotent");
+
+        assert_eq!(runtime.executions().len(), 1);
     }
 
     #[test]

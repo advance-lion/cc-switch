@@ -14,6 +14,13 @@ import {
 export const CODEX_OFFICIAL_PROVIDER_ID = "codex-official";
 export const GROKBUILD_OFFICIAL_PROVIDER_ID = "grokbuild-official";
 
+const NATIVE_ACCOUNT_PROVIDER_IDS: Partial<Record<AppId, string>> = {
+  claude: "claude-official",
+  "claude-desktop": "claude-desktop-official",
+  gemini: "gemini-official",
+  grokbuild: GROKBUILD_OFFICIAL_PROVIDER_ID,
+};
+
 export type CodexOfficialIdentity =
   | "native_login"
   | "managed_account"
@@ -82,6 +89,25 @@ export function resolveCodexOfficialIdentity(
   return hasFixedOfficialId || provider.category === "official"
     ? "native_login"
     : null;
+}
+
+/**
+ * Whether a provider represents credentials owned by the Agent itself rather
+ * than an API-key endpoint. Keep this capability decision here so list views do
+ * not infer account providers from display names or broad categories.
+ */
+export function isNativeAccountProvider(
+  appId: AppId,
+  provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
+): boolean {
+  if (appId === "codex") {
+    return (
+      resolveCodexOfficialIdentity(appId, provider) !== "api_key" &&
+      resolveCodexOfficialIdentity(appId, provider) !== null
+    );
+  }
+
+  return NATIVE_ACCOUNT_PROVIDER_IDS[appId] === provider.id;
 }
 
 /** Keep the UI capability rule aligned with the Rust takeover policy. */

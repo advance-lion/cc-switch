@@ -709,6 +709,15 @@ pub fn run() {
                 Err(e) => log::warn!("✗ Failed to read skills migration flag: {e}"),
             }
 
+            // 1.2. Provider Center: migrate legacy UniversalProvider data to
+            // shared definitions + bindings. Runs once (idempotent via the
+            // SQLITE_MIGRATED_KEY flag). Explicitly triggered at startup so
+            // migration does not depend on a UI view being opened.
+            match crate::provider_center::ensure_sqlite_migrated(&app_state) {
+                Ok(()) => {}
+                Err(e) => log::warn!("✗ Provider Center migration failed: {e}"),
+            }
+
             // 1.5. 自动导入 live 配置 + seed 官方预设供应商（Claude / Codex / Gemini）
             //
             // 先 import 后 seed 是有意为之：先把用户手动配置的 settings.json / auth.json / .env
@@ -1695,24 +1704,21 @@ pub fn run() {
             commands::launch_tool_terminal,
             commands::launch_codex_desktop,
             commands::uninstall_tool_runtime,
-            // Guarded Codex CLI assistant automation
-            commands::start_codex_assistant_plan,
-            commands::start_codex_assistant_chat,
-            commands::execute_codex_assistant_plan,
+            // Persistent Codex app-server assistant conversation
+            commands::start_codex_assistant_session,
+            commands::send_codex_assistant_message,
+            commands::respond_codex_assistant_approval,
             commands::cancel_codex_assistant_run,
+            commands::close_codex_assistant_session,
             // Provider terminal
             commands::open_provider_terminal,
-            // Universal Provider management
-            commands::get_universal_providers,
-            commands::get_universal_provider,
-            commands::upsert_universal_provider,
-            commands::delete_universal_provider,
-            commands::sync_universal_provider,
-            // Provider Center (incremental shared definitions + explicit bindings)
+            // Provider Center (shared definitions + explicit bindings)
             commands::get_provider_center,
+            commands::get_provider_center_agent_provider_catalog,
             commands::get_provider_center_model_catalog,
             commands::save_provider_center_definition,
             commands::delete_provider_center_definition,
+            commands::delete_provider_center_provider,
             commands::duplicate_provider_center_definition,
             commands::discover_provider_center_models,
             commands::scan_provider_center_imports,
@@ -1720,12 +1726,16 @@ pub fn run() {
             commands::get_provider_center_import_session,
             commands::commit_provider_center_import_candidate,
             commands::import_provider_center_candidate,
+            commands::attach_provider_center_binding,
             commands::apply_provider_center_bindings,
             commands::preview_provider_center_apply,
+            commands::preview_provider_center_definition_compatibility,
             commands::apply_provider_center_transaction,
             commands::restore_provider_center_transaction,
             commands::set_provider_center_binding_override,
             commands::disable_provider_center_binding,
+            commands::preview_provider_center_managed_draft,
+            commands::confirm_provider_center_managed_draft,
             // OpenCode specific
             commands::import_opencode_providers_from_live,
             commands::get_opencode_live_provider_ids,
@@ -1977,6 +1987,7 @@ pub fn run() {
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
+    commands::shutdown_codex_assistant_sessions();
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
 
@@ -2384,6 +2395,7 @@ pub fn destroy_single_instance_lock(app_handle: &tauri::AppHandle) {
 /// 图标，而 macOS 的 NSStatusItem 操作要求主线程；`set_visible(false)` 走
 /// `run_item_main_thread` 代理，跨线程安全（见 `remove_tray_icon_before_exit`）。
 pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
+    commands::shutdown_codex_assistant_sessions();
     remove_tray_icon_before_exit(app_handle);
     destroy_single_instance_lock(app_handle);
     tauri::process::restart(&app_handle.env());

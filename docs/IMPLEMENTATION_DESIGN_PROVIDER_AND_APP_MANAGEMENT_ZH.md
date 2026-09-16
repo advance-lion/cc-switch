@@ -1,5 +1,7 @@
 # Provider 中心与应用管理增强补丁：完整实现设计
 
+> **通用 Provider 设计更新：** 本文保留早期技术架构与应用生命周期设计。涉及通用 Provider 的页面结构、创建/编辑/删除流程、兼容性、列表分组及是否提供独立 Provider Center 页面时，以 [`UNIVERSAL_PROVIDER_PRODUCT_DESIGN_ZH.md`](./UNIVERSAL_PROVIDER_PRODUCT_DESIGN_ZH.md) 的已确认方案为准。
+
 > 状态：实施设计稿
 > 目标分支：`feat/runtime-lifecycle`
 > 基线数据库版本：18

@@ -13,6 +13,7 @@
 
 mod adapter;
 mod auth;
+pub mod capabilities;
 mod claude;
 mod codex;
 pub(crate) mod codex_chat_common;

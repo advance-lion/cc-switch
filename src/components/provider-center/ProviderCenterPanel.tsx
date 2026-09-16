@@ -20,6 +20,7 @@ import {
   Unlink,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -46,6 +47,8 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   providerCenterApi,
   type ImportCandidate,
+  type ImportCommitAction,
+  type ImportCommitDecision,
   type ImportFailure,
   type ProviderApplyPreview,
   type ProviderApplyTransaction,
@@ -55,6 +58,8 @@ import {
   type UnifiedModelCatalogEntry,
 } from "@/lib/api/providerCenter";
 import { settingsApi } from "@/lib/api/settings";
+import type { AppId } from "@/lib/api";
+import { refreshProviderCenterApps } from "@/lib/query/providerCenter";
 
 const APPS = [
   { id: "claude", label: "Claude Code", tool: "claude" },
@@ -177,6 +182,7 @@ function AppChooser({
 
 export function ProviderCenterPanel() {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [definitions, setDefinitions] = useState<ProviderDefinition[]>([]);
   const [bindings, setBindings] = useState<ProviderBinding[]>([]);
   const [transactions, setTransactions] = useState<ProviderApplyTransaction[]>(
@@ -194,6 +200,12 @@ export function ProviderCenterPanel() {
   const [importErrors, setImportErrors] = useState<ImportFailure[]>([]);
   const [candidates, setCandidates] = useState<ImportCandidate[]>([]);
   const [importApps, setImportApps] = useState<Record<string, string[]>>({});
+  const [importActions, setImportActions] = useState<
+    Record<string, ImportCommitAction>
+  >({});
+  const [importMergeTargets, setImportMergeTargets] = useState<
+    Record<string, string>
+  >({});
   const [preview, setPreview] = useState<ProviderApplyPreview | null>(null);
   const [previewDefinition, setPreviewDefinition] =
     useState<ProviderDefinition | null>(null);
@@ -264,10 +276,37 @@ export function ProviderCenterPanel() {
     (id: string) => bindings.filter((binding) => binding.providerId === id),
     [bindings],
   );
+  const refreshAffectedApps = useCallback(
+    async (appTypes: string[]) => {
+      const supportedApps = appTypes.filter((appType): appType is AppId =>
+        APPS.some((app) => app.id === appType),
+      );
+      await refreshProviderCenterApps(queryClient, supportedApps);
+    },
+    [queryClient],
+  );
+  const importableCandidates = useMemo(
+    () =>
+      candidates.filter(
+        (candidate) => candidate.sourceKind !== "providerCenterProjection",
+      ),
+    [candidates],
+  );
   const importSummary = useMemo(
     () =>
-      candidates.filter((candidate) => candidate.credentialConfigured).length,
-    [candidates],
+      importableCandidates.filter((candidate) => candidate.credentialConfigured)
+        .length,
+    [importableCandidates],
+  );
+  const deleteBindings = useMemo(
+    () =>
+      deleteTarget
+        ? bindings.filter(
+            (binding) =>
+              binding.providerId === deleteTarget.id && binding.enabled,
+          )
+        : [],
+    [bindings, deleteTarget],
   );
 
   const openCreate = () => {
@@ -275,24 +314,27 @@ export function ProviderCenterPanel() {
     setFormOpen(true);
   };
 
-  const openEdit = (definition: ProviderDefinition) => {
-    setForm({
-      id: definition.id,
-      expectedRevision: definition.revision,
-      name: definition.name,
-      baseUrl: definition.baseUrl,
-      protocol: definition.protocol,
-      apiKey: "",
-      credentialAction: "keep",
-      models: definition.models.join("\n"),
-      notes: definition.notes,
-      enabled: definition.enabled,
-      appTypes: bindingsFor(definition.id)
-        .filter((binding) => binding.enabled)
-        .map((binding) => binding.appType),
-    });
-    setFormOpen(true);
-  };
+  const openEdit = useCallback(
+    (definition: ProviderDefinition) => {
+      setForm({
+        id: definition.id,
+        expectedRevision: definition.revision,
+        name: definition.name,
+        baseUrl: definition.baseUrl,
+        protocol: definition.protocol,
+        apiKey: "",
+        credentialAction: "keep",
+        models: definition.models.join("\n"),
+        notes: definition.notes,
+        enabled: definition.enabled,
+        appTypes: bindingsFor(definition.id)
+          .filter((binding) => binding.enabled)
+          .map((binding) => binding.appType),
+      });
+      setFormOpen(true);
+    },
+    [bindingsFor],
+  );
 
   const save = async () => {
     if (!form.name.trim() || !form.baseUrl.trim()) {
@@ -358,6 +400,22 @@ export function ProviderCenterPanel() {
           ]),
         ),
       );
+      setImportActions(
+        Object.fromEntries(
+          session.candidates.map((candidate) => [
+            candidate.sourceRef,
+            "createCopy" as const,
+          ]),
+        ),
+      );
+      setImportMergeTargets(
+        Object.fromEntries(
+          session.candidates.flatMap((candidate) => {
+            const target = candidate.conflicts[0]?.existingProviderId;
+            return target ? [[candidate.sourceRef, target]] : [];
+          }),
+        ),
+      );
       setImportsOpen(true);
     } catch (error) {
       toast.error(t("providerCenter.scanFailed", { error: String(error) }));
@@ -367,22 +425,37 @@ export function ProviderCenterPanel() {
   };
 
   const importCandidate = async (candidate: ImportCandidate) => {
+    if (candidate.sourceKind === "providerCenterProjection") return;
     setBusy(true);
     try {
       if (importSessionId && candidate.id) {
-        if (candidate.conflicts.length > 0) {
-          toast.error(t("providerCenter.import.conflictUnsupported"));
-          return;
+        const action = importActions[candidate.sourceRef] ?? "createCopy";
+        let decision: ImportCommitDecision = { action };
+        if (action === "merge") {
+          const targetProviderId = importMergeTargets[candidate.sourceRef];
+          const conflict = candidate.conflicts.find(
+            (item) => item.existingProviderId === targetProviderId,
+          );
+          if (!conflict) {
+            toast.error(t("providerCenter.import.mergeTargetRequired"));
+            return;
+          }
+          decision = {
+            action,
+            targetProviderId: conflict.existingProviderId,
+            expectedRevision: conflict.existingRevision,
+          };
         }
         await providerCenterApi.commitImportCandidate(
           importSessionId,
           candidate.id,
-          importApps[candidate.sourceRef] ?? [],
-          { action: "createCopy" },
+          action === "skip" ? [] : (importApps[candidate.sourceRef] ?? []),
+          decision,
         );
         const session =
           await providerCenterApi.getImportSession(importSessionId);
         setCandidates(session.candidates);
+        setImportErrors(session.errors);
       } else {
         await providerCenterApi.importCandidate(
           candidate.sourceRef,
@@ -391,7 +464,12 @@ export function ProviderCenterPanel() {
       }
       await load();
       toast.success(
-        t("providerCenter.import.success", { name: candidate.name }),
+        t(
+          (importActions[candidate.sourceRef] ?? "createCopy") === "skip"
+            ? "providerCenter.import.skipSuccess"
+            : "providerCenter.import.success",
+          { name: candidate.name },
+        ),
       );
     } catch (error) {
       toast.error(t("providerCenter.import.failed", { error: String(error) }));
@@ -437,16 +515,27 @@ export function ProviderCenterPanel() {
     }
   };
 
-  const remove = async () => {
+  const remove = async (removeProjection: boolean) => {
     if (!deleteTarget) return;
     setBusy(true);
     try {
+      for (const binding of deleteBindings) {
+        await providerCenterApi.disableBinding(
+          binding.providerId,
+          binding.appType,
+          removeProjection,
+        );
+      }
       await providerCenterApi.delete(deleteTarget.id);
       setDeleteTarget(null);
       await load();
+      await refreshAffectedApps(
+        deleteBindings.map((binding) => binding.appType),
+      );
       toast.success(t("providerCenter.deleteSuccess"));
     } catch (error) {
       toast.error(t("providerCenter.deleteFailed", { error: String(error) }));
+      await load();
     } finally {
       setBusy(false);
     }
@@ -503,15 +592,25 @@ export function ProviderCenterPanel() {
     }
   };
 
-  const detachBinding = async (binding: ProviderBinding) => {
+  const detachBinding = async (
+    binding: ProviderBinding,
+    removeProjection: boolean,
+  ) => {
     try {
       await providerCenterApi.disableBinding(
         binding.providerId,
         binding.appType,
-        false,
+        removeProjection,
       );
       await load();
-      toast.success(t("providerCenter.detachSuccess"));
+      await refreshAffectedApps([binding.appType]);
+      toast.success(
+        t(
+          removeProjection
+            ? "providerCenter.detachRemoveSuccess"
+            : "providerCenter.detachKeepSuccess",
+        ),
+      );
     } catch (error) {
       toast.error(t("providerCenter.detachFailed", { error: String(error) }));
     }
@@ -550,6 +649,9 @@ export function ProviderCenterPanel() {
       setPreviewDefinition(null);
       setTransactionResult(result);
       await load();
+      await refreshAffectedApps(
+        preview.targets.map((target) => target.appType),
+      );
       if (result.status === "applied")
         toast.success(t("providerCenter.applySuccess"));
       else toast.error(t("providerCenter.applyPartial"));
@@ -567,6 +669,9 @@ export function ProviderCenterPanel() {
       const result = await providerCenterApi.restoreTransaction(transaction.id);
       setTransactionResult(result);
       await load();
+      await refreshAffectedApps(
+        transaction.targets.map((target) => target.appType),
+      );
       if (result.status === "restored")
         toast.success(t("providerCenter.restoreSuccess"));
       else toast.error(t("providerCenter.restorePartial"));
@@ -685,6 +790,10 @@ export function ProviderCenterPanel() {
         <div className="mt-4 flex gap-2 rounded-xl border border-blue-500/20 bg-blue-500/5 px-3 py-2 text-sm text-muted-foreground">
           <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
           <p>{t("providerCenter.securityNote")}</p>
+        </div>
+        <div className="mt-2 flex gap-2 rounded-xl border border-border/70 bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+          <Search className="mt-0.5 h-4 w-4 shrink-0" />
+          <p>{t("providerCenter.scanNote")}</p>
         </div>
       </section>
 
@@ -882,7 +991,7 @@ export function ProviderCenterPanel() {
                         </div>
                         {binding.enabled &&
                           binding.status !== "unsupported" && (
-                            <div className="flex shrink-0 items-center gap-2">
+                            <div className="flex shrink-0 flex-wrap items-center gap-2">
                               <label className="flex items-center gap-2 text-xs text-muted-foreground">
                                 <Switch
                                   checked={binding.overrideEnabled}
@@ -895,10 +1004,23 @@ export function ProviderCenterPanel() {
                               <Button
                                 size="sm"
                                 variant="ghost"
-                                onClick={() => void detachBinding(binding)}
+                                onClick={() =>
+                                  void detachBinding(binding, false)
+                                }
                               >
                                 <Unlink className="mr-1.5 h-3.5 w-3.5" />
-                                {t("providerCenter.detach")}
+                                {t("providerCenter.detachKeep")}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="text-destructive hover:text-destructive"
+                                onClick={() =>
+                                  void detachBinding(binding, true)
+                                }
+                              >
+                                <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                                {t("providerCenter.detachRemove")}
                               </Button>
                             </div>
                           )}
@@ -1219,12 +1341,16 @@ export function ProviderCenterPanel() {
             <DialogTitle>{t("providerCenter.import.title")}</DialogTitle>
             <DialogDescription>
               {t("providerCenter.import.description", {
-                total: candidates.length,
+                total: importableCandidates.length,
                 withCredentials: importSummary,
               })}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
+            <div className="flex gap-2 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3 text-sm text-muted-foreground">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
+              <p>{t("providerCenter.import.readOnlyNotice")}</p>
+            </div>
             {importErrors.length > 0 && (
               <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
                 {t("providerCenter.import.partialErrors")}
@@ -1238,17 +1364,20 @@ export function ProviderCenterPanel() {
                   .join(t("providerCenter.import.errorSeparator"))}
               </div>
             )}
-            {candidates.length === 0 ? (
+            {importableCandidates.length === 0 ? (
               <div className="rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">
                 {t("providerCenter.import.empty")}
               </div>
             ) : (
-              candidates.map((candidate) => (
-                <section
-                  key={candidate.sourceRef}
-                  className="rounded-xl border border-border/70 p-4"
-                >
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              importableCandidates.map((candidate) => {
+                const action =
+                  importActions[candidate.sourceRef] ?? "createCopy";
+                const mergeTarget = importMergeTargets[candidate.sourceRef];
+                return (
+                  <section
+                    key={candidate.sourceRef}
+                    className="rounded-xl border border-border/70 p-4"
+                  >
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <h4 className="font-medium">{candidate.name}</h4>
@@ -1276,48 +1405,158 @@ export function ProviderCenterPanel() {
                         </p>
                       )}
                     </div>
-                    <Button
-                      size="sm"
-                      onClick={() => void importCandidate(candidate)}
-                      disabled={
-                        busy ||
-                        (importApps[candidate.sourceRef]?.length ?? 0) === 0
-                      }
-                    >
-                      <Download className="mr-2 h-4 w-4" />
-                      {t("providerCenter.import.copy")}
-                    </Button>
-                  </div>
-                  {candidate.models.length > 0 && (
-                    <div className="mt-3 flex flex-wrap gap-1.5">
-                      {candidate.models.map((model) => (
-                        <Badge
-                          key={model}
-                          variant="secondary"
-                          className="font-normal"
-                        >
-                          {model}
-                        </Badge>
-                      ))}
+                    {candidate.models.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {candidate.models.map((model) => (
+                          <Badge
+                            key={model}
+                            variant="secondary"
+                            className="font-normal"
+                          >
+                            {model}
+                          </Badge>
+                        ))}
+                      </div>
+                    )}
+                    {candidate.conflicts.length > 0 && (
+                      <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+                        <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                          {t("providerCenter.import.conflictTitle")}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {t("providerCenter.import.conflictHint")}
+                        </p>
+                        {action === "merge" && (
+                          <div className="mt-3 space-y-2">
+                            <Label>
+                              {t("providerCenter.import.mergeTarget")}
+                            </Label>
+                            <Select
+                              value={mergeTarget}
+                              onValueChange={(targetProviderId) =>
+                                setImportMergeTargets((current) => ({
+                                  ...current,
+                                  [candidate.sourceRef]: targetProviderId,
+                                }))
+                              }
+                            >
+                              <SelectTrigger
+                                aria-label={t(
+                                  "providerCenter.import.mergeTarget",
+                                )}
+                              >
+                                <SelectValue
+                                  placeholder={t(
+                                    "providerCenter.import.selectMergeTarget",
+                                  )}
+                                />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {candidate.conflicts.map((conflict) => (
+                                  <SelectItem
+                                    key={conflict.existingProviderId}
+                                    value={conflict.existingProviderId}
+                                  >
+                                    {conflict.existingName}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {importSessionId && candidate.id && (
+                      <div className="mt-4 space-y-2">
+                        <p className="text-xs font-medium text-muted-foreground">
+                          {t("providerCenter.import.actionLabel")}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            size="sm"
+                            variant={
+                              action === "createCopy" ? "default" : "outline"
+                            }
+                            onClick={() =>
+                              setImportActions((current) => ({
+                                ...current,
+                                [candidate.sourceRef]: "createCopy",
+                              }))
+                            }
+                          >
+                            {t("providerCenter.import.actionCreateCopy")}
+                          </Button>
+                          {candidate.conflicts.length > 0 && (
+                            <Button
+                              size="sm"
+                              variant={
+                                action === "merge" ? "default" : "outline"
+                              }
+                              onClick={() =>
+                                setImportActions((current) => ({
+                                  ...current,
+                                  [candidate.sourceRef]: "merge",
+                                }))
+                              }
+                            >
+                              {t("providerCenter.import.actionMerge")}
+                            </Button>
+                          )}
+                          <Button
+                            size="sm"
+                            variant={action === "skip" ? "default" : "outline"}
+                            onClick={() =>
+                              setImportActions((current) => ({
+                                ...current,
+                                [candidate.sourceRef]: "skip",
+                              }))
+                            }
+                          >
+                            {t("providerCenter.import.actionSkip")}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    {action !== "skip" && (
+                      <div className="mt-4 space-y-2">
+                        <p className="text-xs font-medium text-muted-foreground">
+                          {t("providerCenter.import.bindTo")}
+                        </p>
+                        <AppChooser
+                          apps={availableApps}
+                          value={importApps[candidate.sourceRef] ?? []}
+                          onChange={(appTypes) =>
+                            setImportApps((current) => ({
+                              ...current,
+                              [candidate.sourceRef]: appTypes,
+                            }))
+                          }
+                        />
+                      </div>
+                    )}
+                    <div className="mt-4 flex justify-end">
+                      <Button
+                        size="sm"
+                        onClick={() => void importCandidate(candidate)}
+                        disabled={
+                          busy ||
+                          (action !== "skip" &&
+                            (importApps[candidate.sourceRef]?.length ?? 0) ===
+                              0) ||
+                          (action === "merge" && !mergeTarget)
+                        }
+                      >
+                        <Download className="mr-2 h-4 w-4" />
+                        {action === "skip"
+                          ? t("providerCenter.import.confirmSkip")
+                          : action === "merge"
+                            ? t("providerCenter.import.confirmMerge")
+                            : t("providerCenter.import.copy")}
+                      </Button>
                     </div>
-                  )}
-                  <div className="mt-4 space-y-2">
-                    <p className="text-xs font-medium text-muted-foreground">
-                      {t("providerCenter.import.bindTo")}
-                    </p>
-                    <AppChooser
-                      apps={availableApps}
-                      value={importApps[candidate.sourceRef] ?? []}
-                      onChange={(appTypes) =>
-                        setImportApps((current) => ({
-                          ...current,
-                          [candidate.sourceRef]: appTypes,
-                        }))
-                      }
-                    />
-                  </div>
-                </section>
-              ))
+                  </section>
+                );
+              })
             )}
           </div>
           <DialogFooter>
@@ -1591,24 +1830,62 @@ export function ProviderCenterPanel() {
               })}
             </DialogTitle>
             <DialogDescription>
-              {t("providerCenter.deleteDialog.description")}
+              {deleteBindings.length > 0
+                ? t("providerCenter.deleteDialog.activeDescription", {
+                    count: deleteBindings.length,
+                  })
+                : t("providerCenter.deleteDialog.description")}
             </DialogDescription>
           </DialogHeader>
-          <div className="flex gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
-            <Unlink className="mt-0.5 h-4 w-4 shrink-0" />
-            {t("providerCenter.deleteDialog.warning")}
-          </div>
-          <DialogFooter>
+          {deleteBindings.length > 0 ? (
+            <div className="space-y-3">
+              <div className="flex gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                {t("providerCenter.deleteDialog.activeWarning")}
+              </div>
+              <div className="space-y-2">
+                {deleteBindings.map((binding) => (
+                  <div
+                    key={binding.appType}
+                    className="flex items-center justify-between rounded-lg border border-border/70 px-3 py-2 text-sm"
+                  >
+                    <span>{appLabel(binding.appType)}</span>
+                    <Badge variant="outline">
+                      {t(`providerCenter.status.${binding.status}`)}
+                    </Badge>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="flex gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              <Unlink className="mt-0.5 h-4 w-4 shrink-0" />
+              {t("providerCenter.deleteDialog.warning")}
+            </div>
+          )}
+          <DialogFooter className="gap-2 sm:flex-wrap">
             <Button variant="outline" onClick={() => setDeleteTarget(null)}>
               {t("providerCenter.deleteDialog.cancel")}
             </Button>
+            {deleteBindings.length > 0 && (
+              <Button
+                variant="outline"
+                onClick={() => void remove(false)}
+                disabled={busy}
+              >
+                {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {t("providerCenter.deleteDialog.detachKeepAndDelete")}
+              </Button>
+            )}
             <Button
               variant="destructive"
-              onClick={() => void remove()}
+              onClick={() => void remove(deleteBindings.length > 0)}
               disabled={busy}
             >
               {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {t("providerCenter.deleteDialog.confirm")}
+              {deleteBindings.length > 0
+                ? t("providerCenter.deleteDialog.removeProjectionAndDelete")
+                : t("providerCenter.deleteDialog.confirm")}
             </Button>
           </DialogFooter>
         </DialogContent>

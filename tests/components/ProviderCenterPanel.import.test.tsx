@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderCenterPanel } from "@/components/provider-center/ProviderCenterPanel";
@@ -48,13 +49,12 @@ vi.mock("@/lib/api/providerCenter", () => ({
   providerCenterApi: providerCenterApiMock,
 }));
 
-const candidate = (
-  overrides: Partial<ImportCandidate>,
-): ImportCandidate => ({
+const candidate = (overrides: Partial<ImportCandidate>): ImportCandidate => ({
   id: "candidate-1",
   sessionId: "session-1",
   sourceRef: "saved:codex:src-1",
   sourceApp: "codex",
+  sourceKind: "localManaged",
   name: "Imported Provider",
   protocol: "openai-responses",
   baseUrl: "https://clean.example/v1",
@@ -88,6 +88,17 @@ const conflicted = candidate({
     },
   ],
 });
+
+const renderPanel = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <ProviderCenterPanel />
+    </QueryClientProvider>,
+  );
+};
 
 const openImportDialog = async () => {
   const buttons = await screen.findAllByText("providerCenter.importLocal");
@@ -130,30 +141,79 @@ describe("ProviderCenterPanel import flow", () => {
     });
   });
 
-  it("blocks conflicted candidates instead of silently overwriting", async () => {
-    render(<ProviderCenterPanel />);
+  it("commits conflicted candidates as an explicit copy without overwriting", async () => {
+    renderPanel();
     await openImportDialog();
 
     const section = candidateSection("https://dup.example/v1");
     await userEvent.click(section.getByText("providerCenter.import.copy"));
 
-    expect(toastMock.error).toHaveBeenCalledWith(
-      "providerCenter.import.conflictUnsupported",
+    expect(providerCenterApiMock.commitImportCandidate).toHaveBeenCalledWith(
+      "session-1",
+      "candidate-2",
+      ["codex"],
+      { action: "createCopy" },
     );
-    expect(providerCenterApiMock.commitImportCandidate).not.toHaveBeenCalled();
+  });
+
+  it("merges only into the scanned conflict revision", async () => {
+    renderPanel();
+    await openImportDialog();
+
+    const section = candidateSection("https://dup.example/v1");
+    await userEvent.click(
+      section.getByText("providerCenter.import.actionMerge"),
+    );
+    await userEvent.click(
+      section.getByText("providerCenter.import.confirmMerge"),
+    );
+
+    expect(providerCenterApiMock.commitImportCandidate).toHaveBeenCalledWith(
+      "session-1",
+      "candidate-2",
+      ["codex"],
+      {
+        action: "merge",
+        targetProviderId: "shared-1",
+        expectedRevision: 2,
+      },
+    );
+  });
+
+  it("skips a candidate without creating app bindings", async () => {
+    renderPanel();
+    await openImportDialog();
+
+    const section = candidateSection("https://dup.example/v1");
+    await userEvent.click(
+      section.getByText("providerCenter.import.actionSkip"),
+    );
+    await userEvent.click(
+      section.getByText("providerCenter.import.confirmSkip"),
+    );
+
+    expect(providerCenterApiMock.commitImportCandidate).toHaveBeenCalledWith(
+      "session-1",
+      "candidate-2",
+      [],
+      { action: "skip" },
+    );
   });
 
   it("commits clean candidates with an explicit createCopy decision", async () => {
-    render(<ProviderCenterPanel />);
+    renderPanel();
     await openImportDialog();
 
     const section = candidateSection("https://clean.example/v1");
     await userEvent.click(section.getByText("providerCenter.import.copy"));
 
-    expect(
-      providerCenterApiMock.commitImportCandidate,
-    ).toHaveBeenCalledWith("session-1", "candidate-1", ["codex"], {
-      action: "createCopy",
-    });
+    expect(providerCenterApiMock.commitImportCandidate).toHaveBeenCalledWith(
+      "session-1",
+      "candidate-1",
+      ["codex"],
+      {
+        action: "createCopy",
+      },
+    );
   });
 });

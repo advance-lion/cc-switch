@@ -1,8 +1,8 @@
 use crate::provider_center::{
-    self, ImportCandidate, ImportCommitDecision, ImportCommitResult, ModelDiscoveryResult,
-    ProviderApplyPreview, ProviderApplyTransaction, ProviderBinding, ProviderCenterOperationState,
-    ProviderCenterState, ProviderDefinition, ProviderImportSession, SaveProviderDefinitionInput,
-    UnifiedModelCatalog,
+    self, AgentProviderCatalog, DeleteMode, ImportCandidate, ImportCommitDecision,
+    ImportCommitResult, ManagedProviderDraftInput, ModelDiscoveryResult, ProviderApplyPreview,
+    ProviderApplyTransaction, ProviderBinding, ProviderCenterOperationState, ProviderCenterState,
+    ProviderDefinition, ProviderImportSession, SaveProviderDefinitionInput, UnifiedModelCatalog,
 };
 use crate::store::AppState;
 use tauri::State;
@@ -14,6 +14,17 @@ pub async fn get_provider_center(
 ) -> Result<ProviderCenterState, String> {
     let _data_guard = operations.lock_data().await;
     provider_center::state(state.inner()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_provider_center_agent_provider_catalog(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    #[allow(non_snake_case)] appType: String,
+) -> Result<AgentProviderCatalog, String> {
+    let _data_guard = operations.lock_data().await;
+    provider_center::agent_provider_catalog(state.inner(), &appType)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -45,6 +56,27 @@ pub async fn delete_provider_center_definition(
 ) -> Result<(), String> {
     let _data_guard = operations.lock_data().await;
     provider_center::delete_definition(state.inner(), &providerId)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_provider_center_provider(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] appType: String,
+    mode: DeleteMode,
+) -> Result<(), String> {
+    let _data_guard = operations.lock_data().await;
+    let targets = match &mode {
+        DeleteMode::DeleteGlobally => {
+            provider_center::delete_target_app_types(state.inner(), &providerId)
+                .map_err(|error| error.to_string())?
+        }
+        _ => vec![appType.clone()],
+    };
+    let _guards = operations.lock_apps(targets).await;
+    provider_center::delete_provider(state.inner(), &providerId, &appType, mode)
         .map_err(|error| error.to_string())
 }
 
@@ -133,6 +165,18 @@ pub async fn import_provider_center_candidate(
 }
 
 #[tauri::command]
+pub async fn attach_provider_center_binding(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] appType: String,
+) -> Result<ProviderBinding, String> {
+    let _data_guard = operations.lock_data().await;
+    provider_center::attach_binding(state.inner(), &providerId, &appType)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn apply_provider_center_bindings(
     state: State<'_, AppState>,
     operations: State<'_, ProviderCenterOperationState>,
@@ -157,6 +201,18 @@ pub async fn preview_provider_center_apply(
 ) -> Result<ProviderApplyPreview, String> {
     let _data_guard = operations.lock_data().await;
     provider_center::preview_apply(state.inner(), &providerId, appTypes)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_provider_center_definition_compatibility(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] appTypes: Vec<String>,
+) -> Result<ProviderApplyPreview, String> {
+    let _data_guard = operations.lock_data().await;
+    provider_center::preview_definition_compatibility(state.inner(), &providerId, appTypes)
         .map_err(|error| error.to_string())
 }
 
@@ -223,4 +279,38 @@ pub async fn disable_provider_center_binding(
     let _guards = operations.lock_apps(vec![appType.clone()]).await;
     provider_center::disable_binding(state.inner(), &providerId, &appType, removeProjection)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_provider_center_managed_draft(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    input: ManagedProviderDraftInput,
+) -> Result<ProviderApplyPreview, String> {
+    log::info!("[preview_managed_draft] IPC call received, app_type={}, targets={}", input.app_type, input.target_app_types.len());
+    let _data_guard = operations.lock_data().await;
+    log::info!("[preview_managed_draft] data lock acquired");
+    let result = provider_center::preview_managed_draft(state.inner(), input).map_err(|error| error.to_string());
+    log::info!("[preview_managed_draft] completed, ok={}", result.is_ok());
+    result
+}
+
+#[tauri::command]
+pub async fn confirm_provider_center_managed_draft(
+    state: State<'_, AppState>,
+    operations: State<'_, ProviderCenterOperationState>,
+    input: ManagedProviderDraftInput,
+    #[allow(non_snake_case)] previewToken: String,
+    #[allow(non_snake_case)] idempotencyKey: Option<String>,
+) -> Result<ProviderApplyTransaction, String> {
+    let _data_guard = operations.lock_data().await;
+    let targets = provider_center::managed_draft_target_app_types(&input);
+    let _guards = operations.lock_apps(targets).await;
+    provider_center::confirm_managed_draft(
+        state.inner(),
+        input,
+        &previewToken,
+        idempotencyKey.as_deref(),
+    )
+    .map_err(|error| error.to_string())
 }

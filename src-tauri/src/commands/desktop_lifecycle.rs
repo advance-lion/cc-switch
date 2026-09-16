@@ -9,7 +9,7 @@ use crate::store::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -39,14 +39,6 @@ struct DesktopAppManifest {
     macos_app_name: &'static str,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_cask: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RegisteredDesktopAssistantInstall {
-    pub app_id: String,
-    pub display_name: String,
-    pub version: String,
-    pub official_source: String,
 }
 
 const CODEX_DESKTOP: DesktopAppManifest = DesktopAppManifest {
@@ -84,7 +76,7 @@ fn manifest(app: &str) -> Result<DesktopAppManifest, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopAppStatus {
     pub id: String,
     pub display_name: String,
@@ -105,7 +97,7 @@ pub struct DesktopAppStatus {
     pub installations: Vec<DesktopInstallation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopInstallation {
     pub version: String,
     pub path: String,
@@ -130,7 +122,7 @@ struct AppxRecords {
     records: Vec<AppxRecord>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopLifecycleAction {
     Install,
     Update,
@@ -166,7 +158,8 @@ pub struct DesktopLifecycleOperationState {
 
 impl DesktopLifecycleOperationState {
     pub(crate) async fn lock(&self, app_id: &str) -> OwnedMutexGuard<()> {
-        let lock = if let Some(lock) = self.locks.read().await.get(app_id).cloned() {
+        let existing = { self.locks.read().await.get(app_id).cloned() };
+        let lock = if let Some(lock) = existing {
             lock
         } else {
             let mut locks = self.locks.write().await;
@@ -686,35 +679,6 @@ fn verification_satisfied(
     }
 }
 
-fn detect_after_action(
-    manifest: DesktopAppManifest,
-    action: DesktopLifecycleAction,
-    before: &DesktopAppStatus,
-    cancellation: &AtomicBool,
-) -> Result<DesktopAppStatus, String> {
-    if cancellation.load(Ordering::SeqCst) {
-        return Err("JOB_CANCELLED".to_string());
-    }
-    let mut last = detect_desktop_app(manifest)?;
-    if verification_satisfied(action, before, &last) {
-        return Ok(last);
-    }
-    // Store/Appx registration can trail the installer process. Poll briefly
-    // before declaring verification failure, while keeping success tied to a
-    // real post-action probe.
-    for _ in 0..29 {
-        if cancellation.load(Ordering::SeqCst) {
-            return Err("JOB_CANCELLED".to_string());
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        last = detect_desktop_app(manifest)?;
-        if verification_satisfied(action, before, &last) {
-            return Ok(last);
-        }
-    }
-    Ok(last)
-}
-
 #[cfg(target_os = "windows")]
 fn latest_winget_version(manifest: DesktopAppManifest) -> Result<String, String> {
     let mut command = Command::new("winget.exe");
@@ -850,104 +814,6 @@ fn run_winget_uninstall(
         .map(|_| ())
 }
 
-pub(crate) fn plan_registered_desktop_install(
-    app: &str,
-    requested_version: &str,
-    custom_install_location: bool,
-) -> Result<RegisteredDesktopAssistantInstall, String> {
-    let manifest = manifest(app)?;
-    if custom_install_location {
-        return Err(format!(
-            "{} 由系统安装器管理，不支持自定义安装位置",
-            manifest.display_name
-        ));
-    }
-    let version = requested_version.trim();
-    if !version.is_empty() && !matches!(version, "stable" | "latest") {
-        return Err(format!(
-            "{} 的桌面安装器不支持指定版本",
-            manifest.display_name
-        ));
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    return Err(format!(
-        "{} 的 AI 辅助桌面安装当前不支持此平台",
-        manifest.display_name
-    ));
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    Ok(RegisteredDesktopAssistantInstall {
-        app_id: manifest.id.to_string(),
-        display_name: manifest.display_name.to_string(),
-        version: "latest".to_string(),
-        official_source: {
-            #[cfg(target_os = "windows")]
-            {
-                if manifest.id == "codex-desktop" {
-                    "https://apps.microsoft.com/detail/9PLM9XGG6VKS".to_string()
-                } else {
-                    "https://claude.ai/download".to_string()
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                format!("https://formulae.brew.sh/cask/{}", manifest.macos_cask)
-            }
-        },
-    })
-}
-
-#[allow(clippy::needless_return)] // cfg-gated blocks end in `return` on each platform
-pub(crate) fn spawn_registered_desktop_install(
-    install: &RegisteredDesktopAssistantInstall,
-) -> Result<Child, String> {
-    let manifest = manifest(&install.app_id)?;
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = winget_action_command(manifest, DesktopLifecycleAction::Install)?;
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
-        return command
-            .spawn()
-            .map_err(|error| format!("无法启动 {} 安装器: {error}", manifest.display_name));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = Command::new("brew");
-        command
-            .args(["install", "--cask", manifest.macos_cask])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        return command
-            .spawn()
-            .map_err(|error| format!("无法启动 {} 安装器: {error}", manifest.display_name));
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    Err(format!(
-        "{} 的 AI 辅助桌面安装当前不支持此平台",
-        manifest.display_name
-    ))
-}
-
-pub(crate) fn verify_registered_desktop_install(
-    install: &RegisteredDesktopAssistantInstall,
-) -> Result<String, String> {
-    let manifest = manifest(&install.app_id)?;
-    let status = detect_desktop_app(manifest)?;
-    if !status.installed {
-        return Err(format!(
-            "{} 安装器已结束，但未检测到桌面应用",
-            install.display_name
-        ));
-    }
-    status
-        .version
-        .ok_or_else(|| format!("{} 已安装，但无法读取版本", install.display_name))
-}
-
 #[cfg(target_os = "windows")]
 fn uninstall_appx(
     manifest: DesktopAppManifest,
@@ -976,6 +842,116 @@ fn uninstall_appx(
     ]);
     command_output_cancellable(&mut command, "desktop application uninstall", cancellation)
         .map(|_| ())
+}
+
+trait DesktopLifecycleRuntime: Send + Sync {
+    fn probe(&self, manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String>;
+
+    fn latest_version(&self, manifest: DesktopAppManifest) -> Result<String, String>;
+
+    fn verification_retries(&self) -> usize {
+        29
+    }
+
+    fn verification_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+
+    fn execute(
+        &self,
+        manifest: DesktopAppManifest,
+        action: DesktopLifecycleAction,
+        before: &DesktopAppStatus,
+        cancellation: &AtomicBool,
+    ) -> Result<(), String>;
+}
+
+struct SystemDesktopLifecycleRuntime;
+
+impl DesktopLifecycleRuntime for SystemDesktopLifecycleRuntime {
+    fn probe(&self, manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String> {
+        detect_desktop_app(manifest)
+    }
+
+    fn latest_version(&self, manifest: DesktopAppManifest) -> Result<String, String> {
+        latest_winget_version(manifest)
+    }
+
+    fn execute(
+        &self,
+        manifest: DesktopAppManifest,
+        action: DesktopLifecycleAction,
+        before: &DesktopAppStatus,
+        cancellation: &AtomicBool,
+    ) -> Result<(), String> {
+        match action {
+            DesktopLifecycleAction::Install | DesktopLifecycleAction::Update => {
+                #[cfg(target_os = "windows")]
+                {
+                    run_winget_action(manifest, action, cancellation)
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    run_macos_action(manifest, action, cancellation)
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    Err(format!(
+                        "Automatic desktop {} is not supported on this platform",
+                        action.as_str()
+                    ))
+                }
+            }
+            DesktopLifecycleAction::Uninstall => {
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(identity) = before.package_identity.as_deref() {
+                        uninstall_appx(manifest, identity, cancellation)
+                    } else {
+                        run_winget_uninstall(manifest, cancellation)
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    run_macos_action(manifest, action, cancellation)
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    Err("Automatic desktop uninstall is not supported on this platform".to_string())
+                }
+            }
+        }
+    }
+}
+
+fn detect_after_action_with_runtime(
+    runtime: &dyn DesktopLifecycleRuntime,
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    before: &DesktopAppStatus,
+    cancellation: &AtomicBool,
+) -> Result<DesktopAppStatus, String> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("JOB_CANCELLED".to_string());
+    }
+    let mut last = runtime.probe(manifest)?;
+    if verification_satisfied(action, before, &last) {
+        return Ok(last);
+    }
+    // Store/Appx registration can trail the installer process. Poll briefly
+    // before declaring verification failure, while keeping success tied to a
+    // real post-action probe.
+    for _ in 0..runtime.verification_retries() {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("JOB_CANCELLED".to_string());
+        }
+        std::thread::sleep(runtime.verification_delay());
+        last = runtime.probe(manifest)?;
+        if verification_satisfied(action, before, &last) {
+            return Ok(last);
+        }
+    }
+    Ok(last)
 }
 
 #[tauri::command]
@@ -1007,19 +983,38 @@ pub async fn run_desktop_app_lifecycle_action(
     action: String,
     #[allow(non_snake_case)] jobId: Option<String>,
 ) -> Result<DesktopAppStatus, String> {
+    run_desktop_app_lifecycle_action_with_runtime(
+        state.db.clone(),
+        &operations,
+        app,
+        action,
+        jobId,
+        Arc::new(SystemDesktopLifecycleRuntime),
+    )
+    .await
+}
+
+async fn run_desktop_app_lifecycle_action_with_runtime(
+    db: Arc<crate::database::Database>,
+    operations: &DesktopLifecycleOperationState,
+    app: String,
+    action: String,
+    job_id: Option<String>,
+    runtime: Arc<dyn DesktopLifecycleRuntime>,
+) -> Result<DesktopAppStatus, String> {
     let manifest = manifest(&app)?;
     let action = DesktopLifecycleAction::parse(&action)?;
     let _guard = operations.lock(&app).await;
-    let db = state.db.clone();
-    let job_id = jobId.unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(existing) = state
-        .db
+    let job_id = job_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(existing) = db
         .get_lifecycle_job(&job_id)
         .map_err(|error| error.to_string())?
     {
         let existing = job_from_record(existing)?;
-        if let Some(status) = existing.post_probe {
-            return Ok(status);
+        if existing.state == "succeeded" {
+            if let Some(status) = existing.post_probe {
+                return Ok(status);
+            }
         }
         return Err(existing
             .error_message
@@ -1028,7 +1023,7 @@ pub async fn run_desktop_app_lifecycle_action(
     let cancellation = operations.register_job(&job_id).await;
     let result = tokio::task::spawn_blocking({
         let job_id = job_id.clone();
-        move || run_lifecycle_job(db, job_id, manifest, action, cancellation)
+        move || run_lifecycle_job(db, job_id, manifest, action, cancellation, runtime)
     })
     .await
     .map_err(|error| format!("Desktop lifecycle task failed: {error}"))?;
@@ -1069,6 +1064,7 @@ fn run_lifecycle_job(
     manifest: DesktopAppManifest,
     action: DesktopLifecycleAction,
     cancellation: Arc<AtomicBool>,
+    runtime: Arc<dyn DesktopLifecycleRuntime>,
 ) -> Result<DesktopAppStatus, String> {
     let created_at = now();
     let mut job = DesktopLifecycleJob {
@@ -1102,7 +1098,7 @@ fn run_lifecycle_job(
     });
     save_job(&db, &job)?;
 
-    let before = match detect_desktop_app(manifest) {
+    let before = match runtime.probe(manifest) {
         Ok(status) => status,
         Err(error) => return Err(fail_job(&db, &mut job, "APP_PROBE_FAILED", error)),
     };
@@ -1137,100 +1133,48 @@ fn run_lifecycle_job(
     });
     save_job(&db, &job)?;
     let execute_result = match action {
-        DesktopLifecycleAction::Install => {
-            if before.installed {
-                Err(format!("{} is already installed", manifest.display_name))
-            } else {
-                #[cfg(target_os = "windows")]
-                {
-                    run_winget_action(manifest, action, &cancellation)
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    run_macos_action(manifest, action, &cancellation)
-                }
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                {
-                    Err(
-                        "Automatic desktop installation is not supported on this platform"
-                            .to_string(),
-                    )
-                }
-            }
+        DesktopLifecycleAction::Install if before.installed => {
+            Err(format!("{} is already installed", manifest.display_name))
         }
-        DesktopLifecycleAction::Update => {
-            if !before.installed {
-                Err(format!("{} is not installed", manifest.display_name))
-            } else {
-                match latest_winget_version(manifest) {
-                    Ok(latest) => {
-                        let current = before.version.as_deref().unwrap_or_default();
-                        if !version_is_newer(&latest, current) {
-                            let mut current_status = before.clone();
-                            current_status.latest_version = Some(latest);
-                            job.post_probe = Some(current_status.clone());
-                            job.state = "succeeded".to_string();
-                            job.logs.push(DesktopLifecycleLogEntry {
-                                at: now(),
-                                level: "info".to_string(),
-                                step: "completed".to_string(),
-                                message: "当前已是最新版本，无需更新".to_string(),
-                            });
-                            job.completed_at = Some(now());
-                            save_job(&db, &job)?;
-                            return Ok(current_status);
-                        }
-                        #[cfg(target_os = "windows")]
-                        {
-                            run_winget_action(manifest, action, &cancellation)
-                        }
-                        #[cfg(target_os = "macos")]
-                        {
-                            run_macos_action(manifest, action, &cancellation)
-                        }
-                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                        {
-                            Err(
-                                "Automatic desktop updates are not supported on this platform"
-                                    .to_string(),
-                            )
-                        }
-                    }
-                    Err(error) => Err(error),
-                }
-            }
+        DesktopLifecycleAction::Update if !before.installed => {
+            Err(format!("{} is not installed", manifest.display_name))
         }
-        DesktopLifecycleAction::Uninstall => {
-            if !before.installed {
-                job.post_probe = Some(before.clone());
-                job.state = "succeeded".to_string();
-                job.logs.push(DesktopLifecycleLogEntry {
-                    at: now(),
-                    level: "info".to_string(),
-                    step: "completed".to_string(),
-                    message: "应用已经处于未安装状态，无需卸载".to_string(),
-                });
-                job.completed_at = Some(now());
-                save_job(&db, &job)?;
-                return Ok(before);
-            }
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(identity) = before.package_identity.as_deref() {
-                    uninstall_appx(manifest, identity, &cancellation)
-                } else {
-                    run_winget_uninstall(manifest, &cancellation)
+        DesktopLifecycleAction::Update => match runtime.latest_version(manifest) {
+            Ok(latest) => {
+                let current = before.version.as_deref().unwrap_or_default();
+                if !version_is_newer(&latest, current) {
+                    let mut current_status = before.clone();
+                    current_status.latest_version = Some(latest);
+                    job.post_probe = Some(current_status.clone());
+                    job.state = "succeeded".to_string();
+                    job.logs.push(DesktopLifecycleLogEntry {
+                        at: now(),
+                        level: "info".to_string(),
+                        step: "completed".to_string(),
+                        message: "当前已是最新版本，无需更新".to_string(),
+                    });
+                    job.completed_at = Some(now());
+                    save_job(&db, &job)?;
+                    return Ok(current_status);
                 }
+                runtime.execute(manifest, action, &before, &cancellation)
             }
-            #[cfg(target_os = "macos")]
-            {
-                run_macos_action(manifest, action, &cancellation)
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                Err("Automatic desktop uninstall is not supported on this platform".to_string())
-            }
+            Err(error) => Err(error),
+        },
+        DesktopLifecycleAction::Uninstall if !before.installed => {
+            job.post_probe = Some(before.clone());
+            job.state = "succeeded".to_string();
+            job.logs.push(DesktopLifecycleLogEntry {
+                at: now(),
+                level: "info".to_string(),
+                step: "completed".to_string(),
+                message: "应用已经处于未安装状态，无需卸载".to_string(),
+            });
+            job.completed_at = Some(now());
+            save_job(&db, &job)?;
+            return Ok(before);
         }
+        _ => runtime.execute(manifest, action, &before, &cancellation),
     };
     if let Err(error) = execute_result {
         let code = if error == "JOB_CANCELLED" {
@@ -1263,7 +1207,13 @@ fn run_lifecycle_job(
         message: "安装器已结束，正在重新检测版本和安装状态".to_string(),
     });
     save_job(&db, &job)?;
-    let mut after = match detect_after_action(manifest, action, &before, &cancellation) {
+    let mut after = match detect_after_action_with_runtime(
+        runtime.as_ref(),
+        manifest,
+        action,
+        &before,
+        &cancellation,
+    ) {
         Ok(status) => status,
         Err(error) if error == "JOB_CANCELLED" => {
             job.state = "cancelled".to_string();
@@ -1453,6 +1403,91 @@ pub async fn launch_desktop_app(app: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct FakeDesktopLifecycleRuntime {
+        probes: Mutex<Vec<Result<DesktopAppStatus, String>>>,
+        latest_version: Result<String, String>,
+        execution_result: Result<(), String>,
+        executions: Mutex<Vec<DesktopLifecycleAction>>,
+    }
+
+    impl FakeDesktopLifecycleRuntime {
+        fn new(
+            probes: Vec<Result<DesktopAppStatus, String>>,
+            latest_version: Result<&str, &str>,
+            execution_result: Result<(), &str>,
+        ) -> Self {
+            Self {
+                probes: Mutex::new(probes),
+                latest_version: latest_version.map(str::to_string).map_err(str::to_string),
+                execution_result: execution_result.map_err(str::to_string),
+                executions: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn executions(&self) -> Vec<DesktopLifecycleAction> {
+            self.executions.lock().expect("execution lock").clone()
+        }
+    }
+
+    impl DesktopLifecycleRuntime for FakeDesktopLifecycleRuntime {
+        fn probe(&self, _manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String> {
+            self.probes.lock().expect("probe lock").remove(0)
+        }
+
+        fn latest_version(&self, _manifest: DesktopAppManifest) -> Result<String, String> {
+            self.latest_version.clone()
+        }
+
+        fn verification_retries(&self) -> usize {
+            0
+        }
+
+        fn verification_delay(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+
+        fn execute(
+            &self,
+            _manifest: DesktopAppManifest,
+            action: DesktopLifecycleAction,
+            _before: &DesktopAppStatus,
+            cancellation: &AtomicBool,
+        ) -> Result<(), String> {
+            self.executions.lock().expect("execution lock").push(action);
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("JOB_CANCELLED".to_string());
+            }
+            self.execution_result.clone()
+        }
+    }
+
+    async fn run_fake_lifecycle(
+        db: Arc<crate::database::Database>,
+        runtime: Arc<FakeDesktopLifecycleRuntime>,
+        app: &str,
+        action: &str,
+        job_id: &str,
+    ) -> Result<DesktopAppStatus, String> {
+        run_desktop_app_lifecycle_action_with_runtime(
+            db,
+            &DesktopLifecycleOperationState::default(),
+            app.to_string(),
+            action.to_string(),
+            Some(job_id.to_string()),
+            runtime,
+        )
+        .await
+    }
+
+    fn saved_job(db: &crate::database::Database, job_id: &str) -> DesktopLifecycleJob {
+        db.get_lifecycle_job(job_id)
+            .expect("load job")
+            .map(job_from_record)
+            .expect("job exists")
+            .expect("parse job")
+    }
 
     #[test]
     fn desktop_registry_rejects_unknown_apps() {
@@ -1580,5 +1615,197 @@ mod tests {
         assert_eq!(restored.logs.len(), 1);
         assert_eq!(restored.logs[0].step, "verifying");
         assert_eq!(restored.logs[0].message, "正在重新检测安装结果");
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_persists_install_success_and_replays_only_verified_success() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(false, None)), Ok(status(true, Some("1.0.0")))],
+            Ok("1.0.0"),
+            Ok(()),
+        ));
+
+        let completed = run_fake_lifecycle(
+            db.clone(),
+            runtime.clone(),
+            "codex-desktop",
+            "install",
+            "desktop-install",
+        )
+        .await
+        .expect("install succeeds");
+        assert!(completed.installed);
+        assert_eq!(runtime.executions(), vec![DesktopLifecycleAction::Install]);
+
+        let job = saved_job(&db, "desktop-install");
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.pre_probe, Some(status(false, None)));
+        assert_eq!(job.post_probe, Some(status(true, Some("1.0.0"))));
+        assert!(job.completed_at.is_some());
+
+        let replay = run_fake_lifecycle(
+            db,
+            runtime.clone(),
+            "codex-desktop",
+            "install",
+            "desktop-install",
+        )
+        .await
+        .expect("successful verified job replays");
+        assert_eq!(replay.version.as_deref(), Some("1.0.0"));
+        assert_eq!(runtime.executions(), vec![DesktopLifecycleAction::Install]);
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_persists_update_success_and_noop_without_execution() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let update_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![
+                Ok(status(true, Some("1.0.0"))),
+                Ok(status(true, Some("1.1.0"))),
+            ],
+            Ok("1.1.0"),
+            Ok(()),
+        ));
+        run_fake_lifecycle(
+            db.clone(),
+            update_runtime.clone(),
+            "codex-desktop",
+            "update",
+            "desktop-update",
+        )
+        .await
+        .expect("update succeeds");
+        assert_eq!(
+            update_runtime.executions(),
+            vec![DesktopLifecycleAction::Update]
+        );
+        assert_eq!(
+            saved_job(&db, "desktop-update")
+                .post_probe
+                .and_then(|probe| probe.version),
+            Some("1.1.0".to_string())
+        );
+
+        let noop_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(true, Some("1.1.0")))],
+            Ok("1.1.0"),
+            Ok(()),
+        ));
+        let completed = run_fake_lifecycle(
+            db.clone(),
+            noop_runtime.clone(),
+            "codex-desktop",
+            "update",
+            "desktop-update-noop",
+        )
+        .await
+        .expect("current update is a no-op");
+        assert_eq!(completed.latest_version.as_deref(), Some("1.1.0"));
+        assert!(noop_runtime.executions().is_empty());
+        assert_eq!(saved_job(&db, "desktop-update-noop").state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_persists_uninstall_noop_and_verification_failure() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let noop_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(false, None))],
+            Ok("1.0.0"),
+            Ok(()),
+        ));
+        run_fake_lifecycle(
+            db.clone(),
+            noop_runtime.clone(),
+            "codex-desktop",
+            "uninstall",
+            "desktop-uninstall-noop",
+        )
+        .await
+        .expect("absent uninstall is a no-op");
+        assert!(noop_runtime.executions().is_empty());
+        assert_eq!(saved_job(&db, "desktop-uninstall-noop").state, "succeeded");
+
+        let verification_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(false, None)), Ok(status(false, None))],
+            Ok("1.0.0"),
+            Ok(()),
+        ));
+        let error = run_fake_lifecycle(
+            db.clone(),
+            verification_runtime.clone(),
+            "codex-desktop",
+            "install",
+            "desktop-verification-failure",
+        )
+        .await
+        .expect_err("unchanged post-probe fails verification");
+        assert!(error.contains("not detected"));
+        let job = saved_job(&db, "desktop-verification-failure");
+        assert_eq!(job.state, "failed");
+        assert_eq!(
+            job.error_code.as_deref(),
+            Some("POST_INSTALL_VERIFICATION_FAILED")
+        );
+        assert_eq!(job.post_probe, Some(status(false, None)));
+
+        let duplicate_error = run_fake_lifecycle(
+            db,
+            verification_runtime,
+            "codex-desktop",
+            "install",
+            "desktop-verification-failure",
+        )
+        .await
+        .expect_err("failed job id does not replay post-probe");
+        assert_eq!(duplicate_error, error);
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_persists_execution_failure_and_cancellation() {
+        let db = Arc::new(crate::database::Database::memory().expect("memory database"));
+        let failed_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(true, Some("1.0.0")))],
+            Ok("1.1.0"),
+            Err("installer failed"),
+        ));
+        let error = run_fake_lifecycle(
+            db.clone(),
+            failed_runtime,
+            "codex-desktop",
+            "update",
+            "desktop-execution-failure",
+        )
+        .await
+        .expect_err("execution fails");
+        assert_eq!(error, "installer failed");
+        let job = saved_job(&db, "desktop-execution-failure");
+        assert_eq!(job.state, "failed");
+        assert_eq!(
+            job.error_code.as_deref(),
+            Some("LIFECYCLE_EXECUTION_FAILED")
+        );
+        assert!(job.post_probe.is_none());
+
+        let cancelled_runtime = Arc::new(FakeDesktopLifecycleRuntime::new(
+            vec![Ok(status(true, Some("1.0.0")))],
+            Ok("1.1.0"),
+            Err("JOB_CANCELLED"),
+        ));
+        let error = run_fake_lifecycle(
+            db.clone(),
+            cancelled_runtime,
+            "codex-desktop",
+            "update",
+            "desktop-cancelled",
+        )
+        .await
+        .expect_err("execution cancellation fails request");
+        assert_eq!(error, "操作已停止");
+        let job = saved_job(&db, "desktop-cancelled");
+        assert_eq!(job.state, "cancelled");
+        assert_eq!(job.error_code.as_deref(), Some("JOB_CANCELLED"));
+        assert!(job.completed_at.is_some());
     }
 }

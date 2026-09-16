@@ -66,6 +66,39 @@ describe("ProviderActions Pi provider switching", () => {
     expect(screen.queryByTitle("provider.duplicate")).not.toBeInTheDocument();
   });
 
+  it("keeps managed local mutations blocked while allowing an owning edit target", async () => {
+    const user = userEvent.setup();
+    const onEdit = vi.fn();
+    const onDuplicate = vi.fn();
+    const onDelete = vi.fn();
+
+    render(
+      <ProviderActions
+        appId="codex"
+        isCurrent={false}
+        isEditDisabled={false}
+        isDeleteDisabled
+        onSwitch={vi.fn()}
+        onEdit={onEdit}
+        onDuplicate={onDuplicate}
+        onDelete={onDelete}
+      />,
+    );
+
+    const editButton = screen.getByRole("button", { name: "common.edit" });
+    expect(editButton).toBeEnabled();
+    // Duplicate is preserved for managed projections
+    expect(screen.queryByTitle("provider.duplicate")).toBeInTheDocument();
+    // Delete is disabled, not absent
+    const deleteButton = screen.queryByRole("button", { name: "common.delete" });
+    expect(deleteButton).toBeDisabled();
+
+    await user.click(editButton);
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(onDuplicate).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
   it("enables a provider that is not in Pi", async () => {
     const user = userEvent.setup();
     const { onSwitch } = renderPiActions({});

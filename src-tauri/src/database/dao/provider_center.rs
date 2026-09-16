@@ -48,12 +48,32 @@ fn parse_json<T: serde::de::DeserializeOwned>(text: &str, field: &str) -> Result
         .map_err(|error| AppError::Database(format!("解析 {field} 失败: {error}")))
 }
 
+fn source_id(provider_id: &str, source: &ProviderSource) -> String {
+    format!(
+        "source:{provider_id}:{}:{}",
+        source.source_app, source.source_ref
+    )
+}
+
+fn provider_sources(definition: &ProviderDefinition) -> Vec<ProviderSource> {
+    let mut sources = definition.sources.clone();
+    if let Some(source) = definition.source.clone() {
+        if !sources.iter().any(|item| {
+            item.source_app == source.source_app && item.source_ref == source.source_ref
+        }) {
+            sources.insert(0, source);
+        }
+    }
+    sources
+}
+
 fn upsert_definition_tx(
     tx: &Transaction<'_>,
     definition: &ProviderDefinition,
 ) -> Result<(), AppError> {
     let metadata = to_json_string(&json!({
         "discoveredModels": definition.discovered_models,
+        "modelDefinitions": definition.model_definitions,
         "lastDiscoveryAt": definition.last_discovery_at,
         "lastDiscoveryError": definition.last_discovery_error,
     }))?;
@@ -105,19 +125,25 @@ fn upsert_definition_tx(
         .map_err(|error| AppError::Database(format!("保存模型失败: {error}")))?;
     }
 
-    tx.execute(
-        "DELETE FROM provider_sources WHERE provider_id = ?1",
-        params![definition.id],
-    )
-    .map_err(|error| AppError::Database(format!("更新导入来源失败: {error}")))?;
-    if let Some(source) = &definition.source {
+    for source in provider_sources(definition) {
+        tx.execute(
+            "DELETE FROM provider_sources
+             WHERE provider_id = ?1
+               AND source_app_type = ?2
+               AND COALESCE(source_provider_id, source_locator) = ?3",
+            params![definition.id, source.source_app, source.source_ref],
+        )
+        .map_err(|error| AppError::Database(format!("更新导入来源失败: {error}")))?;
         tx.execute(
             "INSERT INTO provider_sources (
                 id, provider_id, source_app_type, source_provider_id,
                 source_locator, source_fingerprint, imported_at, last_observed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                source_fingerprint = excluded.source_fingerprint,
+                last_observed_at = excluded.last_observed_at",
             params![
-                format!("source:{}", definition.id),
+                source_id(&definition.id, &source),
                 definition.id,
                 source.source_app,
                 source.source_ref,
@@ -143,6 +169,7 @@ fn upsert_binding_tx(
     let overrides = to_json_string(&json!({
         "enabled": binding.enabled,
         "overrideEnabled": binding.override_enabled,
+        "providerTemplate": binding.provider_template,
     }))?;
     tx.execute(
         "INSERT INTO provider_bindings (
@@ -351,6 +378,30 @@ impl Database {
         session_id: &str,
         candidate_id: &str,
         state_json: &str,
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let changed = tx
+            .execute(
+                "UPDATE provider_import_candidates
+                 SET conflict_json = ?3
+                 WHERE id = ?1 AND session_id = ?2",
+                params![candidate_id, session_id, state_json],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        if changed == 0 {
+            return Err(AppError::Message("导入候选不存在".to_string()));
+        }
+        tx.commit()
+            .map_err(|error| AppError::Database(error.to_string()))
+    }
+
+    pub fn clear_provider_import_candidate_secret_ref(
+        &self,
+        session_id: &str,
+        candidate_id: &str,
         completed_at: i64,
     ) -> Result<(), AppError> {
         let mut conn = lock_conn!(self.conn);
@@ -360,9 +411,9 @@ impl Database {
         let changed = tx
             .execute(
                 "UPDATE provider_import_candidates
-                 SET conflict_json = ?3, temporary_secret_ref = NULL
+                 SET temporary_secret_ref = NULL
                  WHERE id = ?1 AND session_id = ?2",
-                params![candidate_id, session_id, state_json],
+                params![candidate_id, session_id],
             )
             .map_err(|error| AppError::Database(error.to_string()))?;
         if changed == 0 {
@@ -372,7 +423,8 @@ impl Database {
             .query_row(
                 "SELECT COUNT(*) FROM provider_import_candidates
                  WHERE session_id = ?1
-                   AND (conflict_json IS NULL
+                   AND (temporary_secret_ref IS NOT NULL
+                        OR conflict_json IS NULL
                         OR json_valid(conflict_json) = 0
                         OR (json_extract(conflict_json, '$.outcome') IS NULL
                             AND json_extract(conflict_json, '$.quarantine') IS NULL))",
@@ -557,25 +609,29 @@ impl Database {
             let models = model_rows
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| AppError::Database(error.to_string()))?;
-            let source = conn
-                .query_row(
+            let mut source_stmt = conn
+                .prepare(
                     "SELECT source_app_type, COALESCE(source_provider_id, source_locator), imported_at,
                             source_fingerprint, last_observed_at
                      FROM provider_sources WHERE provider_id = ?1
-                     ORDER BY imported_at ASC LIMIT 1",
-                    params![id],
-                    |source_row| {
-                        Ok(ProviderSource {
-                            source_app: source_row.get(0)?,
-                            source_ref: source_row.get(1)?,
-                            imported_at: source_row.get(2)?,
-                            source_fingerprint: source_row.get(3)?,
-                            last_observed_at: source_row.get(4)?,
-                        })
-                    },
+                     ORDER BY imported_at ASC, source_app_type ASC, source_locator ASC",
                 )
-                .optional()
                 .map_err(|error| AppError::Database(error.to_string()))?;
+            let source_rows = source_stmt
+                .query_map(params![id], |source_row| {
+                    Ok(ProviderSource {
+                        source_app: source_row.get(0)?,
+                        source_ref: source_row.get(1)?,
+                        imported_at: source_row.get(2)?,
+                        source_fingerprint: source_row.get(3)?,
+                        last_observed_at: source_row.get(4)?,
+                    })
+                })
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            let sources = source_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            let source = sources.first().cloned();
             definitions.push(ProviderDefinition {
                 id,
                 name,
@@ -589,10 +645,18 @@ impl Database {
                     .transpose()
                     .map_err(|error| AppError::Database(error.to_string()))?
                     .unwrap_or_default(),
+                model_definitions: metadata
+                    .get("modelDefinitions")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| AppError::Database(error.to_string()))?
+                    .unwrap_or_default(),
                 notes: notes.unwrap_or_default(),
                 enabled,
                 revision: revision.max(1) as u64,
                 source,
+                sources,
                 credential_configured: secret_ref.is_some(),
                 credential_hint: None,
                 last_discovery_at: metadata.get("lastDiscoveryAt").and_then(Value::as_i64),
@@ -658,6 +722,13 @@ impl Database {
                     .get("overrideEnabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                provider_template: overrides
+                    .get("providerTemplate")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| AppError::Database(error.to_string()))?,
                 applied_revision: applied_revision.map(|value| value.max(0) as u64),
                 expected_fingerprint,
                 last_error,
@@ -882,6 +953,7 @@ mod tests {
             protocol: "openai-chat".to_string(),
             base_url: "https://example.test/v1".to_string(),
             models: vec!["model-a".to_string(), "model-b".to_string()],
+            model_definitions: Vec::new(),
             discovered_models: vec!["model-c".to_string()],
             notes: "test".to_string(),
             enabled: true,
@@ -893,6 +965,13 @@ mod tests {
                 source_fingerprint: Some("fingerprint".to_string()),
                 last_observed_at: Some(100),
             }),
+            sources: vec![ProviderSource {
+                source_app: "codex".to_string(),
+                source_ref: "saved:codex:origin".to_string(),
+                imported_at: 100,
+                source_fingerprint: Some("fingerprint".to_string()),
+                last_observed_at: Some(100),
+            }],
             credential_configured: false,
             credential_hint: None,
             last_discovery_at: Some(200),
@@ -906,6 +985,7 @@ mod tests {
             status: "pending".to_string(),
             enabled: true,
             override_enabled: false,
+            provider_template: None,
             applied_revision: None,
             expected_fingerprint: None,
             last_error: None,
@@ -930,6 +1010,34 @@ mod tests {
         );
         assert_eq!(
             loaded_definitions[0].source.as_ref().unwrap().source_ref,
+            "saved:codex:origin"
+        );
+        let mut merged = loaded_definitions[0].clone();
+        merged.revision = 4;
+        merged.updated_at = 30;
+        merged.sources.push(ProviderSource {
+            source_app: "gemini".to_string(),
+            source_ref: "live:gemini".to_string(),
+            imported_at: 200,
+            source_fingerprint: Some("other-fingerprint".to_string()),
+            last_observed_at: Some(210),
+        });
+        db.save_provider_center_core(std::slice::from_ref(&merged), &loaded_bindings)
+            .expect("save merged provenance");
+        let with_multiple_sources = db
+            .load_provider_center_definitions()
+            .expect("reload merged provenance");
+        assert_eq!(with_multiple_sources[0].sources.len(), 2);
+        assert!(with_multiple_sources[0]
+            .sources
+            .iter()
+            .any(|source| source.source_ref == "saved:codex:origin"));
+        assert!(with_multiple_sources[0]
+            .sources
+            .iter()
+            .any(|source| source.source_ref == "live:gemini"));
+        assert_eq!(
+            with_multiple_sources[0].source.as_ref().unwrap().source_ref,
             "saved:codex:origin"
         );
         assert_eq!(loaded_bindings.len(), 1);
@@ -987,11 +1095,39 @@ mod tests {
                 .len(),
             1
         );
-        let refs = db.expire_provider_import_sessions(101).unwrap();
-        assert_eq!(refs, vec!["temporary-secret".to_string()]);
+        db.update_provider_import_candidate_state(
+            &session.id,
+            &candidate.id,
+            r#"{"outcome":{"action":"skip","providerId":null}}"#,
+        )
+        .expect("persist candidate outcome");
+        assert_eq!(
+            db.get_provider_import_candidate(&session.id, &candidate.id)
+                .unwrap()
+                .and_then(|candidate| candidate.temporary_secret_ref),
+            Some("temporary-secret".to_string()),
+            "the temporary secret remains addressable until secure cleanup succeeds"
+        );
+        db.clear_provider_import_candidate_secret_ref(&session.id, &candidate.id, 61)
+            .expect("clear temporary secret reference");
         assert!(db
-            .list_provider_import_candidates(&session.id)
+            .get_provider_import_candidate(&session.id, &candidate.id)
             .unwrap()
-            .is_empty());
+            .is_some_and(|candidate| candidate.temporary_secret_ref.is_none()));
+        assert_eq!(
+            db.get_provider_import_session(&session.id)
+                .expect("load completed session")
+                .map(|session| session.state),
+            Some("completed".to_string())
+        );
+        let refs = db.expire_provider_import_sessions(101).unwrap();
+        assert!(refs.is_empty());
+        assert_eq!(
+            db.list_provider_import_candidates(&session.id)
+                .unwrap()
+                .len(),
+            1,
+            "completed sessions retain the outcome for idempotent retries"
+        );
     }
 }

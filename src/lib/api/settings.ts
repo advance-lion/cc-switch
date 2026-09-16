@@ -31,44 +31,47 @@ export interface WebDavSyncResult {
   status: string;
 }
 
-export interface CodexAssistantPlanStep {
-  label: string;
-  description: string;
-  requiresNetwork: boolean;
-}
-
-export interface CodexAssistantPlan {
-  title: string;
-  summary: string;
-  sources: string[];
-  steps: CodexAssistantPlanStep[];
-  limitations: string[];
-  executable: boolean;
-  install?: CodexAssistantInstallSummary | null;
-}
-
-export interface CodexAssistantInstallSummary {
-  tool: string;
-  displayName: string;
-  version: string;
-  installLocation: string;
-  usesDefaultLocation: boolean;
-  officialSource: string;
-}
-
 export interface CodexAssistantChatTurn {
   role: "user" | "assistant";
   content: string;
 }
 
-export interface CodexAssistantEvent {
-  runId: string;
-  kind: "started" | "log" | "stderr" | "plan" | "message" | "finished";
-  message?: string | null;
-  planId?: string | null;
-  plan?: CodexAssistantPlan | null;
-  success?: boolean | null;
+export type CodexAssistantApprovalDecision =
+  | "accept"
+  | "acceptForSession"
+  | "decline"
+  | "cancel";
+
+export interface CodexAssistantApproval {
+  id: string;
+  type: "command" | "fileChange";
+  command?: string | null;
+  cwd?: string | null;
+  reason?: string | null;
+  networkHost?: string | null;
+  grantRoot?: string | null;
+  allowForSession: boolean;
+  availableDecisions: CodexAssistantApprovalDecision[];
 }
+
+export type CodexAssistantEvent =
+  | { sessionId: string; kind: "started" }
+  | { sessionId: string; kind: "message"; message: string }
+  | { sessionId: string; kind: "log"; message: string }
+  | { sessionId: string; kind: "stderr"; message: string }
+  | { sessionId: string; kind: "disconnected"; message: string }
+  | {
+      sessionId: string;
+      kind: "approval";
+      approval: CodexAssistantApproval;
+    }
+  | {
+      sessionId: string;
+      kind: "finished";
+      success: boolean;
+      cancelled: boolean;
+      message?: string | null;
+    };
 
 export interface CodexDesktopStatus {
   installed: boolean;
@@ -238,63 +241,70 @@ export const settingsApi = {
     return await invoke("pick_directory", { defaultPath });
   },
 
-  async startCodexAssistantPlan(
-    request: string,
-    targetDir: string,
-    options?: {
-      tool?: string;
-      requestedVersion?: string;
-      customInstallLocation?: boolean;
-    },
-  ): Promise<string> {
-    const body = {
-      request,
-      targetDir,
-      tool: options?.tool,
-      requestedVersion: options?.requestedVersion,
-      customInstallLocation: options?.customInstallLocation,
-    };
+  async startCodexAssistantSession(): Promise<string> {
     if (isCodexAssistantWebBridgeActive()) {
-      const result = await webAssistantRequest<{ runId: string }>(
-        "/plan",
-        body,
+      const result = await webAssistantRequest<{ sessionId: string }>(
+        "/session",
+        {},
       );
-      return result.runId;
+      return result.sessionId;
     }
-    return await invoke("start_codex_assistant_plan", body);
+    return await invoke("start_codex_assistant_session");
   },
 
-  async startCodexAssistantChat(
-    request: string,
-    history: CodexAssistantChatTurn[],
-  ): Promise<string> {
-    const body = { request, history };
+  async sendCodexAssistantMessage(
+    sessionId: string,
+    message: string,
+  ): Promise<void> {
     if (isCodexAssistantWebBridgeActive()) {
-      const result = await webAssistantRequest<{ runId: string }>(
-        "/chat",
-        body,
-      );
-      return result.runId;
-    }
-    return await invoke("start_codex_assistant_chat", body);
-  },
-
-  async executeCodexAssistantPlan(planId: string): Promise<string> {
-    if (isCodexAssistantWebBridgeActive()) {
-      const result = await webAssistantRequest<{ runId: string }>("/execute", {
-        planId,
+      await webAssistantRequest<{ accepted: boolean }>("/message", {
+        sessionId,
+        message,
       });
-      return result.runId;
+      return;
     }
-    return await invoke("execute_codex_assistant_plan", { planId });
+    await invoke("send_codex_assistant_message", { sessionId, message });
   },
 
-  async cancelCodexAssistantRun(runId: string): Promise<boolean> {
+  async respondCodexAssistantApproval(
+    sessionId: string,
+    approvalId: string,
+    decision: CodexAssistantApprovalDecision,
+  ): Promise<void> {
     if (isCodexAssistantWebBridgeActive()) {
-      await webAssistantRequest<{ cancelled: boolean }>("/cancel", { runId });
-      return true;
+      await webAssistantRequest<{ accepted: boolean }>("/approval", {
+        sessionId,
+        approvalId,
+        decision,
+      });
+      return;
     }
-    return await invoke("cancel_codex_assistant_run", { runId });
+    await invoke("respond_codex_assistant_approval", {
+      sessionId,
+      approvalId,
+      decision,
+    });
+  },
+
+  async cancelCodexAssistantRun(sessionId: string): Promise<boolean> {
+    if (isCodexAssistantWebBridgeActive()) {
+      const result = await webAssistantRequest<{ cancelled: boolean }>(
+        "/cancel",
+        { sessionId },
+      );
+      return result.cancelled;
+    }
+    return await invoke("cancel_codex_assistant_run", { sessionId });
+  },
+
+  async closeCodexAssistantSession(sessionId: string): Promise<boolean> {
+    if (isCodexAssistantWebBridgeActive()) {
+      const result = await webAssistantRequest<{ closed: boolean }>("/close", {
+        sessionId,
+      });
+      return result.closed;
+    }
+    return await invoke("close_codex_assistant_session", { sessionId });
   },
 
   async getCodexDesktopStatus(): Promise<CodexDesktopStatus> {

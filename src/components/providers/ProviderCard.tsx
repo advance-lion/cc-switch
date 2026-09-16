@@ -79,6 +79,9 @@ interface ProviderCardProps {
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
   isStateChangeProtected?: boolean;
+  managedByProviderCenter?: boolean;
+  onManageScope?: () => void;
+  onManagedDelete?: () => void;
   onSetAsDefault?: (modelId?: string) => void;
 }
 
@@ -196,6 +199,9 @@ export function ProviderCard({
   isDefaultModel,
   isRemovalProtected,
   isStateChangeProtected,
+  managedByProviderCenter = false,
+  onManageScope,
+  onManagedDelete,
   onSetAsDefault,
 }: ProviderCardProps) {
   const { t } = useTranslation();
@@ -299,6 +305,7 @@ export function ProviderCard({
   // read-only here — writes have to go through Hermes Web UI.
   const isHermesReadOnly =
     appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
+  const isReadOnly = isHermesReadOnly;
   const isCodexOauth =
     appId === "codex"
       ? isBoundCodexOfficial
@@ -499,11 +506,31 @@ export function ProviderCard({
                   <FailoverPriorityBadge priority={failoverPriority} />
                 )}
 
+              {managedByProviderCenter && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onManageScope?.();
+                  }}
+                  className="inline-flex cursor-pointer items-center rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 transition-colors hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-200 dark:hover:bg-sky-900/60"
+                  title={t("provider.providerCenterManagedHint", {
+                    defaultValue:
+                      "通用 Provider；点击管理使用范围",
+                  })}
+                >
+                  {t("provider.providerCenterManaged", {
+                    defaultValue: "通用",
+                  })}
+                </button>
+              )}
+
               {isHermesReadOnly && (
                 <span
                   className="inline-flex items-center rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700/60 dark:text-slate-200"
                   title={t("provider.managedByHermesHint", {
-                    defaultValue: "由 Hermes 管理，请在 Hermes Web UI 中编辑",
+                    defaultValue:
+                      "由 Hermes 管理，请在 Hermes Web UI 中编辑",
                   })}
                 >
                   {t("provider.managedByHermes", {
@@ -688,7 +715,17 @@ export function ProviderCard({
               isTesting={isTesting}
               isProxyTakeover={isProxyTakeover}
               isOfficialBlockedByProxy={isOfficialBlockedByProxy}
-              isReadOnly={isHermesReadOnly}
+              isReadOnly={isReadOnly}
+              isEditDisabled={isHermesReadOnly}
+              isDeleteDisabled={isHermesReadOnly}
+              isManagedDelete={managedByProviderCenter}
+              onDelete={() => {
+                if (managedByProviderCenter && onManagedDelete) {
+                  onManagedDelete();
+                } else {
+                  onDelete(provider);
+                }
+              }}
               isOmo={isAnyOmo}
               onSwitch={() => onSwitch(provider)}
               onEdit={() => onEdit(provider)}
@@ -711,7 +748,6 @@ export function ProviderCard({
                   ? undefined
                   : () => onConfigureUsage(provider)
               }
-              onDelete={() => onDelete(provider)}
               onRemoveFromConfig={
                 onRemoveFromConfig
                   ? () => onRemoveFromConfig(provider)

@@ -55,7 +55,12 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 19;
+///
+/// 注意：v19 的 provider center / lifecycle 表由 `create_tables_on_conn`
+/// 无条件创建（`IF NOT EXISTS`），因此 v18→v19 迁移是冗余的。将
+/// SCHEMA_VERSION 保持为 18 可让官方 CC Switch 打开同一数据库。
+/// 已有 v19 数据库会在 `apply_schema_migrations_on_conn` 中静默降级。
+pub(crate) const SCHEMA_VERSION: i32 = 18;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -173,6 +178,9 @@ impl Database {
     ///
     /// 用于初始化失败后判断是否为「数据库版本过新（应用过旧，需升级应用）」的可恢复
     /// 场景——此时不应反复弹出无效的重试对话框，而应引导用户在应用内升级。
+    ///
+    /// v19（旧 dev 版本）被视为兼容：provider center 表已由 `create_tables`
+    /// 创建，v18→v19 迁移是冗余的，`apply_schema_migrations_on_conn` 会静默降级。
     pub fn stored_user_version_exceeds_supported(
         db_path: &std::path::Path,
     ) -> Result<Option<i32>, AppError> {
@@ -181,7 +189,11 @@ impl Database {
         }
         let conn = Connection::open(db_path).map_err(|e| AppError::Database(e.to_string()))?;
         let version = Self::get_user_version(&conn)?;
-        Ok((version > SCHEMA_VERSION).then_some(version))
+        if version > SCHEMA_VERSION && version != SCHEMA_VERSION + 1 {
+            Ok(Some(version))
+        } else {
+            Ok(None)
+        }
     }
 
     /// 创建内存数据库（用于测试）

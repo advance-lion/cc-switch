@@ -449,11 +449,22 @@ impl Database {
         let mut version = Self::get_user_version(conn)?;
 
         if version > SCHEMA_VERSION {
-            conn.execute("ROLLBACK TO schema_migration;", []).ok();
-            conn.execute("RELEASE schema_migration;", []).ok();
-            return Err(AppError::Database(format!(
-                "数据库版本过新（{version}），当前应用仅支持 {SCHEMA_VERSION}，请升级应用后再尝试。"
-            )));
+            // v19（旧 dev 版本）静默降级到 v18：provider center 表已由
+            // create_tables_on_conn 创建，v18→v19 迁移是冗余的。
+            if version == SCHEMA_VERSION + 1 {
+                log::info!(
+                    "静默降级数据库从 v{} 到 v{SCHEMA_VERSION}（v19 表已由 create_tables 创建）",
+                    version
+                );
+                Self::set_user_version(conn, SCHEMA_VERSION)?;
+                version = SCHEMA_VERSION;
+            } else {
+                conn.execute("ROLLBACK TO schema_migration;", []).ok();
+                conn.execute("RELEASE schema_migration;", []).ok();
+                return Err(AppError::Database(format!(
+                    "数据库版本过新（{version}），当前应用仅支持 {SCHEMA_VERSION}，请升级应用后再尝试。"
+                )));
+            }
         }
 
         let result = (|| {
@@ -3866,6 +3877,9 @@ mod tests {
     #[test]
     fn migrate_v18_to_v19_creates_provider_center_and_lifecycle_tables() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
+        // create_tables_on_conn creates ALL tables (including provider center)
+        // regardless of schema version; the v18→v19 migration is redundant.
+        Database::create_tables_on_conn(&conn)?;
         Database::set_user_version(&conn, 18)?;
 
         Database::apply_schema_migrations_on_conn(&conn)?;
@@ -3887,6 +3901,21 @@ mod tests {
                 "missing table {table}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v19_silently_downgrades_to_v18() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&conn)?;
+        Database::set_user_version(&conn, SCHEMA_VERSION + 1)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        // Provider center tables must still exist after downgrade.
+        assert!(Database::table_exists(&conn, "provider_definitions")?);
+        assert!(Database::table_exists(&conn, "lifecycle_jobs")?);
         Ok(())
     }
 }

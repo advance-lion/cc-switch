@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import { invoke } from "@tauri-apps/api/core";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Plus,
   Settings,
@@ -35,10 +35,17 @@ import { proxyKeys, useProvidersQuery, useSettingsQuery } from "@/lib/query";
 import {
   piApi,
   providersApi,
+  providerCenterApi,
   settingsApi,
   type AppId,
   type ProviderSwitchEvent,
 } from "@/lib/api";
+import type {
+  ManagedProviderDraftInput,
+  ProviderApplyPreview,
+  ProviderCenterApp,
+} from "@/lib/api/providerCenter";
+import { PROVIDER_CENTER_APP_LABELS } from "@/components/providers/providerCenterApps";
 import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
 import { useProviderActions } from "@/hooks/useProviderActions";
 import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
@@ -72,6 +79,8 @@ import {
 } from "@/components/assistant/CodexAssistantDock";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import { ProviderScopeDialog } from "@/components/providers/ProviderScopeDialog";
+import { ProviderDeleteDialog } from "@/components/providers/ProviderDeleteDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
@@ -268,6 +277,63 @@ function App() {
   const effectiveEditingProvider = useLastValidValue(editingProvider);
   const effectiveUsageProvider = useLastValidValue(usageProvider);
 
+  const { data: agentProviderCatalog } = useQuery({
+    queryKey: ["provider-center", "agent-catalog", activeApp],
+    queryFn: () => providerCenterApi.getAgentProviderCatalog(activeApp),
+    enabled: Boolean(activeApp),
+    staleTime: 30_000,
+  });
+
+  const { data: providerCenterState } = useQuery({
+    queryKey: ["provider-center", "state"],
+    queryFn: () => providerCenterApi.get(),
+    staleTime: 30_000,
+  });
+
+  // Provider Center managed projection lookup for the currently edited provider.
+  const editingManagedContext = useMemo(() => {
+    if (!editingProvider || !agentProviderCatalog) return undefined;
+    const item = agentProviderCatalog.items.find(
+      (i) => i.providerId === editingProvider.id,
+    );
+    if (item?.ownership === "providerCenterProjection" && item?.definitionId) {
+      const definition = providerCenterState?.definitions.find(
+        (d) => d.id === item.definitionId,
+      );
+      const targetAppTypes = (providerCenterState?.bindings ?? [])
+        .filter((b) => b.providerId === item.definitionId && b.enabled)
+        .map((b) => b.appType);
+      return {
+        definitionId: item.definitionId,
+        expectedRevision: definition?.revision,
+        targetAppTypes,
+      };
+    }
+    return undefined;
+  }, [editingProvider, agentProviderCatalog, providerCenterState]);
+
+  const editingBindingCount = useMemo(() => {
+    if (!editingManagedContext || !providerCenterState) return undefined;
+    return providerCenterState.bindings.filter(
+      (b) =>
+        b.providerId === editingManagedContext.definitionId && b.enabled,
+    ).length;
+  }, [editingManagedContext, providerCenterState]);
+
+  const [managedEditPreview, setManagedEditPreview] = useState<{
+    preview: ProviderApplyPreview;
+    input: ManagedProviderDraftInput;
+  } | null>(null);
+  const [managedEditApplying, setManagedEditApplying] = useState(false);
+  const [scopeDialog, setScopeDialog] = useState<{
+    definitionId: string;
+    definitionName: string;
+  } | null>(null);
+  const [managedDeleteProvider, setManagedDeleteProvider] = useState<{
+    provider: Provider;
+    definitionId: string;
+  } | null>(null);
+
   useUsageCacheBridge();
 
   const promptPanelRef = useRef<PromptPanelHandle>(null);
@@ -308,8 +374,10 @@ function App() {
   const { data: codexProviderData } = useProvidersQuery("codex");
   const { data: piCurrentState } = usePiCurrentState(activeApp === "pi");
   const providers = useMemo(() => data?.providers ?? {}, [data]);
-  const codexProviderReady =
-    Object.keys(codexProviderData?.providers ?? {}).length > 0;
+  const codexProviderReady = Boolean(
+    codexProviderData?.currentProviderId &&
+    codexProviderData.providers[codexProviderData.currentProviderId],
+  );
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
     activeApp === "openclaw" &&
@@ -442,15 +510,6 @@ function App() {
       unsubscribe?.();
     };
   }, [activeApp, queryClient, refetch]);
-
-  useTauriEvent("universal-provider-synced", async () => {
-    await queryClient.invalidateQueries({ queryKey: ["providers"] });
-    try {
-      await providersApi.updateTrayMenu();
-    } catch (error) {
-      console.error("[App] Failed to update tray menu", error);
-    }
-  });
 
   // 应用项目后刷新相关缓存（providers 由既有 provider-switched 监听承接；
   // proxy 状态由后端直接改 DB，不走 mutation，必须显式刷新）
@@ -721,12 +780,60 @@ function App() {
   const handleEditProvider = async ({
     provider,
     originalId,
+    managedContext,
   }: {
     provider: Provider;
     originalId?: string;
+    managedContext?: {
+      definitionId: string;
+      expectedRevision?: number;
+      targetAppTypes: string[];
+    };
   }) => {
+    if (managedContext) {
+      try {
+        const input: ManagedProviderDraftInput = {
+          appType: activeApp,
+          provider,
+          definitionId: managedContext.definitionId,
+          expectedRevision: managedContext.expectedRevision,
+          targetAppTypes: managedContext.targetAppTypes,
+        };
+        const preview = await providerCenterApi.previewManagedDraft(input);
+        setManagedEditPreview({ preview, input });
+      } catch (error) {
+        toast.error(extractErrorMessage(error));
+      }
+      setEditingProvider(null);
+      return;
+    }
     await updateProvider(provider, originalId);
     setEditingProvider(null);
+  };
+
+  const handleConfirmManagedEdit = async () => {
+    if (!managedEditPreview) return;
+    const { preview, input } = managedEditPreview;
+    setManagedEditApplying(true);
+    try {
+      await providerCenterApi.confirmManagedDraft(input, preview.token);
+      await queryClient.invalidateQueries({
+        queryKey: ["providers", activeApp],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: ["provider-center"],
+      });
+      toast.success("共享定义已应用");
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setManagedEditApplying(false);
+      setManagedEditPreview(null);
+    }
+  };
+
+  const handleCancelManagedEdit = () => {
+    setManagedEditPreview(null);
   };
 
   const handleConfirmAction = async () => {
@@ -817,7 +924,10 @@ function App() {
       name: `${provider.name} copy`,
       settingsConfig: deepClone(provider.settingsConfig),
       websiteUrl: provider.websiteUrl,
-      category: provider.category,
+      category:
+        (provider.category as string | undefined) === "provider-center"
+          ? undefined
+          : provider.category,
       sortIndex: newSortIndex, // 复制原 sortIndex + 1
       meta: provider.meta ? deepClone(provider.meta) : undefined,
       icon: provider.icon,
@@ -1175,6 +1285,12 @@ function App() {
                             ? switchProvider
                             : undefined
                       }
+                      onManageScope={(definitionId, definitionName) =>
+                        setScopeDialog({ definitionId, definitionName })
+                      }
+                      onManagedDelete={(provider, definitionId) =>
+                        setManagedDeleteProvider({ provider, definitionId })
+                      }
                     />
                   </motion.div>
                 </AnimatePresence>
@@ -1332,8 +1448,8 @@ function App() {
                   {currentView === "mcp" && t("mcp.unifiedPanel.title")}
                   {currentView === "agents" && t("agents.title")}
                   {currentView === "universal" &&
-                    t("universalProvider.title", {
-                      defaultValue: "统一供应商",
+                    t("providerCenter.title", {
+                      defaultValue: "Provider Center",
                     })}
                   {currentView === "sessions" && t("sessionManager.title")}
                   {currentView === "workspace" && t("workspace.title")}
@@ -1811,7 +1927,73 @@ function App() {
         onSubmit={handleEditProvider}
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
+        managedContext={editingManagedContext}
+        managedBindingCount={editingBindingCount}
       />
+
+      <ConfirmDialog
+        isOpen={Boolean(managedEditPreview)}
+        title="应用共享定义变更"
+        message={
+          managedEditPreview
+            ? `将更新 ${managedEditPreview.preview.targets.length} 个 Agent：\n${managedEditPreview.preview.targets
+                .map((target) => {
+                  const label =
+                    PROVIDER_CENTER_APP_LABELS[
+                      target.appType as ProviderCenterApp
+                    ] ?? target.appType;
+                  const mode =
+                    target.connectionMode === "proxy"
+                      ? "需要路由"
+                      : target.connectionMode === "direct"
+                        ? "直接兼容"
+                        : "不兼容";
+                  return `${label}：${target.operation === "create" ? "创建" : "更新"} · ${mode}${target.drifted ? "（检测到漂移）" : ""}${target.message ? ` — ${target.message}` : ""}`;
+                })
+                .join("\n")}`
+            : ""
+        }
+        confirmText="确认应用"
+        cancelText={t("common.cancel")}
+        variant="info"
+        zIndex="top"
+        pending={managedEditApplying}
+        onConfirm={() => void handleConfirmManagedEdit()}
+        onCancel={handleCancelManagedEdit}
+      />
+
+      {scopeDialog && (
+        <ProviderScopeDialog
+          open={Boolean(scopeDialog)}
+          onOpenChange={(open) => {
+            if (!open) setScopeDialog(null);
+          }}
+          definitionId={scopeDialog.definitionId}
+          definitionName={scopeDialog.definitionName}
+        />
+      )}
+
+      {managedDeleteProvider && (
+        <ProviderDeleteDialog
+          open={Boolean(managedDeleteProvider)}
+          onOpenChange={(open) => {
+            if (!open) setManagedDeleteProvider(null);
+          }}
+          provider={managedDeleteProvider.provider}
+          definitionId={managedDeleteProvider.definitionId}
+          appType={activeApp}
+          boundAgents={
+            providerCenterState?.bindings
+              ?.filter(
+                (b) =>
+                  b.providerId === managedDeleteProvider.definitionId &&
+                  b.enabled,
+              )
+              .map((b) => b.appType) ?? []
+          }
+          onSuccess={() => setManagedDeleteProvider(null)}
+        />
+      )}
 
       {effectiveUsageProvider && (
         <UsageScriptModal

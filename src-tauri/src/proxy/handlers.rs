@@ -2049,6 +2049,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::AlreadyRunning
         | ProxyError::NotRunning
         | ProxyError::BindFailed(_)
+        | ProxyError::AddressInUse { .. }
         | ProxyError::StopTimeout
         | ProxyError::StopFailed(_)
         | ProxyError::ResponseBodyTooLarge(_) => "cc_switch_proxy_error",

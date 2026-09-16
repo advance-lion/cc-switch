@@ -109,9 +109,16 @@ impl ProxyServer {
         let app = self.build_router();
 
         // 绑定监听器
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                ProxyError::AddressInUse {
+                    address: self.config.listen_address.clone(),
+                    port: self.config.listen_port,
+                }
+            } else {
+                ProxyError::BindFailed(e.to_string())
+            }
+        })?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
@@ -452,6 +459,38 @@ mod tests {
         path_and_query: String,
         authorization: Option<String>,
         body: Value,
+    }
+
+    #[tokio::test]
+    async fn occupied_port_reports_actionable_address_in_use_error() {
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reserve occupied port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: port,
+                ..ProxyConfig::default()
+            },
+            Arc::new(Database::memory().expect("memory database")),
+            None,
+        );
+
+        let error = proxy.start().await.expect_err("occupied port must fail");
+        match &error {
+            ProxyError::AddressInUse {
+                address,
+                port: error_port,
+            } => {
+                assert_eq!(address, "127.0.0.1");
+                assert_eq!(*error_port, port);
+            }
+            other => panic!("expected AddressInUse, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains(&format!("127.0.0.1:{port}")));
+        assert!(message.contains("另一个 CC Switch 实例或其他程序"));
     }
 
     #[tokio::test]

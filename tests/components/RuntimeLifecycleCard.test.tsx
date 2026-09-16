@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RuntimeLifecycleCard } from "@/components/runtime/RuntimeLifecycleCard";
 import type {
@@ -117,6 +118,34 @@ describe("RuntimeLifecycleCard", () => {
     settingsApiMock.cancelCliLifecycleJob.mockResolvedValue(true);
   });
 
+  it("keeps a sticky app summary while lifecycle details can be collapsed", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <RuntimeLifecycleCard appId="codex" isConfigured={false} />,
+    );
+
+    const lifecycleCard = container.querySelector("section");
+    expect(lifecycleCard).toHaveClass("sticky", "top-0", "z-20");
+
+    const trigger = screen.getByRole("button", {
+      name: "appLifecycle.collapseDetails",
+    });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await screen.findByText("appLifecycle.cliDescription"),
+    ).toBeVisible();
+
+    await user.click(trigger);
+
+    expect(
+      screen.getByRole("button", { name: "appLifecycle.expandDetails" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByText("appLifecycle.cliDescription"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("appLifecycle.title")).toBeVisible();
+    expect(screen.getByText("appLifecycle.notConnected")).toBeVisible();
+  });
   it("keeps provider configuration state separate from install state", async () => {
     render(<RuntimeLifecycleCard appId="codex" isConfigured={false} />);
 
@@ -199,5 +228,239 @@ describe("RuntimeLifecycleCard", () => {
       await screen.findByText(/appLifecycle\.lastJobFailed/),
     ).toBeInTheDocument();
     expect(screen.getByText(/disk full/)).toBeInTheDocument();
+  });
+
+  it("starts CLI installs through the fixed tool API with a generated job id", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions
+      .mockResolvedValueOnce([
+        {
+          name: "gemini",
+          version: null,
+          latest_version: null,
+          error: null,
+          installed_but_broken: false,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          name: "gemini",
+          version: "1.0.0",
+          latest_version: null,
+          error: null,
+          installed_but_broken: false,
+        },
+      ]);
+    settingsApiMock.runCliLifecycleAction.mockResolvedValue(undefined);
+
+    render(<RuntimeLifecycleCard appId="gemini" isConfigured />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "appLifecycle.standardInstall",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(settingsApiMock.runCliLifecycleAction).toHaveBeenCalledWith(
+        "gemini",
+        "install",
+        expect.any(String),
+      ),
+    );
+  });
+
+  it("starts CLI updates and launches only through registered tool APIs", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions.mockResolvedValue([
+      {
+        name: "grok",
+        version: "1.0.0",
+        latest_version: "1.1.0",
+        error: null,
+        installed_but_broken: false,
+      },
+    ]);
+    settingsApiMock.getToolLifecycleCapabilities.mockResolvedValue([
+      {
+        ...capabilities,
+        name: "grok",
+        can_update: true,
+      },
+    ]);
+    settingsApiMock.runCliLifecycleAction.mockResolvedValue(undefined);
+    settingsApiMock.launchToolTerminal.mockResolvedValue(undefined);
+
+    render(<RuntimeLifecycleCard appId="grokbuild" isConfigured />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "appLifecycle.update" }),
+    );
+    await waitFor(() =>
+      expect(settingsApiMock.runCliLifecycleAction).toHaveBeenCalledWith(
+        "grok",
+        "update",
+        expect.any(String),
+      ),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "appLifecycle.launch" }),
+    );
+    await waitFor(() =>
+      expect(settingsApiMock.launchToolTerminal).toHaveBeenCalledWith("grok"),
+    );
+  });
+
+  it("requires confirmation before sending CLI uninstall to the lifecycle API", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions
+      .mockResolvedValueOnce([
+        {
+          name: "openclaw",
+          version: "1.0.0",
+          latest_version: null,
+          error: null,
+          installed_but_broken: false,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          name: "openclaw",
+          version: null,
+          latest_version: null,
+          error: null,
+          installed_but_broken: false,
+        },
+      ]);
+    settingsApiMock.getToolLifecycleCapabilities.mockResolvedValue([
+      {
+        ...capabilities,
+        name: "openclaw",
+        can_uninstall: true,
+      },
+    ]);
+    settingsApiMock.runCliLifecycleAction.mockResolvedValue(undefined);
+
+    render(<RuntimeLifecycleCard appId="openclaw" isConfigured />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "appLifecycle.uninstall" }),
+    );
+    expect(settingsApiMock.runCliLifecycleAction).not.toHaveBeenCalled();
+
+    const dialog = await screen.findByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("button", { name: "appLifecycle.uninstall" }),
+    );
+
+    await waitFor(() =>
+      expect(settingsApiMock.runCliLifecycleAction).toHaveBeenCalledWith(
+        "openclaw",
+        "uninstall",
+        expect.any(String),
+      ),
+    );
+  });
+
+  it("cancels a restored CLI job by its durable job id", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions.mockResolvedValue([
+      {
+        name: "pi",
+        version: "1.0.0",
+        latest_version: null,
+        error: null,
+        installed_but_broken: false,
+      },
+    ]);
+    settingsApiMock.getToolLifecycleCapabilities.mockResolvedValue([
+      { ...capabilities, name: "pi" },
+    ]);
+    settingsApiMock.listCliLifecycleJobs.mockResolvedValue([
+      cliJob({ id: "durable-pi-job", appId: "pi", state: "running" }),
+    ]);
+
+    render(<RuntimeLifecycleCard appId="pi" isConfigured />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "appLifecycle.stop" }),
+    );
+
+    expect(settingsApiMock.cancelCliLifecycleJob).toHaveBeenCalledWith(
+      "durable-pi-job",
+    );
+  });
+
+  it("sends desktop lifecycle operations through the registered desktop API", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions.mockResolvedValue([
+      {
+        name: "claude",
+        version: "1.0.0",
+        latest_version: null,
+        error: null,
+        installed_but_broken: false,
+      },
+    ]);
+    settingsApiMock.getToolLifecycleCapabilities.mockResolvedValue([
+      { ...capabilities, name: "claude" },
+    ]);
+    const installedDesktop: DesktopAppStatus = {
+      ...desktopStatus,
+      id: "claude-desktop",
+      display_name: "Claude Desktop",
+      installed: true,
+      version: "1.0.0",
+      latest_version: "1.1.0",
+      can_install: false,
+      can_update: true,
+      can_uninstall: true,
+      can_launch: true,
+    };
+    settingsApiMock.getDesktopAppStatus.mockResolvedValue(installedDesktop);
+    settingsApiMock.runDesktopAppLifecycleAction.mockResolvedValue(
+      installedDesktop,
+    );
+    settingsApiMock.launchDesktopApp.mockResolvedValue(undefined);
+
+    render(<RuntimeLifecycleCard appId="claude" isConfigured />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "appLifecycle.update" }),
+    );
+    await waitFor(() =>
+      expect(settingsApiMock.runDesktopAppLifecycleAction).toHaveBeenCalledWith(
+        "claude-desktop",
+        "update",
+        expect.any(String),
+      ),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "appLifecycle.launchDesktop" }),
+    );
+    await waitFor(() =>
+      expect(settingsApiMock.launchDesktopApp).toHaveBeenCalledWith(
+        "claude-desktop",
+      ),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "appLifecycle.uninstall" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("button", { name: "appLifecycle.uninstall" }),
+    );
+    await waitFor(() =>
+      expect(
+        settingsApiMock.runDesktopAppLifecycleAction,
+      ).toHaveBeenLastCalledWith(
+        "claude-desktop",
+        "uninstall",
+        expect.any(String),
+      ),
+    );
   });
 });
