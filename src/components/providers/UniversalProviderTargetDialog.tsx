@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import {
   Dialog,
@@ -26,6 +27,11 @@ interface UniversalProviderTargetDialogProps {
   onSelectedAppTypesChange: (appTypes: ProviderCenterApp[]) => void;
   onConfirm: () => void;
   onCancel: () => void;
+  /** Agents that are always checked and cannot be unchecked (e.g. existing projections). */
+  lockedAppTypes?: ProviderCenterApp[];
+  title?: string;
+  description?: ReactNode;
+  confirmText?: string;
 }
 
 export function UniversalProviderTargetDialog({
@@ -36,11 +42,17 @@ export function UniversalProviderTargetDialog({
   onSelectedAppTypesChange,
   onConfirm,
   onCancel,
+  lockedAppTypes,
+  title,
+  description,
+  confirmText,
 }: UniversalProviderTargetDialogProps) {
   const selected = new Set(selectedAppTypes);
+  const locked = new Set(lockedAppTypes ?? []);
   const targetByApp = new Map(targets.map((target) => [target.appType, target]));
 
   const toggle = (appType: ProviderCenterApp, checked: boolean) => {
+    if (locked.has(appType)) return;
     const next = new Set(selected);
     if (checked) next.add(appType);
     else next.delete(appType);
@@ -53,9 +65,10 @@ export function UniversalProviderTargetDialog({
     <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
       <DialogContent className="max-w-lg" zIndex="top">
         <DialogHeader>
-          <DialogTitle>选择使用此 Provider 的 Agent</DialogTitle>
+          <DialogTitle>{title ?? "选择使用此 Provider 的 Agent"}</DialogTitle>
           <DialogDescription>
-            已默认选择所有兼容的 Agent。需要路由的 Agent 也会保存 Provider；实际使用时需开启本地路由。保存不会切换当前 Provider，也不会自动启动路由。
+            {description ??
+              "已默认选择所有兼容的 Agent。需要路由的 Agent 也会保存 Provider；实际使用时需开启本地路由。保存不会切换当前 Provider，也不会自动启动路由。"}
           </DialogDescription>
         </DialogHeader>
 
@@ -65,15 +78,19 @@ export function UniversalProviderTargetDialog({
             const compatible = target?.compatible ?? false;
             const mode = target?.connectionMode ??
               (compatible ? "direct" : "unsupported");
-            const disabled = pending || !compatible;
+            const isLocked = locked.has(appType);
+            const isIncompatible = !compatible;
+            const disabled = pending || isLocked || isIncompatible;
 
             return (
               <label
                 key={appType}
                 className={`flex items-start gap-3 rounded-lg border p-3 ${
-                  disabled
+                  isIncompatible
                     ? "cursor-not-allowed border-border-default opacity-60"
-                    : "cursor-pointer border-border-default hover:bg-accent/50"
+                    : isLocked
+                      ? "cursor-not-allowed border-border-default"
+                      : "cursor-pointer border-border-default hover:bg-accent/50"
                 }`}
               >
                 <Checkbox
@@ -99,8 +116,12 @@ export function UniversalProviderTargetDialog({
                       </span>
                     )}
                     {mode === "unsupported" && (
-                      <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-700 dark:bg-red-900/40 dark:text-red-200">
-                        不兼容
+                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                        isLocked
+                          ? "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-200"
+                          : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200"
+                      }`}>
+                        {isLocked ? "将解除共享" : "不兼容"}
                       </span>
                     )}
                   </span>
@@ -124,7 +145,7 @@ export function UniversalProviderTargetDialog({
             disabled={pending || selectedAppTypes.length === 0}
           >
             {pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            预览并继续
+            {confirmText ?? "预览并继续"}
           </Button>
         </DialogFooter>
       </DialogContent>

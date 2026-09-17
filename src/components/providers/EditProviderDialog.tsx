@@ -17,6 +17,7 @@ import {
   type ManagedAuthProvider,
 } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
+import { providerCenterAppLabel } from "@/components/providers/providerCenterApps";
 
 interface ManagedEditContext {
   definitionId: string;
@@ -38,8 +39,8 @@ interface EditProviderDialogProps {
   /** When set, the dialog edits a Provider Center projection: skip live read
    * (DB projection is SSOT) and route the save through the managed draft API. */
   managedContext?: ManagedEditContext;
-  /** Number of agents this universal provider is bound to. */
-  managedBindingCount?: number;
+  /** Agent app types this universal provider is bound to. */
+  managedBindingTargets?: string[];
 }
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
@@ -108,7 +109,7 @@ export function EditProviderDialog({
   appId,
   isProxyTakeover = false,
   managedContext,
-  managedBindingCount,
+  managedBindingTargets,
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
@@ -384,8 +385,16 @@ export function EditProviderDialog({
           </span>
           <span className="text-xs text-muted-foreground">
             通用 Provider
-            {managedBindingCount != null
-              ? ` · 已添加到 ${managedBindingCount} 个 Agent`
+            {managedBindingTargets && managedBindingTargets.length > 0
+              ? (() => {
+                  const labels = managedBindingTargets.map(
+                    (t) => providerCenterAppLabel(t),
+                  );
+                  if (labels.length <= 3) {
+                    return ` · 已添加到 ${labels.join("、")}`;
+                  }
+                  return ` · 已添加到 ${labels.slice(0, 3).join("、")} 等 ${labels.length} 个 Agent`;
+                })()
               : ""}
           </span>
         </div>

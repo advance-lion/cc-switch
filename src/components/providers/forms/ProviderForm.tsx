@@ -4,7 +4,6 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { info as tauriLogInfo } from "@tauri-apps/plugin-log";
 import { Button } from "@/components/ui/button";
 import { Form, FormField, FormItem, FormMessage } from "@/components/ui/form";
 import { ImeSafeInput } from "@/components/ui/ime-safe-input";
@@ -272,12 +271,6 @@ export interface ProviderFormProps {
   showButtons?: boolean;
   isProxyTakeover?: boolean;
 }
-
-const dbg = (msg: string, data?: unknown) => {
-  const text = data ? `${msg} ${JSON.stringify(data)}` : msg;
-  console.log(text);
-  void tauriLogInfo(text, { file: "ProviderForm" }).catch(() => undefined);
-};
 
 export function ProviderForm(props: ProviderFormProps) {
   if (props.appId === "pi") {
@@ -1119,7 +1112,6 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
-    dbg("[ProviderForm] handleSubmit entered", { appId, category });
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -1481,7 +1473,6 @@ function ProviderFormFull({
     }
 
     if (issues.length > 0) {
-      dbg("[ProviderForm] soft issues found, showing confirm dialog", { issueCount: issues.length });
       // 弹确认框让用户决定是否仍要保存
       setSoftIssues(issues);
       setPendingFormValues(values);
@@ -1489,7 +1480,6 @@ function ProviderFormFull({
       return;
     }
 
-    dbg("[ProviderForm] no soft issues, calling performSubmit");
     await performSubmit(values, overridesResult);
   };
 
@@ -1497,7 +1487,6 @@ function ProviderFormFull({
     values: ProviderFormData,
     overridesResult: LocalProxyRequestOverridesBuildResult,
   ) => {
-    dbg("[ProviderForm] performSubmit entered", { appId });
     if (overridesResult.error) {
       toast.error(
         t("providerForm.localProxyRequestOverridesInvalid", {
@@ -1856,9 +1845,7 @@ function ProviderFormFull({
 
     payload.meta = nextMeta;
 
-    dbg("[ProviderForm] calling onSubmit(payload)", { name: payload.name, hasSettingsConfig: !!payload.settingsConfig });
     await onSubmit(payload);
-    dbg("[ProviderForm] onSubmit returned");
   };
 
   const shouldShowSpeedTest =
@@ -2154,8 +2141,6 @@ function ProviderFormFull({
         <form
           id="provider-form"
           onSubmit={(e) => {
-            console.log("[ProviderForm] form onSubmit event triggered");
-            dbg("[ProviderForm] form onSubmit event triggered");
             form.handleSubmit(handleSubmit)(e);
           }}
           className="space-y-6 glass rounded-xl p-6 border border-white/10"
@@ -2865,7 +2850,6 @@ function ProviderFormFull({
             setPendingLocalProxyRequestOverridesResult(null);
           } catch (error) {
             console.error("[ProviderForm] soft-confirm submit failed:", error);
-            dbg("[ProviderForm] soft-confirm submit failed: " + String(error));
             // 保留确认框和 pending values，让用户可以重试或取消
           } finally {
             setIsConfirmSubmitting(false);

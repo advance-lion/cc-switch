@@ -7,7 +7,7 @@
 
 use crate::app_config::AppType;
 use crate::error::AppError;
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderMeta};
 use crate::proxy::providers::capabilities::{self, Compatibility};
 use crate::services::ProviderService;
 use crate::store::AppState;
@@ -183,6 +183,18 @@ impl AppAdapter {
             }
             .to_string();
         }
+        if let Some(ref meta) = provider.meta {
+            if let Some(ref api_format) = meta.api_format {
+                return match api_format.as_str() {
+                    "anthropic" => "anthropic",
+                    "openai_chat" => "openai-chat",
+                    "openai_responses" => "openai-responses",
+                    "gemini_native" => "gemini",
+                    _ => self.default_protocol,
+                }
+                .to_string();
+            }
+        }
         if self.app_type == AppType::Codex {
             if let Some(config) = provider
                 .settings_config
@@ -231,6 +243,19 @@ impl AppAdapter {
         let mut provider = (self.render)(definition, secret)?;
         provider.id = projected_provider_id(definition, self.app_id());
         provider.category = Some("provider-center".to_string());
+        // Set meta.apiFormat so the frontend (providerNeedsRouting) and the
+        // runtime transform predicates (codex_provider_uses_chat_completions
+        // etc.) can detect when proxy routing is required.  Without this, a
+        // projected Codex provider with an openai-chat definition would have
+        // wire_api="responses" in the TOML and no apiFormat, causing the
+        // frontend to skip the "需要路由" badge and the proxy to never
+        // transform Responses→Chat requests.
+        if let Some(api_format) = protocol_to_api_format(&definition.protocol) {
+            provider.meta = Some(ProviderMeta {
+                api_format: Some(api_format),
+                ..Default::default()
+            });
+        }
         Ok(provider)
     }
 
@@ -244,7 +269,6 @@ impl AppAdapter {
     ) -> Result<indexmap::IndexMap<String, Provider>, AppError> {
         ProviderService::list(state, self.app_type())
     }
-
     /// Lists providers for an import scan without allowing app-specific list
     /// routines to persist native state as a side effect.
     pub(crate) fn list_for_scan(
@@ -274,6 +298,29 @@ impl AppAdapter {
 
     pub(crate) fn delete(&self, state: &AppState, provider_id: &str) -> Result<(), AppError> {
         ProviderService::delete(state, self.app_type(), provider_id)
+    }
+}
+
+/// Map a Provider Center protocol string to the canonical `meta.apiFormat`
+/// value used by the frontend and runtime transform predicates.
+///
+/// Returns `None` for protocols that don't have a meaningful apiFormat
+/// (e.g. `ollama`), leaving `meta` unset as before.
+fn protocol_to_api_format(protocol: &str) -> Option<String> {
+    match protocol.trim().to_lowercase().as_str() {
+        "openai-chat" | "openai_chat" | "openai-chat-completions" => {
+            Some("openai_chat".to_string())
+        }
+        "openai-responses" | "openai_responses" | "responses" => {
+            Some("openai_responses".to_string())
+        }
+        "anthropic" | "anthropic-messages" | "anthropic_messages" => {
+            Some("anthropic".to_string())
+        }
+        "gemini" | "gemini-generate-content" | "gemini_native" | "gemini-native" => {
+            Some("gemini_native".to_string())
+        }
+        _ => None,
     }
 }
 

@@ -3419,14 +3419,12 @@ pub fn apply_transaction(
     if preview.token != preview_token_value {
         return Err(AppError::Message("应用预览已过期，请重新预览".to_string()));
     }
-    if preview
-        .targets
-        .iter()
-        .any(|target| !target.compatible || target.drifted)
-    {
-        return Err(AppError::Message(
-            "存在不兼容或已被外部修改的目标，未执行任何写入".to_string(),
-        ));
+    // Reject if any target has drifted (external modification conflict).
+    if let Some(drifted) = preview.targets.iter().find(|t| t.drifted) {
+        return Err(AppError::Message(format!(
+            "目标 {} 的配置已被外部修改，请先确认冲突后重试",
+            drifted.app_type
+        )));
     }
     let definitions = load_definitions(state)?;
     let definition = definitions
@@ -3452,16 +3450,46 @@ pub fn apply_transaction(
             .iter()
             .map(|target| ProviderApplyTargetResult {
                 app_type: target.app_type.clone(),
-                status: "pending".to_string(),
-                message: None,
+                status: if target.compatible {
+                    "pending".to_string()
+                } else {
+                    "detached".to_string()
+                },
+                message: if target.compatible {
+                    None
+                } else {
+                    Some("协议不兼容，已解除共享".to_string())
+                },
             })
             .collect(),
         created_at: now(),
         completed_at: None,
     };
     let mut bindings = load_bindings(state)?;
+
+    // Detach incompatible targets' bindings before projection so they keep
+    // their existing provider as an independent local copy.
+    for target in &preview.targets {
+        if !target.compatible {
+            if let Some(binding) = bindings
+                .iter_mut()
+                .find(|b| b.provider_id == provider_id && b.app_type == target.app_type)
+            {
+                binding.enabled = false;
+                binding.status = "detached".to_string();
+                binding.expected_fingerprint = None;
+                binding.last_error = None;
+                binding.updated_at = now();
+            }
+        }
+    }
+
     let mut snapshots = Vec::new();
     for target in &preview.targets {
+        // Skip incompatible targets — they are detached above, not projected.
+        if !target.compatible {
+            continue;
+        }
         let app = AppType::from_str(&target.app_type)?;
         let projected = projection(&definition, secret.clone(), &target.app_type)?;
         let template = bindings
@@ -4465,7 +4493,7 @@ mod tests {
             )
             .expect_err("drift is rejected");
 
-            assert!(error.to_string().contains("未执行任何写入"));
+            assert!(error.to_string().contains("已被外部修改"));
             let current = state
                 .db
                 .get_provider_by_id(&projection.id, "opencode")

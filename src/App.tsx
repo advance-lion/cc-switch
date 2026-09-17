@@ -45,7 +45,10 @@ import type {
   ProviderApplyPreview,
   ProviderCenterApp,
 } from "@/lib/api/providerCenter";
-import { PROVIDER_CENTER_APP_LABELS } from "@/components/providers/providerCenterApps";
+import {
+  PROVIDER_CENTER_APPS,
+  PROVIDER_CENTER_APP_LABELS,
+} from "@/components/providers/providerCenterApps";
 import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
 import { useProviderActions } from "@/hooks/useProviderActions";
 import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
@@ -82,6 +85,7 @@ import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ProviderScopeDialog } from "@/components/providers/ProviderScopeDialog";
 import { ProviderDeleteDialog } from "@/components/providers/ProviderDeleteDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { UniversalProviderTargetDialog } from "@/components/providers/UniversalProviderTargetDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
@@ -312,19 +316,20 @@ function App() {
     return undefined;
   }, [editingProvider, agentProviderCatalog, providerCenterState]);
 
-  const editingBindingCount = useMemo(() => {
-    if (!editingManagedContext || !providerCenterState) return undefined;
-    return providerCenterState.bindings.filter(
-      (b) =>
-        b.providerId === editingManagedContext.definitionId && b.enabled,
-    ).length;
-  }, [editingManagedContext, providerCenterState]);
-
   const [managedEditPreview, setManagedEditPreview] = useState<{
     preview: ProviderApplyPreview;
     input: ManagedProviderDraftInput;
   } | null>(null);
   const [managedEditApplying, setManagedEditApplying] = useState(false);
+  const [managedEditDiscovery, setManagedEditDiscovery] = useState<{
+    preview: ProviderApplyPreview;
+    input: ManagedProviderDraftInput;
+    lockedAppTypes: ProviderCenterApp[];
+  } | null>(null);
+  const [selectedEditTargetApps, setSelectedEditTargetApps] = useState<
+    ProviderCenterApp[]
+  >([]);
+  const [managedEditPreviewing, setManagedEditPreviewing] = useState(false);
   const [scopeDialog, setScopeDialog] = useState<{
     definitionId: string;
     definitionName: string;
@@ -792,23 +797,55 @@ function App() {
   }) => {
     if (managedContext) {
       try {
+        setManagedEditPreviewing(true);
         const input: ManagedProviderDraftInput = {
           appType: activeApp,
           provider,
           definitionId: managedContext.definitionId,
           expectedRevision: managedContext.expectedRevision,
-          targetAppTypes: managedContext.targetAppTypes,
+          targetAppTypes: PROVIDER_CENTER_APPS,
         };
         const preview = await providerCenterApi.previewManagedDraft(input);
-        setManagedEditPreview({ preview, input });
+        const lockedAppTypes = managedContext.targetAppTypes as ProviderCenterApp[];
+        setManagedEditDiscovery({ preview, input, lockedAppTypes });
+        setSelectedEditTargetApps(lockedAppTypes);
       } catch (error) {
         toast.error(extractErrorMessage(error));
+        // Refresh provider center state so the next attempt uses the
+        // latest revision (e.g. after a prior confirm incremented it).
+        void queryClient.invalidateQueries({ queryKey: ["provider-center"] });
+      } finally {
+        setManagedEditPreviewing(false);
       }
       setEditingProvider(null);
       return;
     }
     await updateProvider(provider, originalId);
     setEditingProvider(null);
+  };
+
+  const handlePreviewEditTargets = async () => {
+    if (!managedEditDiscovery || selectedEditTargetApps.length === 0) return;
+    setManagedEditPreviewing(true);
+    try {
+      const input: ManagedProviderDraftInput = {
+        ...managedEditDiscovery.input,
+        targetAppTypes: selectedEditTargetApps,
+      };
+      const preview = await providerCenterApi.previewManagedDraft(input);
+      setManagedEditDiscovery(null);
+      setManagedEditPreview({ preview, input });
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      void queryClient.invalidateQueries({ queryKey: ["provider-center"] });
+    } finally {
+      setManagedEditPreviewing(false);
+    }
+  };
+
+  const handleCancelEditTargetSelection = () => {
+    setManagedEditDiscovery(null);
+    setSelectedEditTargetApps([]);
   };
 
   const handleConfirmManagedEdit = async () => {
@@ -1928,7 +1965,21 @@ function App() {
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
         managedContext={editingManagedContext}
-        managedBindingCount={editingBindingCount}
+        managedBindingTargets={editingManagedContext?.targetAppTypes}
+      />
+
+      <UniversalProviderTargetDialog
+        open={Boolean(managedEditDiscovery)}
+        targets={managedEditDiscovery?.preview.targets ?? []}
+        selectedAppTypes={selectedEditTargetApps}
+        lockedAppTypes={managedEditDiscovery?.lockedAppTypes}
+        pending={managedEditPreviewing}
+        onSelectedAppTypesChange={setSelectedEditTargetApps}
+        onConfirm={() => void handlePreviewEditTargets()}
+        onCancel={handleCancelEditTargetSelection}
+        title="管理共享投影目标"
+        description="已勾选的 Agent 已有投影，无法取消。可勾选新的兼容 Agent 来新增投影。"
+        confirmText="预览变更"
       />
 
       <ConfirmDialog
@@ -1936,8 +1987,12 @@ function App() {
         title="应用共享定义变更"
         message={
           managedEditPreview
-            ? `将更新 ${managedEditPreview.preview.targets.length} 个 Agent：\n${managedEditPreview.preview.targets
-                .map((target) => {
+            ? (() => {
+                const targets = managedEditPreview.preview.targets;
+                const created = targets.filter((t) => t.operation === "create" && t.compatible);
+                const updated = targets.filter((t) => t.operation === "update" && t.compatible);
+                const detached = targets.filter((t) => !t.compatible);
+                const fmt = (target: (typeof targets)[number]) => {
                   const label =
                     PROVIDER_CENTER_APP_LABELS[
                       target.appType as ProviderCenterApp
@@ -1948,9 +2003,35 @@ function App() {
                       : target.connectionMode === "direct"
                         ? "直接兼容"
                         : "不兼容";
-                  return `${label}：${target.operation === "create" ? "创建" : "更新"} · ${mode}${target.drifted ? "（检测到漂移）" : ""}${target.message ? ` — ${target.message}` : ""}`;
-                })
-                .join("\n")}`
+                  return `• ${label}：${mode}${target.drifted ? "（检测到漂移）" : ""}${target.message ? ` — ${target.message}` : ""}`;
+                };
+                const applicableCount = created.length + updated.length;
+                const parts: string[] = [];
+                if (applicableCount > 0) {
+                  parts.push(`将应用共享定义到 ${applicableCount} 个 Agent：`);
+                }
+                if (created.length > 0) {
+                  parts.push("\n新增投影：");
+                  parts.push(...created.map(fmt));
+                }
+                if (updated.length > 0) {
+                  parts.push("\n更新已有：");
+                  parts.push(...updated.map(fmt));
+                }
+                if (detached.length > 0) {
+                  parts.push("\n解除共享（保留独立副本）：");
+                  parts.push(
+                    ...detached.map((t) => {
+                      const label =
+                        PROVIDER_CENTER_APP_LABELS[
+                          t.appType as ProviderCenterApp
+                        ] ?? t.appType;
+                      return `• ${label}：协议不兼容，将解除共享`;
+                    }),
+                  );
+                }
+                return parts.join("\n");
+              })()
             : ""
         }
         confirmText="确认应用"

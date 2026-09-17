@@ -290,7 +290,10 @@ pub async fn preview_provider_center_managed_draft(
     log::info!("[preview_managed_draft] IPC call received, app_type={}, targets={}", input.app_type, input.target_app_types.len());
     let _data_guard = operations.lock_data().await;
     log::info!("[preview_managed_draft] data lock acquired");
-    let result = provider_center::preview_managed_draft(state.inner(), input).map_err(|error| error.to_string());
+    let result = provider_center::preview_managed_draft(state.inner(), input).map_err(|error| {
+        log::info!("[preview_managed_draft] error: {}", error);
+        error.to_string()
+    });
     log::info!("[preview_managed_draft] completed, ok={}", result.is_ok());
     result
 }

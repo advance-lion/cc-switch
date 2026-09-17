@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { info as tauriLogInfo } from "@tauri-apps/plugin-log";
 import { Button } from "@/components/ui/button";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -49,12 +48,6 @@ interface AddProviderDialogProps {
     },
   ) => Promise<void> | void;
 }
-
-const dbg = (msg: string, data?: unknown) => {
-  const text = data ? `${msg} ${JSON.stringify(data)}` : msg;
-  console.log(text);
-  void tauriLogInfo(text, { file: "AddProviderDialog" }).catch(() => undefined);
-};
 
 export function AddProviderDialog({
   open,
@@ -135,12 +128,10 @@ export function AddProviderDialog({
 
   const handleSubmit = useCallback(
     async (values: ProviderFormValues) => {
-      dbg("[AddProviderDialog] handleSubmit entered", { saveScope, appId });
       const parsedConfig = JSON.parse(values.settingsConfig) as Record<
         string,
         unknown
       >;
-      dbg("[AddProviderDialog] parsedConfig ok");
 
       // 构造基础提交数据
       const providerData: Omit<Provider, "id"> & {
@@ -333,7 +324,6 @@ export function AddProviderDialog({
       }
 
       if (saveScope === "universal") {
-        dbg("[AddProviderDialog] universal scope, building input");
         const definitionId = crypto.randomUUID();
         const provider: Provider = {
           ...providerData,
@@ -346,22 +336,8 @@ export function AddProviderDialog({
             definitionId,
             targetAppTypes: PROVIDER_CENTER_APPS,
           };
-          dbg("[AddProviderDialog] calling previewManagedDraft", {
-            appType: appId,
-            definitionId,
-            targetCount: PROVIDER_CENTER_APPS.length,
-          });
           setManagedDraftPreviewing(true);
           const preview = await providerCenterApi.previewManagedDraft(input);
-          dbg("[AddProviderDialog] previewManagedDraft returned", {
-            token: preview.token,
-            targetCount: preview.targets.length,
-            targets: preview.targets.map((t) => ({
-              appType: t.appType,
-              compatible: t.compatible,
-              connectionMode: t.connectionMode,
-            })),
-          });
           setManagedDraftDiscovery({ preview, input });
           setSelectedTargetApps(
             PROVIDER_CENTER_APPS.filter((candidate) =>
@@ -373,17 +349,13 @@ export function AddProviderDialog({
           );
           return;
         } catch (error) {
-          console.error("[AddProviderDialog] previewManagedDraft error", error);
-          dbg("[AddProviderDialog] previewManagedDraft error: " + String(error));
           toast.error(extractErrorMessage(error));
           return;
         } finally {
-          dbg("[AddProviderDialog] finally, setting previewing=false");
           setManagedDraftPreviewing(false);
         }
       }
 
-      dbg("[AddProviderDialog] non-universal path, calling onSubmit");
       await onSubmit(providerData);
       closeDialog();
     },
@@ -496,7 +468,7 @@ export function AddProviderDialog({
           <Button
             variant={saveScope === "universal" ? "default" : "outline"}
             size="sm"
-            onClick={() => { dbg("[AddProviderDialog] toggle to universal"); setSaveScope("universal"); }}
+            onClick={() => setSaveScope("universal")}
             className="h-7 text-xs"
           >
             通用 Provider

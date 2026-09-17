@@ -750,7 +750,13 @@ export function ProviderCard({
               }
               onRemoveFromConfig={
                 onRemoveFromConfig
-                  ? () => onRemoveFromConfig(provider)
+                  ? () => {
+                      if (managedByProviderCenter && onManagedDelete) {
+                        onManagedDelete();
+                      } else {
+                        onRemoveFromConfig(provider);
+                      }
+                    }
                   : undefined
               }
               onDisableOmo={handleDisableAnyOmo}
