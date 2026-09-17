@@ -22,6 +22,7 @@ import type { AppId } from "@/lib/api";
 import {
   providerCenterApi,
   type AgentProviderCatalogItem,
+  type ProviderCenterApp,
 } from "@/lib/api/providerCenter";
 import { providersApi } from "@/lib/api/providers";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -114,7 +115,9 @@ export function ProviderList({
   );
   const { data: providerCatalog } = useQuery({
     queryKey: ["provider-center", "agent-catalog", appId],
-    queryFn: () => providerCenterApi.getAgentProviderCatalog(appId),
+    queryFn: () =>
+      providerCenterApi.getAgentProviderCatalog(appId as ProviderCenterApp),
+    enabled: appId !== "dsh",
   });
   const catalogByProviderId = useMemo(
     () =>

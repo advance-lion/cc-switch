@@ -247,6 +247,7 @@ impl Provider {
                 );
                 (base_url, api_key)
             }
+            AppType::DeepSeekHarness => (String::new(), String::new()),
         };
 
         // Normalize like the JS-script path (extract_base_url_from_provider) so a

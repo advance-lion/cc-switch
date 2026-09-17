@@ -140,8 +140,8 @@ pub struct CodexDesktopStatus {
     path: Option<String>,
 }
 
-pub(super) const VALID_TOOLS: [&str; 8] = [
-    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
+pub(super) const VALID_TOOLS: [&str; 9] = [
+    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "dsh",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -338,6 +338,122 @@ pub async fn launch_tool_terminal(tool: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || launch_terminal_running(tool, &label))
         .await
         .map_err(|e| format!("runtime launch task join error: {e}"))?
+}
+
+/// Launch the DeepSeek Harness web UI (`dsh web`) in the background and open
+/// the browser.  The server listens on http://127.0.0.1:3080 by default.
+#[tauri::command]
+pub async fn launch_dsh() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        spawn_dsh_web()?;
+        wait_for_dsh_ready();
+        open_browser("http://127.0.0.1:3080");
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("dsh launch task join error: {e}"))?
+}
+
+/// Restart the DeepSeek Harness web UI: kill the running process on port
+/// 3080, then relaunch `dsh web`.
+#[tauri::command]
+pub async fn restart_dsh() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        kill_process_on_port(3080);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        spawn_dsh_web()?;
+        wait_for_dsh_ready();
+        open_browser("http://127.0.0.1:3080");
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("dsh restart task join error: {e}"))?
+}
+
+/// Spawn `dsh web --no-open` as a detached background process.
+fn spawn_dsh_web() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "/B", "dsh web --no-open"]);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.spawn().map_err(|e| format!("Failed to start dsh: {e}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = std::process::Command::new("nohup");
+        cmd.args(["dsh", "web", "--no-open"]);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn().map_err(|e| format!("Failed to start dsh: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Wait for the DSH web server to become ready (max ~30s).
+fn wait_for_dsh_ready() {
+    for _ in 0..30 {
+        if std::net::TcpStream::connect("127.0.0.1:3080").is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Kill the process listening on the given TCP port.
+fn kill_process_on_port(port: u16) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("cmd")
+            .args(["/C", &format!("netstat -ano | findstr :{port}")])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("LISTENING") {
+                    if let Some(pid) = line.split_whitespace().last() {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/PID", pid, "/F"])
+                            .creation_flags(0x08000000)
+                            .output();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid in pids.lines() {
+                let _ = std::process::Command::new("kill").arg(pid).output();
+            }
+        }
+    }
+}
+
+/// Open a URL in the user's default browser.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(0x08000000)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 /// 卸载由 npm 全局安装的 Runtime。
@@ -943,6 +1059,7 @@ pub(super) fn tool_display_name(tool: &str) -> &'static str {
         "openclaw" => "OpenClaw",
         "hermes" => "Hermes",
         "pi" => "Pi",
+        "dsh" => "DeepSeek Harness",
         _ => "Unknown",
     }
 }
@@ -3049,6 +3166,7 @@ pub(super) fn npm_package_for(tool: &str) -> Option<&'static str> {
         "opencode" => Some("opencode-ai"),
         "openclaw" => Some("openclaw"),
         "pi" => Some("@earendil-works/pi-coding-agent"),
+        "dsh" => Some("@deepseek-ai/dsh"),
         _ => None,
     }
 }

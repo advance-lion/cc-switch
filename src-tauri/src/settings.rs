@@ -79,6 +79,7 @@ impl VisibleApps {
             AppType::OpenClaw => self.openclaw,
             AppType::Hermes => self.hermes,
             AppType::Pi => self.pi,
+            AppType::DeepSeekHarness => false,
         }
     }
 }
@@ -1014,6 +1015,7 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::OpenClaw => settings.current_provider_openclaw.clone(),
         AppType::Hermes => settings.current_provider_hermes.clone(),
         AppType::Pi => None,
+        AppType::DeepSeekHarness => None,
     }
 }
 
@@ -1033,6 +1035,7 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::OpenClaw => settings.current_provider_openclaw = id_owned.clone(),
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
         AppType::Pi => {}
+        AppType::DeepSeekHarness => {}
     })
 }
 

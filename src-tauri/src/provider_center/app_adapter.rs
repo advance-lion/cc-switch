@@ -94,6 +94,12 @@ impl AppAdapterRegistry {
                 ],
                 render_pi,
             ),
+            AppAdapter::new(
+                AppType::DeepSeekHarness,
+                "openai-chat",
+                &["openai-chat"],
+                render_dsh,
+            ),
         ];
         Self {
             adapters: adapters.into_iter().collect(),
@@ -647,6 +653,10 @@ fn render_pi(definition: &ProviderDefinition, secret: &str) -> Result<Provider, 
         }),
         None,
     ))
+}
+
+fn render_dsh(_definition: &ProviderDefinition, _secret: &str) -> Result<Provider, AppError> {
+    Err(render_error())
 }
 
 fn render_error() -> AppError {

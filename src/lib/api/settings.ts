@@ -79,7 +79,7 @@ export interface CodexDesktopStatus {
   path: string | null;
 }
 
-export type DesktopAppId = "codex-desktop" | "claude-desktop";
+export type DesktopAppId = "codex-desktop" | "claude-desktop" | "hermes-desktop";
 export type DesktopLifecycleAction = "install" | "update" | "uninstall";
 
 export interface DesktopAppStatus {
@@ -688,6 +688,16 @@ export const settingsApi = {
   /** 在用户首选终端中启动已登记 Runtime 的 CLI。后端只接受受支持的工具名。 */
   async launchToolTerminal(tool: string): Promise<void> {
     await invoke("launch_tool_terminal", { tool });
+  },
+
+  /** 启动 DeepSeek Harness Web UI（后台运行 dsh web 并打开浏览器）。 */
+  async launchDsh(): Promise<void> {
+    await invoke("launch_dsh");
+  },
+
+  /** 重启 DeepSeek Harness Web UI（杀掉端口 3080 上的进程后重新启动）。 */
+  async restartDsh(): Promise<void> {
+    await invoke("restart_dsh");
   },
 
   /** 卸载有明确 npm 包映射的 Runtime；不会变更 Provider 或账号配置。 */

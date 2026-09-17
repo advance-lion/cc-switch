@@ -39,6 +39,15 @@ struct DesktopAppManifest {
     macos_app_name: &'static str,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_cask: &'static str,
+    /// Custom installer URL for apps without winget/brew distribution.
+    /// Empty string means use winget (Windows) or brew (macOS) instead.
+    installer_url: &'static str,
+    /// Silent install arguments for the custom Windows installer (e.g. "/S").
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    installer_silent_args: &'static str,
+    /// Custom macOS installer URL (usually a .dmg). Empty = use brew or `installer_url`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    macos_installer_url: &'static str,
 }
 
 const CODEX_DESKTOP: DesktopAppManifest = DesktopAppManifest {
@@ -53,6 +62,9 @@ const CODEX_DESKTOP: DesktopAppManifest = DesktopAppManifest {
     macos_bundle_path: "/Applications/Codex.app",
     macos_app_name: "Codex",
     macos_cask: "codex-app",
+    installer_url: "",
+    installer_silent_args: "",
+    macos_installer_url: "",
 };
 
 const CLAUDE_DESKTOP: DesktopAppManifest = DesktopAppManifest {
@@ -66,14 +78,39 @@ const CLAUDE_DESKTOP: DesktopAppManifest = DesktopAppManifest {
     macos_bundle_path: "/Applications/Claude.app",
     macos_app_name: "Claude",
     macos_cask: "claude",
+    installer_url: "",
+    installer_silent_args: "",
+    macos_installer_url: "",
+};
+
+const HERMES_DESKTOP: DesktopAppManifest = DesktopAppManifest {
+    id: "hermes-desktop",
+    display_name: "Hermes Desktop",
+    windows_package_name: "Hermes",
+    windows_display_name: "Hermes",
+    windows_app_id_suffix: "Hermes",
+    winget_id: "",
+    winget_source: "",
+    macos_bundle_path: "/Applications/Hermes.app",
+    macos_app_name: "Hermes",
+    macos_cask: "",
+    installer_url: "https://hermes-assets.nousresearch.com/Hermes-Setup.exe",
+    installer_silent_args: "/S",
+    macos_installer_url: "https://hermes-assets.nousresearch.com/Hermes-Setup.dmg",
 };
 
 fn manifest(app: &str) -> Result<DesktopAppManifest, String> {
     match app {
         "codex-desktop" => Ok(CODEX_DESKTOP),
         "claude-desktop" => Ok(CLAUDE_DESKTOP),
+        "hermes-desktop" => Ok(HERMES_DESKTOP),
         _ => Err(format!("Unsupported desktop application: {app}")),
     }
+}
+
+/// Whether this manifest uses a custom installer (not winget/brew).
+fn uses_custom_installer(manifest: DesktopAppManifest) -> bool {
+    !manifest.installer_url.is_empty()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +489,7 @@ foreach ($entry in $entries) {{
         .map_err(|error| format!("Invalid desktop package metadata: {error}"))?
         .records;
     if records.is_empty() {
+        let custom = uses_custom_installer(manifest);
         return Ok(DesktopAppStatus {
             id: manifest.id.to_string(),
             display_name: manifest.display_name.to_string(),
@@ -462,11 +500,12 @@ foreach ($entry in $entries) {{
             launch_target: None,
             package_identity: None,
             installation_source: "not_installed".to_string(),
-            can_install: winget_available,
+            can_install: custom || winget_available,
             can_update: false,
             can_uninstall: false,
             can_launch: false,
-            reason: (!winget_available).then(|| "未找到 Winget，无法执行自动安装".to_string()),
+            reason: (!custom && !winget_available)
+                .then(|| "未找到 Winget，无法执行自动安装".to_string()),
             installations: Vec::new(),
         });
     }
@@ -514,6 +553,7 @@ foreach ($entry in $entries) {{
         .expect("non-empty installations after detection");
     let primary_is_appx = primary.package_identity.is_some();
 
+    let custom = uses_custom_installer(manifest);
     Ok(DesktopAppStatus {
         id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
@@ -525,10 +565,10 @@ foreach ($entry in $entries) {{
         package_identity: primary.package_identity.clone(),
         installation_source: primary.installation_source.clone(),
         can_install: false,
-        can_update: winget_available,
-        can_uninstall: primary_is_appx || winget_available,
+        can_update: custom || winget_available,
+        can_uninstall: custom || primary_is_appx || winget_available,
         can_launch: true,
-        reason: (!winget_available).then(|| {
+        reason: (!custom && !winget_available).then(|| {
             if primary_is_appx {
                 "未找到 Winget，仍可启动和卸载，但不能自动更新"
             } else {
@@ -565,6 +605,8 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
+    let custom = uses_custom_installer(manifest);
+    let can_act = custom || homebrew_available;
     Ok(DesktopAppStatus {
         id: manifest.id.to_string(),
         display_name: manifest.display_name.to_string(),
@@ -580,11 +622,11 @@ fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, 
             "not_installed"
         }
         .to_string(),
-        can_install: !installed && homebrew_available,
-        can_update: installed && homebrew_available,
-        can_uninstall: installed && homebrew_available,
+        can_install: !installed && can_act,
+        can_update: installed && can_act,
+        can_uninstall: installed && can_act,
         can_launch: installed,
-        reason: (!homebrew_available)
+        reason: (!can_act)
             .then(|| "需要 Homebrew 才能自动安装、更新或卸载；仍可启动现有应用".to_string()),
         installations: if installed {
             vec![DesktopInstallation {
@@ -844,6 +886,151 @@ fn uninstall_appx(
         .map(|_| ())
 }
 
+// ── Custom installer support (non-winget/brew apps like Hermes Desktop) ──────
+
+#[cfg(target_os = "windows")]
+fn execute_custom_installer_action(
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    before: &DesktopAppStatus,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    match action {
+        DesktopLifecycleAction::Install | DesktopLifecycleAction::Update => {
+            let temp_dir = std::env::temp_dir();
+            let installer_path = temp_dir.join(format!("{}-setup.exe", manifest.id));
+            let installer_str = installer_path.to_string_lossy().replace('\\', "/");
+            // Download the installer via curl (available on Windows 10+).
+            let mut curl = Command::new("curl");
+            curl.args(["-fsSL", manifest.installer_url, "-o", &installer_str]);
+            curl.creation_flags(CREATE_NO_WINDOW);
+            command_output_cancellable(&mut curl, "download custom installer", cancellation)?;
+            // Run the installer silently.
+            let mut installer = Command::new(&installer_str);
+            if !manifest.installer_silent_args.is_empty() {
+                installer.arg(manifest.installer_silent_args);
+            }
+            installer.creation_flags(CREATE_NO_WINDOW);
+            command_output_cancellable(&mut installer, "custom installer run", cancellation)?;
+            // Clean up.
+            let _ = std::fs::remove_file(&installer_path);
+            Ok(())
+        }
+        DesktopLifecycleAction::Uninstall => {
+            // Find the UninstallString from the registry.
+            let script = format!(
+                r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$uninstallRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+$entry = Get-ItemProperty $uninstallRoots -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DisplayName -eq '{}' }} |
+  Sort-Object DisplayVersion -Descending |
+  Select-Object -First 1
+if ($entry -and $entry.UninstallString) {{
+  Write-Output $entry.UninstallString
+}} else {{
+  Write-Output ''
+}}"#,
+                manifest.windows_display_name
+            );
+            let output = powershell_output(&script, "custom uninstall lookup")?;
+            let uninstall_string = output.trim().trim_matches('"');
+            if uninstall_string.is_empty() {
+                return Err(format!(
+                    "Could not find uninstaller for {} in the registry",
+                    manifest.display_name
+                ));
+            }
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &format!("Start-Process -FilePath '{}' -ArgumentList '/S' -Wait", uninstall_string),
+            ]);
+            command.creation_flags(CREATE_NO_WINDOW);
+            command_output_cancellable(&mut command, "custom uninstall", cancellation)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn execute_custom_installer_action(
+    manifest: DesktopAppManifest,
+    action: DesktopLifecycleAction,
+    _before: &DesktopAppStatus,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    match action {
+        DesktopLifecycleAction::Install | DesktopLifecycleAction::Update => {
+            let dmg_path = format!("/tmp/{}-setup.dmg", manifest.id);
+            let url = if !manifest.macos_installer_url.is_empty() {
+                manifest.macos_installer_url
+            } else {
+                manifest.installer_url
+            };
+            // Download the DMG.
+            let mut curl = Command::new("curl");
+            curl.args(["-fsSL", url, "-o", &dmg_path]);
+            command_output_cancellable(&mut curl, "download custom installer", cancellation)?;
+            // Mount the DMG.
+            let mount_output = command_output_cancellable(
+                Command::new("hdiutil").args(["attach", "-nobrowse", &dmg_path]),
+                "mount custom installer",
+                cancellation,
+            )?;
+            // Parse mount point (last line of hdiutil output).
+            let mount_point = mount_output
+                .lines()
+                .last()
+                .map(|line| line.split_whitespace().last().unwrap_or(""))
+                .unwrap_or("");
+            if mount_point.is_empty() {
+                return Err("Failed to determine DMG mount point".to_string());
+            }
+            // Copy the .app bundle to /Applications.
+            let app_name = format!("{}/{}.app", mount_point, manifest.macos_app_name);
+            let mut cp = Command::new("cp");
+            cp.args(["-R", &app_name, "/Applications/"]);
+            command_output_cancellable(&mut cp, "copy app bundle", cancellation)?;
+            // Unmount.
+            let _ = Command::new("hdiutil")
+                .args(["detach", mount_point])
+                .output();
+            // Clean up.
+            let _ = std::fs::remove_file(&dmg_path);
+            Ok(())
+        }
+        DesktopLifecycleAction::Uninstall => {
+            let path = manifest.macos_bundle_path;
+            if !std::path::Path::new(path).exists() {
+                return Ok(()); // Already removed.
+            }
+            let mut rm = Command::new("rm");
+            rm.args(["-rf", path]);
+            command_output_cancellable(&mut rm, "custom uninstall", cancellation)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn execute_custom_installer_action(
+    _manifest: DesktopAppManifest,
+    _action: DesktopLifecycleAction,
+    _before: &DesktopAppStatus,
+    _cancellation: &AtomicBool,
+) -> Result<(), String> {
+    Err("Custom installer actions are not supported on this platform".to_string())
+}
+
 trait DesktopLifecycleRuntime: Send + Sync {
     fn probe(&self, manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String>;
 
@@ -874,6 +1061,12 @@ impl DesktopLifecycleRuntime for SystemDesktopLifecycleRuntime {
     }
 
     fn latest_version(&self, manifest: DesktopAppManifest) -> Result<String, String> {
+        if uses_custom_installer(manifest) {
+            return Err(format!(
+                "Automatic version check is not available for {} (custom installer)",
+                manifest.display_name
+            ));
+        }
         latest_winget_version(manifest)
     }
 
@@ -884,6 +1077,9 @@ impl DesktopLifecycleRuntime for SystemDesktopLifecycleRuntime {
         before: &DesktopAppStatus,
         cancellation: &AtomicBool,
     ) -> Result<(), String> {
+        if uses_custom_installer(manifest) {
+            return execute_custom_installer_action(manifest, action, before, cancellation);
+        }
         match action {
             DesktopLifecycleAction::Install | DesktopLifecycleAction::Update => {
                 #[cfg(target_os = "windows")]

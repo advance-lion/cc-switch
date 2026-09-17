@@ -48,7 +48,8 @@ type RuntimeTool =
   | "opencode"
   | "openclaw"
   | "hermes"
-  | "pi";
+  | "pi"
+  | "dsh";
 
 type ToolVersion = {
   name: string;
@@ -67,12 +68,14 @@ const TOOL_BY_APP: Partial<Record<AppId, RuntimeTool>> = {
   openclaw: "openclaw",
   hermes: "hermes",
   pi: "pi",
+  dsh: "dsh",
 };
 
 const DESKTOP_BY_APP: Partial<Record<AppId, DesktopAppId>> = {
   claude: "claude-desktop",
   "claude-desktop": "claude-desktop",
   codex: "codex-desktop",
+  hermes: "hermes-desktop",
 };
 
 const cliCache = new Map<
@@ -579,10 +582,29 @@ function CliLifecycleRow({
   const launch = async () => {
     setAction("launch");
     try {
-      await settingsApi.launchToolTerminal(tool);
-      toast.success(t("appLifecycle.terminalOpened"));
+      if (tool === "dsh") {
+        await settingsApi.launchDsh();
+        toast.success("DSH Web UI 已启动");
+      } else {
+        await settingsApi.launchToolTerminal(tool);
+        toast.success(t("appLifecycle.terminalOpened"));
+      }
     } catch (error) {
       toast.error(t("appLifecycle.launchFailed"), {
+        description: extractErrorMessage(error),
+      });
+    } finally {
+      setAction(null);
+    }
+  };
+
+  const restart = async () => {
+    setAction("launch");
+    try {
+      await settingsApi.restartDsh();
+      toast.success("DSH Web UI 已重启");
+    } catch (error) {
+      toast.error("重启失败", {
         description: extractErrorMessage(error),
       });
     } finally {
@@ -659,6 +681,15 @@ function CliLifecycleRow({
           onRedetect={() => void refresh(false)}
           onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
         />
+        {tool === "dsh" && installed && !busy && (
+          <button
+            onClick={() => void restart()}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border-default px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent/50"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            重启
+          </button>
+        )}
         {activeJob &&
           ["queued", "running", "verifying"].includes(activeJob.state) && (
             <JobActiveBanner job={activeJob} />

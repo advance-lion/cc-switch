@@ -283,8 +283,11 @@ function App() {
 
   const { data: agentProviderCatalog } = useQuery({
     queryKey: ["provider-center", "agent-catalog", activeApp],
-    queryFn: () => providerCenterApi.getAgentProviderCatalog(activeApp),
-    enabled: Boolean(activeApp),
+    queryFn: () =>
+      providerCenterApi.getAgentProviderCatalog(
+        activeApp as ProviderCenterApp,
+      ),
+    enabled: Boolean(activeApp) && activeApp !== "dsh",
     staleTime: 30_000,
   });
 

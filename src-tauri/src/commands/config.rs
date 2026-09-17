@@ -146,6 +146,10 @@ pub async fn get_config_status(
                 path,
             })
         }
+        AppType::DeepSeekHarness => Ok(ConfigStatus {
+            exists: false,
+            path: String::new(),
+        }),
     }
 }
 
@@ -168,6 +172,9 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
+        AppType::DeepSeekHarness => {
+            return Err("DeepSeekHarness has no config directory".to_string())
+        }
     };
 
     Ok(dir.to_string_lossy().to_string())
@@ -187,6 +194,9 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
+        AppType::DeepSeekHarness => {
+            return Err("DeepSeekHarness has no config directory".to_string())
+        }
     };
 
     if !config_dir.exists() {

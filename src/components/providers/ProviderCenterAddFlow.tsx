@@ -20,6 +20,7 @@ import {
   type ImportCandidate,
   type ProviderApplyPreview,
   type ProviderBinding,
+  type ProviderCenterApp,
   type ProviderDefinition,
 } from "@/lib/api/providerCenter";
 import { refreshProviderCenterApplyCaches } from "@/lib/query/providerCenter";
@@ -55,6 +56,7 @@ const protocolsByApp: Record<AppId, readonly string[]> = {
   ],
   hermes: ["openai-chat", "ollama"],
   pi: ["openai-chat", "openai-responses", "anthropic", "gemini", "ollama"],
+  dsh: [],
 };
 
 const defaultProtocolByApp: Record<AppId, string> = {
@@ -67,6 +69,7 @@ const defaultProtocolByApp: Record<AppId, string> = {
   openclaw: "openai-chat",
   hermes: "openai-chat",
   pi: "openai-chat",
+  dsh: "",
 };
 
 const protocolLabels: Record<string, string> = {
@@ -78,7 +81,7 @@ const protocolLabels: Record<string, string> = {
 };
 
 interface ProviderCenterAddFlowProps {
-  appId: AppId;
+  appId: ProviderCenterApp;
   path: Exclude<AddProviderPath, "agent-only">;
   onPathChange: (path: AddProviderPath) => void;
   onComplete: () => void;

@@ -1703,6 +1703,8 @@ pub fn run() {
             commands::probe_tool_installations,
             commands::launch_tool_terminal,
             commands::launch_codex_desktop,
+            commands::launch_dsh,
+            commands::restart_dsh,
             commands::uninstall_tool_runtime,
             // Persistent Codex app-server assistant conversation
             commands::start_codex_assistant_session,
