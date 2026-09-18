@@ -48,7 +48,7 @@ impl McpApps {
             AppType::OpenCode => self.opencode = enabled,
             AppType::OpenClaw => {} // OpenClaw doesn't support MCP, ignore
             AppType::Hermes => self.hermes = enabled,
-            AppType::Pi => {}            // Pi core has no native MCP registry.
+            AppType::Pi => {}              // Pi core has no native MCP registry.
             AppType::ClaudeDesktop => {} // Claude Desktop 3P provider config doesn't support MCP here
             AppType::DeepSeekHarness => {} // DSH has no MCP config
         }

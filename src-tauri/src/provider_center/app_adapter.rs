@@ -320,9 +320,7 @@ fn protocol_to_api_format(protocol: &str) -> Option<String> {
         "openai-responses" | "openai_responses" | "responses" => {
             Some("openai_responses".to_string())
         }
-        "anthropic" | "anthropic-messages" | "anthropic_messages" => {
-            Some("anthropic".to_string())
-        }
+        "anthropic" | "anthropic-messages" | "anthropic_messages" => Some("anthropic".to_string()),
         "gemini" | "gemini-generate-content" | "gemini_native" | "gemini-native" => {
             Some("gemini_native".to_string())
         }

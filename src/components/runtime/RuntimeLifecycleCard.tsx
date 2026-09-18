@@ -950,7 +950,11 @@ function DesktopLifecycleRow({
   );
   const title =
     status?.display_name ??
-    (app === "codex-desktop" ? "Codex Desktop" : "Claude Desktop");
+    (app === "codex-desktop"
+      ? "Codex Desktop"
+      : app === "hermes-desktop"
+        ? "Hermes Desktop"
+        : "Claude Desktop");
 
   return (
     <>
@@ -1152,7 +1156,9 @@ export function RuntimeLifecycleCard({
                           appName:
                             desktop === "codex-desktop"
                               ? "Codex Desktop"
-                              : "Claude Desktop",
+                              : desktop === "hermes-desktop"
+                                ? "Hermes Desktop"
+                                : "Claude Desktop",
                           supportsCustomLocation: false,
                           supportsVersionPin: false,
                         })

@@ -439,6 +439,163 @@ fn powershell_output(script: &str, label: &str) -> Result<String, String> {
     command_output(&mut command, label)
 }
 
+// ── Hermes bootstrap detection (source-built / unpacked Electron app) ────────
+
+/// Stable path suffix within the Hermes home directory that identifies the
+/// bootstrap-built desktop payload.
+#[cfg(target_os = "windows")]
+const HERMES_BOOTSTRAP_SUFFIX: &str =
+    "hermes-agent\\apps\\desktop\\release\\win-unpacked\\Hermes.exe";
+
+#[cfg(target_os = "windows")]
+struct HermesBootstrapInfo {
+    version: String,
+    exe_path: String,
+    install_dir: String,
+}
+
+/// Validate a candidate `Hermes.exe` as the real bootstrap-built desktop app.
+///
+/// Returns version + paths only when every structural check passes:
+/// - file name is `Hermes.exe`
+/// - path ends with the stable bootstrap suffix
+/// - `resources\app.asar` exists adjacent to the exe
+/// - `..\..\package.json` exists and its `name` or `productName` contains
+///   "hermes" with a non-empty `version`
+///
+/// This excludes the CLI shim (`venv\Scripts\hermes.exe`), the bootstrap
+/// installer (`hermes-setup.exe`), and any unrelated `Hermes.exe`.
+#[cfg(target_os = "windows")]
+fn validate_hermes_bootstrap_exe(exe_path: &std::path::Path) -> Option<HermesBootstrapInfo> {
+    let file_name = exe_path.file_name()?.to_str()?;
+    if !file_name.eq_ignore_ascii_case("Hermes.exe") {
+        return None;
+    }
+
+    let path_str = exe_path.to_str()?;
+    let normalized = path_str.replace('/', "\\");
+    if !normalized
+        .to_lowercase()
+        .ends_with(&HERMES_BOOTSTRAP_SUFFIX.to_lowercase())
+    {
+        return None;
+    }
+
+    let parent = exe_path.parent()?;
+    let app_asar = parent.join("resources").join("app.asar");
+    if !app_asar.is_file() {
+        return None;
+    }
+
+    // package.json lives at ../../package.json relative to the exe
+    // (win-unpacked/Hermes.exe → release/ → desktop/package.json)
+    let package_json_path = parent.parent()?.parent()?.join("package.json");
+    if !package_json_path.is_file() {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&package_json_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let product_name = value
+        .get("productName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !name.to_lowercase().contains("hermes") && !product_name.to_lowercase().contains("hermes") {
+        return None;
+    }
+
+    let version = value.get("version").and_then(|v| v.as_str())?;
+    if version.trim().is_empty() {
+        return None;
+    }
+
+    Some(HermesBootstrapInfo {
+        version: version.to_string(),
+        exe_path: exe_path.to_string_lossy().to_string(),
+        install_dir: parent.to_string_lossy().to_string(),
+    })
+}
+
+/// Detect a Hermes bootstrap installation by checking the stable path under
+/// the Hermes home directory, then falling back to Start Menu shortcut,
+/// `hermes://` protocol, and running process paths. Every candidate must pass
+/// the same strict validation.
+#[cfg(target_os = "windows")]
+fn detect_hermes_bootstrap() -> Option<HermesBootstrapInfo> {
+    let hermes_dir = crate::hermes_config::get_hermes_dir();
+    let stable_exe = hermes_dir
+        .join("hermes-agent")
+        .join("apps")
+        .join("desktop")
+        .join("release")
+        .join("win-unpacked")
+        .join("Hermes.exe");
+    if let Some(info) = validate_hermes_bootstrap_exe(&stable_exe) {
+        return Some(info);
+    }
+
+    for candidate in collect_hermes_fallback_candidates() {
+        if let Some(info) = validate_hermes_bootstrap_exe(&candidate) {
+            return Some(info);
+        }
+    }
+
+    None
+}
+
+/// Collect additional `Hermes.exe` candidate paths from Start Menu shortcut,
+/// `hermes://` protocol handler, and running processes.
+#[cfg(target_os = "windows")]
+fn collect_hermes_fallback_candidates() -> Vec<std::path::PathBuf> {
+    let script = r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$candidates = @()
+
+$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Hermes.lnk'
+if (Test-Path $lnk) {
+  try {
+    $sh = New-Object -ComObject WScript.Shell
+    $shortcut = $sh.CreateShortcut($lnk)
+    if ($shortcut.TargetPath) { $candidates += $shortcut.TargetPath }
+  } catch {}
+}
+
+$cmd = (Get-ItemProperty 'HKCU:\Software\Classes\hermes\shell\open\command' -ErrorAction SilentlyContinue).'(default)'
+if ($cmd) {
+  if ($cmd -match '"([^"]+\.exe)"') { $candidates += $matches[1] }
+  elseif ($cmd -match '([^\s"]+\.exe)') { $candidates += $matches[1] }
+}
+
+Get-CimInstance Win32_Process -Filter "Name='Hermes.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+  if ($_.ExecutablePath) { $candidates += $_.ExecutablePath }
+}
+
+[pscustomobject]@{ candidates = @($candidates | Select-Object -Unique) } | ConvertTo-Json -Compress"#;
+
+    let output = match powershell_output(script, "Hermes fallback candidate lookup") {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    #[derive(Deserialize)]
+    struct FallbackCandidates {
+        candidates: Vec<String>,
+    }
+
+    let parsed =
+        serde_json::from_str::<FallbackCandidates>(&output).unwrap_or(FallbackCandidates {
+            candidates: Vec::new(),
+        });
+
+    parsed
+        .candidates
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 #[cfg(target_os = "windows")]
 fn detect_desktop_app(manifest: DesktopAppManifest) -> Result<DesktopAppStatus, String> {
     let winget_available = Command::new("winget.exe")
@@ -488,6 +645,22 @@ foreach ($entry in $entries) {{
     let mut records = serde_json::from_str::<AppxRecords>(&output)
         .map_err(|error| format!("Invalid desktop package metadata: {error}"))?
         .records;
+
+    // Hermes bootstrap detection: source-built Electron apps don't appear in
+    // Appx or the uninstall registry. Check the known unpacked layout.
+    if manifest.id == "hermes-desktop" {
+        if let Some(info) = detect_hermes_bootstrap() {
+            records.push(AppxRecord {
+                kind: "hermes_bootstrap".to_string(),
+                version: info.version,
+                package_full_name: None,
+                package_family_name: None,
+                install_location: info.install_dir,
+                launch_target: Some(info.exe_path),
+            });
+        }
+    }
+
     if records.is_empty() {
         let custom = uses_custom_installer(manifest);
         return Ok(DesktopAppStatus {
@@ -538,7 +711,9 @@ foreach ($entry in $entries) {{
             path: record.install_location.clone(),
             launch_target: record.launch_target.clone(),
             package_identity: record.package_full_name.clone(),
-            installation_source: if record.kind == "win32" {
+            installation_source: if record.kind == "hermes_bootstrap" {
+                "hermes_bootstrap"
+            } else if record.kind == "win32" {
                 "official_exe"
             } else if manifest.id == "codex-desktop" {
                 "microsoft_store"
@@ -552,6 +727,7 @@ foreach ($entry in $entries) {{
         .first()
         .expect("non-empty installations after detection");
     let primary_is_appx = primary.package_identity.is_some();
+    let is_bootstrap = primary.installation_source == "hermes_bootstrap";
 
     let custom = uses_custom_installer(manifest);
     Ok(DesktopAppStatus {
@@ -565,17 +741,31 @@ foreach ($entry in $entries) {{
         package_identity: primary.package_identity.clone(),
         installation_source: primary.installation_source.clone(),
         can_install: false,
-        can_update: custom || winget_available,
-        can_uninstall: custom || primary_is_appx || winget_available,
+        can_update: if is_bootstrap {
+            false
+        } else {
+            custom || winget_available
+        },
+        can_uninstall: if is_bootstrap {
+            false
+        } else {
+            custom || primary_is_appx || winget_available
+        },
         can_launch: true,
-        reason: (!custom && !winget_available).then(|| {
-            if primary_is_appx {
-                "未找到 Winget，仍可启动和卸载，但不能自动更新"
-            } else {
-                "未找到 Winget，仍可启动，但不能自动更新或卸载"
-            }
-            .to_string()
-        }),
+        reason: if is_bootstrap {
+            Some("Bootstrap 安装不支持自动更新和卸载，请通过 Hermes 自身管理".to_string())
+        } else if !custom && !winget_available {
+            Some(
+                if primary_is_appx {
+                    "未找到 Winget，仍可启动和卸载，但不能自动更新"
+                } else {
+                    "未找到 Winget，仍可启动，但不能自动更新或卸载"
+                }
+                .to_string(),
+            )
+        } else {
+            None
+        },
         installations,
     })
 }
@@ -952,7 +1142,10 @@ if ($entry -and $entry.UninstallString) {{
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                &format!("Start-Process -FilePath '{}' -ArgumentList '/S' -Wait", uninstall_string),
+                &format!(
+                    "Start-Process -FilePath '{}' -ArgumentList '/S' -Wait",
+                    uninstall_string
+                ),
             ]);
             command.creation_flags(CREATE_NO_WINDOW);
             command_output_cancellable(&mut command, "custom uninstall", cancellation)?;
@@ -1163,6 +1356,9 @@ pub async fn check_desktop_app_updates(app: String) -> Result<DesktopAppStatus, 
     let manifest = manifest(&app)?;
     tokio::task::spawn_blocking(move || {
         let mut status = detect_desktop_app(manifest)?;
+        if !status.can_update {
+            return Ok(status);
+        }
         let latest = latest_winget_version(manifest)?;
         status.latest_version = Some(latest);
         Ok(status)
@@ -2003,5 +2199,155 @@ mod tests {
         assert_eq!(job.state, "cancelled");
         assert_eq!(job.error_code.as_deref(), Some("JOB_CANCELLED"));
         assert!(job.completed_at.is_some());
+    }
+
+    // ── Hermes bootstrap detection tests ─────────────────────────────────
+
+    #[cfg(target_os = "windows")]
+    fn create_hermes_bootstrap_layout(
+        root: &std::path::Path,
+        package_json_content: &str,
+        include_app_asar: bool,
+    ) -> std::path::PathBuf {
+        let win_unpacked = root
+            .join("hermes-agent")
+            .join("apps")
+            .join("desktop")
+            .join("release")
+            .join("win-unpacked");
+        std::fs::create_dir_all(&win_unpacked).expect("create win-unpacked dir");
+
+        let exe_path = win_unpacked.join("Hermes.exe");
+        std::fs::write(&exe_path, b"").expect("create Hermes.exe");
+
+        if include_app_asar {
+            let resources = win_unpacked.join("resources");
+            std::fs::create_dir_all(&resources).expect("create resources dir");
+            std::fs::write(resources.join("app.asar"), b"").expect("create app.asar");
+        }
+
+        let desktop_dir = root.join("hermes-agent").join("apps").join("desktop");
+        std::fs::write(desktop_dir.join("package.json"), package_json_content)
+            .expect("create package.json");
+
+        exe_path
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_valid_layout_is_recognized() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"hermes","productName":"Hermes","version":"0.17.0"}"#,
+            true,
+        );
+        let info = validate_hermes_bootstrap_exe(&exe).expect("valid layout should be recognized");
+        assert_eq!(info.version, "0.17.0");
+        assert!(info.exe_path.ends_with("Hermes.exe"));
+        assert!(info.install_dir.ends_with("win-unpacked"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_product_name_match_is_recognized() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"hermes-desktop","productName":"Hermes Desktop","version":"1.2.3"}"#,
+            true,
+        );
+        let info =
+            validate_hermes_bootstrap_exe(&exe).expect("product name match should be recognized");
+        assert_eq!(info.version, "1.2.3");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_cli_shim_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let venv_scripts = dir.path().join("hermes-agent").join("venv").join("Scripts");
+        std::fs::create_dir_all(&venv_scripts).expect("create venv Scripts");
+        let exe = venv_scripts.join("hermes.exe");
+        std::fs::write(&exe, b"").expect("create hermes.exe");
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_setup_exe_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("hermes-setup.exe");
+        std::fs::write(&exe, b"").expect("create hermes-setup.exe");
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_missing_app_asar_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"hermes","version":"0.17.0"}"#,
+            false,
+        );
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_missing_package_json_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"hermes","version":"0.17.0"}"#,
+            true,
+        );
+        // Remove the package.json that create_hermes_bootstrap_layout wrote.
+        let package_json = dir
+            .path()
+            .join("hermes-agent")
+            .join("apps")
+            .join("desktop")
+            .join("package.json");
+        std::fs::remove_file(&package_json).expect("remove package.json");
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_wrong_product_name_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"other-app","productName":"Other App","version":"1.0.0"}"#,
+            true,
+        );
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_empty_version_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe =
+            create_hermes_bootstrap_layout(dir.path(), r#"{"name":"hermes","version":""}"#, true);
+        assert!(validate_hermes_bootstrap_exe(&exe).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hermes_bootstrap_forward_slash_path_is_recognized() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = create_hermes_bootstrap_layout(
+            dir.path(),
+            r#"{"name":"hermes","version":"0.17.0"}"#,
+            true,
+        );
+        // Convert backslashes to forward slashes to verify normalization.
+        let exe_forward = std::path::PathBuf::from(exe.to_string_lossy().replace('\\', "/"));
+        let info = validate_hermes_bootstrap_exe(&exe_forward)
+            .expect("forward-slash path should be recognized");
+        assert_eq!(info.version, "0.17.0");
     }
 }

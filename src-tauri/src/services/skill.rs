@@ -2467,7 +2467,10 @@ impl SkillService {
 
     /// Caller must hold either the Skills state read or write guard.
     fn sync_to_app_unlocked(db: &Arc<Database>, app: &AppType) -> Result<()> {
-        if matches!(app, AppType::ClaudeDesktop | AppType::Pi | AppType::DeepSeekHarness) {
+        if matches!(
+            app,
+            AppType::ClaudeDesktop | AppType::Pi | AppType::DeepSeekHarness
+        ) {
             return Ok(());
         }
 

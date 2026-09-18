@@ -1522,15 +1522,19 @@ fn models_from_settings(settings: &serde_json::Value) -> Vec<String> {
 /// preserves source order and captures display name, context window,
 /// max output tokens, reasoning capability, and input modalities where
 /// the source format provides them.
-fn model_definitions_from_settings(
-    settings: &serde_json::Value,
-) -> Vec<ProviderModelDefinition> {
+fn model_definitions_from_settings(settings: &serde_json::Value) -> Vec<ProviderModelDefinition> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut defs: Vec<ProviderModelDefinition> = Vec::new();
 
     fn extract_meta(
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> (Option<String>, Option<u64>, Option<u64>, Option<bool>, Vec<String>) {
+    ) -> (
+        Option<String>,
+        Option<u64>,
+        Option<u64>,
+        Option<bool>,
+        Vec<String>,
+    ) {
         let meta = match meta {
             Some(m) => m,
             None => {
@@ -1552,9 +1556,7 @@ fn model_definitions_from_settings(
             .or_else(|| meta.get("maxTokens"))
             .or_else(|| meta.get("max_output_tokens"))
             .and_then(serde_json::Value::as_u64);
-        let reasoning = meta
-            .get("reasoning")
-            .and_then(serde_json::Value::as_bool);
+        let reasoning = meta.get("reasoning").and_then(serde_json::Value::as_bool);
         let input_modalities = meta
             .get("input")
             .or_else(|| meta.get("inputModalities"))
@@ -1565,7 +1567,13 @@ fn model_definitions_from_settings(
                     .collect()
             })
             .unwrap_or_default();
-        (display_name, context_window, max_output_tokens, reasoning, input_modalities)
+        (
+            display_name,
+            context_window,
+            max_output_tokens,
+            reasoning,
+            input_modalities,
+        )
     }
 
     fn push_def(
@@ -1601,7 +1609,10 @@ fn model_definitions_from_settings(
         "/model",
         "/options/model",
     ] {
-        if let Some(model) = settings.pointer(pointer).and_then(serde_json::Value::as_str) {
+        if let Some(model) = settings
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+        {
             push_def(model, None, &mut seen, &mut defs);
         }
     }
@@ -2763,17 +2774,16 @@ fn evaluate_preview_target(
         definition.protocol,
         compat
     );
-    let (connection_mode, route_id, requires_takeover) =
-        match compat {
-            Compatibility::Direct => ("direct".to_string(), None, false),
-            Compatibility::Proxy {
-                route_id,
-                requires_takeover,
-            } => ("proxy".to_string(), Some(route_id), requires_takeover),
-            Compatibility::Unsupported { reason } => {
-                return Ok(unsupported_preview_target(app_type, reason));
-            }
-        };
+    let (connection_mode, route_id, requires_takeover) = match compat {
+        Compatibility::Direct => ("direct".to_string(), None, false),
+        Compatibility::Proxy {
+            route_id,
+            requires_takeover,
+        } => ("proxy".to_string(), Some(route_id), requires_takeover),
+        Compatibility::Unsupported { reason } => {
+            return Ok(unsupported_preview_target(app_type, reason));
+        }
+    };
     let projected = match projection(definition, secret.to_string(), &app_type) {
         Ok(provider) => provider,
         Err(error) => {
