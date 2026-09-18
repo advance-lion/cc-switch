@@ -8,6 +8,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
@@ -340,120 +341,225 @@ pub async fn launch_tool_terminal(tool: String) -> Result<(), String> {
         .map_err(|e| format!("runtime launch task join error: {e}"))?
 }
 
-/// Launch the DeepSeek Harness web UI (`dsh web`) in the background and open
-/// the browser.  The server listens on http://127.0.0.1:3080 by default.
+const DSH_WEB_URL: &str = "http://127.0.0.1:3080/";
+const DSH_WEB_PORT: u16 = 3080;
+static DSH_PROCESS: Lazy<Mutex<Option<std::process::Child>>> = Lazy::new(|| Mutex::new(None));
+
+/// Start the DeepSeek Harness Web UI if needed, wait until it is reachable, and
+/// open it in the default browser.
 #[tauri::command]
-pub async fn launch_dsh() -> Result<(), String> {
-    tokio::task::spawn_blocking(|| {
-        spawn_dsh_web()?;
-        wait_for_dsh_ready();
-        open_browser("http://127.0.0.1:3080");
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("dsh launch task join error: {e}"))?
+pub async fn launch_dsh(app: AppHandle) -> Result<(), String> {
+    tokio::task::spawn_blocking(ensure_dsh_running)
+        .await
+        .map_err(|e| format!("dsh launch task join error: {e}"))??;
+    app.opener()
+        .open_url(DSH_WEB_URL, None::<String>)
+        .map_err(|e| format!("failed to open DSH Web UI: {e}"))
 }
 
-/// Restart the DeepSeek Harness web UI: kill the running process on port
-/// 3080, then relaunch `dsh web`.
+/// Restart the DeepSeek Harness Web UI.  First stops the process managed by
+/// this session (if any), then finds and stops any remaining process whose
+/// command line identifies it as DSH (`@deepseek-ai/dsh` + `web`).  An
+/// unrelated process on port 3080 that is not DSH is never terminated.
 #[tauri::command]
-pub async fn restart_dsh() -> Result<(), String> {
-    tokio::task::spawn_blocking(|| {
-        kill_process_on_port(3080);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        spawn_dsh_web()?;
-        wait_for_dsh_ready();
-        open_browser("http://127.0.0.1:3080");
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("dsh restart task join error: {e}"))?
+pub async fn restart_dsh(app: AppHandle) -> Result<(), String> {
+    tokio::task::spawn_blocking(restart_dsh_process)
+        .await
+        .map_err(|e| format!("dsh restart task join error: {e}"))??;
+    app.opener()
+        .open_url(DSH_WEB_URL, None::<String>)
+        .map_err(|e| format!("failed to open DSH Web UI: {e}"))
 }
 
-/// Spawn `dsh web --no-open` as a detached background process.
-fn spawn_dsh_web() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", "/B", "dsh web --no-open"]);
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        cmd.spawn().map_err(|e| format!("Failed to start dsh: {e}"))?;
+fn ensure_dsh_running() -> Result<(), String> {
+    if dsh_port_ready() {
+        return Ok(());
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut cmd = std::process::Command::new("nohup");
-        cmd.args(["dsh", "web", "--no-open"]);
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        cmd.spawn().map_err(|e| format!("Failed to start dsh: {e}"))?;
+
+    let mut managed = DSH_PROCESS
+        .lock()
+        .map_err(|_| "DSH process state is unavailable".to_string())?;
+    if let Some(child) = managed.as_mut() {
+        match child.try_wait() {
+            Ok(None) => return wait_for_dsh_ready(child),
+            Ok(Some(_)) | Err(_) => *managed = None,
+        }
     }
+
+    let mut child = spawn_dsh_web()?;
+    if let Err(error) = wait_for_dsh_ready(&mut child) {
+        let _ = terminate_child_tree(&mut child);
+        return Err(error);
+    }
+    *managed = Some(child);
     Ok(())
 }
 
-/// Wait for the DSH web server to become ready (max ~30s).
-fn wait_for_dsh_ready() {
-    for _ in 0..30 {
-        if std::net::TcpStream::connect("127.0.0.1:3080").is_ok() {
-            break;
+fn restart_dsh_process() -> Result<(), String> {
+    // 1. Stop the process managed by this session, if any.
+    {
+        let mut managed = DSH_PROCESS
+            .lock()
+            .map_err(|_| "DSH process state is unavailable".to_string())?;
+        if let Some(child) = managed.as_mut() {
+            if child
+                .try_wait()
+                .map_err(|e| format!("failed to inspect DSH process: {e}"))?
+                .is_none()
+            {
+                let _ = terminate_child_tree(child);
+                let _ = child.wait();
+            }
+            *managed = None;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
     }
+
+    // 2. Find and stop any remaining DSH process identified by its command
+    //    line.  This covers processes started from a terminal, a batch file,
+    //    DSH Desktop, or a previous CC Switch session.
+    kill_external_dsh_processes();
+
+    // 3. Wait for port 3080 to be released.
+    wait_for_dsh_stopped()?;
+
+    // 4. Relaunch.
+    let mut child = spawn_dsh_web()?;
+    if let Err(error) = wait_for_dsh_ready(&mut child) {
+        let _ = terminate_child_tree(&mut child);
+        return Err(error);
+    }
+    let mut managed = DSH_PROCESS
+        .lock()
+        .map_err(|_| "DSH process state is unavailable".to_string())?;
+    *managed = Some(child);
+    Ok(())
 }
 
-/// Kill the process listening on the given TCP port.
-fn kill_process_on_port(port: u16) {
+/// Find and terminate processes whose command line identifies them as DSH
+/// (`@deepseek-ai/dsh` and `web`).  A process that merely happens to listen on
+/// port 3080 but is not DSH is left alone.
+#[cfg(target_os = "windows")]
+fn kill_external_dsh_processes() {
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            concat!(
+                "Get-CimInstance Win32_Process ",
+                "| Where-Object { ",
+                "$_.CommandLine -match '@deepseek-ai/dsh' ",
+                "-and $_.CommandLine -match 'web' ",
+                "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+            ),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_external_dsh_processes() {
+    // pkill is available on macOS and all common Linux distributions.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "dsh.*web"])
+        .output();
+}
+
+/// Spawn `dsh web --no-open` using the same resolved executable and PATH used
+/// by runtime detection. This is required for npm's `dsh.cmd` shim on Windows.
+fn spawn_dsh_web() -> Result<std::process::Child, String> {
+    use std::process::Stdio;
+
+    let tool_path = locate_default_tool(
+        "dsh",
+        CommandDeadline::from_timeout(Some(std::time::Duration::from_secs(5))),
+    )?;
+    let parent = tool_path.parent().unwrap_or_else(|| Path::new(""));
+
     #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = std::process::Command::new("cmd")
-            .args(["/C", &format!("netstat -ano | findstr :{port}")])
-            .creation_flags(0x08000000)
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains("LISTENING") {
-                    if let Some(pid) = line.split_whitespace().last() {
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/PID", pid, "/F"])
-                            .creation_flags(0x08000000)
-                            .output();
-                    }
-                }
-            }
-        }
-    }
+    let mut command = {
+        let current_path = effective_path_string();
+        let parent = parent.to_string_lossy();
+        let path = merge_path_segments_win(&[parent.as_ref(), &current_path]);
+        build_windows_tool_command(&tool_path, &["web", "--no-open"], &path)
+    };
+
     #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = std::process::Command::new("lsof")
-            .args(["-ti", &format!(":{port}")])
-            .output()
-        {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            for pid in pids.lines() {
-                let _ = std::process::Command::new("kill").arg(pid).output();
-            }
-        }
-    }
+    let mut command = {
+        let current_path = login_shell_path()
+            .map(std::ffi::OsString::from)
+            .or_else(effective_path_os)
+            .unwrap_or_default();
+        let path = prepend_search_dir_to_path(parent, &current_path);
+        let mut command = std::process::Command::new(&tool_path);
+        command.args(["web", "--no-open"]).env("PATH", path);
+        isolate_child_process_group(&mut command);
+        command
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("无法启动 DeepSeek Harness：{e}"))
 }
 
-/// Open a URL in the user's default browser.
-fn open_browser(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(0x08000000)
-            .spawn();
+fn dsh_port_ready() -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], DSH_WEB_PORT));
+    tcp_port_ready(address, std::time::Duration::from_millis(250))
+}
+
+fn tcp_port_ready(address: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&address, timeout).is_ok()
+}
+
+fn wait_for_dsh_ready(child: &mut std::process::Child) -> Result<(), String> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], DSH_WEB_PORT));
+    wait_for_process_ready(
+        child,
+        address,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    )
+}
+
+fn wait_for_process_ready(
+    child: &mut std::process::Child,
+    address: std::net::SocketAddr,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if tcp_port_ready(
+            address,
+            poll_interval.min(std::time::Duration::from_millis(250)),
+        ) {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("无法检查 DSH 启动状态：{e}"))?
+        {
+            return Err(format!("DeepSeek Harness 启动进程提前退出：{status}"));
+        }
+        std::thread::sleep(poll_interval);
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
+    Err(format!(
+        "DeepSeek Harness Web 服务未在 {} 秒内启动",
+        timeout.as_secs()
+    ))
+}
+
+fn wait_for_dsh_stopped() -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !dsh_port_ready() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    Err("DSH 进程已结束，但 3080 端口仍被占用".to_string())
 }
 
 /// 卸载由 npm 全局安装的 Runtime。
@@ -1141,6 +1247,7 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "opencode" => Some("npm i -g opencode-ai@latest"),
         "openclaw" => Some("npm i -g openclaw@latest"),
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
+        "dsh" => Some("npm i -g @deepseek-ai/dsh@latest"),
         _ => None,
     }
 }
@@ -1454,6 +1561,7 @@ pub(super) async fn get_single_tool_version_impl(
                 fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local)
                     .await
             }
+            "dsh" => fetch_npm_latest_for_tool(&client, "@deepseek-ai/dsh", tool, local).await,
             _ => None,
         }
     } else {
@@ -5618,6 +5726,113 @@ mod tests {
     }
 
     #[test]
+    fn dsh_lifecycle_metadata_uses_official_npm_package() {
+        assert_eq!(npm_package_for("dsh"), Some("@deepseek-ai/dsh"));
+        assert_eq!(
+            npm_install_command_for("dsh"),
+            Some("npm i -g @deepseek-ai/dsh@latest")
+        );
+        assert_eq!(official_update_args("dsh"), None);
+        for action in [ToolLifecycleAction::Install, ToolLifecycleAction::Update] {
+            assert_eq!(
+                tool_action_shell_command_for_shell("dsh", action, LifecycleCommandShell::Posix)
+                    .as_deref(),
+                Some("npm i -g @deepseek-ai/dsh@latest")
+            );
+        }
+    }
+
+    #[test]
+    fn dsh_readiness_succeeds_when_port_is_listening() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let mut child = spawn_sleeping_test_process();
+
+        let result = wait_for_process_ready(
+            &mut child,
+            address,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(5),
+        );
+
+        let _ = terminate_child_tree(&mut child);
+        let _ = child.wait();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn dsh_readiness_reports_an_early_process_exit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let address = listener.local_addr().expect("read reserved port");
+        drop(listener);
+        let mut child = spawn_exiting_test_process();
+
+        let error = wait_for_process_ready(
+            &mut child,
+            address,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
+        )
+        .expect_err("an exited child must not be reported as ready");
+
+        assert!(error.contains("启动进程提前退出"), "{error}");
+    }
+
+    #[test]
+    fn dsh_readiness_reports_a_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let address = listener.local_addr().expect("read reserved port");
+        drop(listener);
+        let mut child = spawn_sleeping_test_process();
+
+        let error = wait_for_process_ready(
+            &mut child,
+            address,
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_millis(5),
+        )
+        .expect_err("an unopened port must time out");
+
+        let _ = terminate_child_tree(&mut child);
+        let _ = child.wait();
+        assert!(error.contains("未在"), "{error}");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_sleeping_test_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/D", "/S", "/C", "ping -n 6 127.0.0.1 >NUL"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn sleeping test process")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_sleeping_test_process() -> std::process::Child {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        isolate_child_process_group(&mut command);
+        command.spawn().expect("spawn sleeping test process")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_exiting_test_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/D", "/S", "/C", "exit 7"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn exiting test process")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_exiting_test_process() -> std::process::Child {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        isolate_child_process_group(&mut command);
+        command.spawn().expect("spawn exiting test process")
+    }
+
+    #[test]
     fn test_extract_version() {
         assert_eq!(extract_version("claude 1.0.20"), "1.0.20");
         assert_eq!(extract_version("v2.3.4-beta.1"), "2.3.4-beta.1");
@@ -7614,6 +7829,26 @@ mod tests {
         assert_eq!(
             windows_shell_compatible_path(Path::new(r"C:\tools\codex.cmd")),
             PathBuf::from(r"C:\tools\codex.cmd")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_dsh_cmd_receives_web_arguments_separately() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let cmd = dir.path().join("dsh.cmd");
+        std::fs::write(&cmd, "@echo off\r\necho %1 %2\r\n")
+            .expect("dsh cmd shim should be created");
+        let canonical = std::fs::canonicalize(&cmd).expect("dsh cmd shim should canonicalize");
+        let current_path = effective_path_string();
+
+        let output = run_windows_tool_command(&canonical, &["web", "--no-open"], &current_path)
+            .expect("dsh cmd shim should execute");
+
+        assert!(output.status.success());
+        assert_eq!(
+            decode_command_output(&output.stdout).trim(),
+            "\"web\" \"--no-open\""
         );
     }
 

@@ -9,6 +9,15 @@ import type {
   ToolLifecycleCapabilities,
 } from "@/lib/api";
 
+const toastMock = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("sonner", () => ({
+  toast: toastMock,
+}));
+
 const settingsApiMock = vi.hoisted(() => ({
   getToolVersions: vi.fn(),
   checkToolUpdates: vi.fn(),
@@ -19,6 +28,8 @@ const settingsApiMock = vi.hoisted(() => ({
   getCliLifecycleJob: vi.fn(),
   cancelCliLifecycleJob: vi.fn(),
   launchToolTerminal: vi.fn(),
+  launchDsh: vi.fn(),
+  restartDsh: vi.fn(),
   uninstallToolRuntime: vi.fn(),
   getDesktopAppStatus: vi.fn(),
   checkDesktopAppUpdates: vi.fn(),
@@ -116,6 +127,8 @@ describe("RuntimeLifecycleCard", () => {
     settingsApiMock.listCliLifecycleJobs.mockResolvedValue([]);
     settingsApiMock.getCliLifecycleJob.mockResolvedValue(null);
     settingsApiMock.cancelCliLifecycleJob.mockResolvedValue(true);
+    settingsApiMock.launchDsh.mockResolvedValue(undefined);
+    settingsApiMock.restartDsh.mockResolvedValue(undefined);
   });
 
   it("keeps a sticky app summary while lifecycle details can be collapsed", async () => {
@@ -309,6 +322,69 @@ describe("RuntimeLifecycleCard", () => {
     );
     await waitFor(() =>
       expect(settingsApiMock.launchToolTerminal).toHaveBeenCalledWith("grok"),
+    );
+  });
+
+  it("launches and restarts DSH through its Web service APIs", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.getToolVersions.mockResolvedValue([
+      {
+        name: "dsh",
+        version: "1.0.0",
+        latest_version: null,
+        error: null,
+        installed_but_broken: false,
+      },
+    ]);
+    settingsApiMock.getToolLifecycleCapabilities.mockResolvedValue([
+      { ...capabilities, name: "dsh" },
+    ]);
+
+    render(<RuntimeLifecycleCard appId="dsh" isConfigured />);
+
+    expect(
+      await screen.findByText("appLifecycle.dshDescription"),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("appLifecycle.cliDescription"),
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "appLifecycle.dshLaunch" }),
+    );
+
+    await waitFor(() =>
+      expect(settingsApiMock.launchDsh).toHaveBeenCalledOnce(),
+    );
+    expect(settingsApiMock.launchToolTerminal).not.toHaveBeenCalled();
+    expect(toastMock.success).toHaveBeenCalledWith("appLifecycle.dshStarted");
+
+    await user.click(
+      screen.getByRole("button", { name: "appLifecycle.restart" }),
+    );
+
+    await waitFor(() =>
+      expect(settingsApiMock.restartDsh).toHaveBeenCalledOnce(),
+    );
+    expect(toastMock.success).toHaveBeenCalledWith("appLifecycle.dshRestarted");
+  });
+
+  it("restores the DSH launch button after a launch failure", async () => {
+    const user = userEvent.setup();
+    settingsApiMock.launchDsh.mockRejectedValueOnce(new Error("port busy"));
+
+    render(<RuntimeLifecycleCard appId="dsh" isConfigured />);
+
+    const launchButton = await screen.findByRole("button", {
+      name: "appLifecycle.dshLaunch",
+    });
+    await user.click(launchButton);
+
+    await waitFor(() => expect(launchButton).toBeEnabled());
+    expect(settingsApiMock.launchToolTerminal).not.toHaveBeenCalled();
+    expect(toastMock.error).toHaveBeenCalledWith(
+      "appLifecycle.dshLaunchFailed",
+      { description: "port busy" },
     );
   });
 

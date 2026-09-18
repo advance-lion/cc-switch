@@ -94,7 +94,10 @@ type CliRefreshResult = {
 type DesktopRefreshResult = DesktopAppStatus | null;
 
 const cliRefreshInFlight = new Map<RuntimeTool, Promise<CliRefreshResult>>();
-const desktopRefreshInFlight = new Map<DesktopAppId, Promise<DesktopRefreshResult>>();
+const desktopRefreshInFlight = new Map<
+  DesktopAppId,
+  Promise<DesktopRefreshResult>
+>();
 
 interface RuntimeLifecycleCardProps {
   appId: AppId;
@@ -130,6 +133,7 @@ interface LifecycleRowProps {
   canLaunch: boolean;
   disabledReason?: string | null;
   launchLabel: string;
+  launchIcon?: "terminal" | "monitorPlay";
   onInstall: () => void;
   onAiInstall?: () => void;
   onLaunch: () => void;
@@ -223,6 +227,7 @@ function LifecycleRow({
   canLaunch,
   disabledReason,
   launchLabel,
+  launchIcon = "terminal",
   onInstall,
   onAiInstall,
   onLaunch,
@@ -299,7 +304,7 @@ function LifecycleRow({
             >
               {action === "launch" ? (
                 <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-              ) : title.includes("Desktop") ? (
+              ) : launchIcon === "monitorPlay" ? (
                 <MonitorPlay className="mr-1.5 h-3.5 w-3.5" />
               ) : (
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
@@ -584,15 +589,20 @@ function CliLifecycleRow({
     try {
       if (tool === "dsh") {
         await settingsApi.launchDsh();
-        toast.success("DSH Web UI 已启动");
+        toast.success(t("appLifecycle.dshStarted"));
       } else {
         await settingsApi.launchToolTerminal(tool);
         toast.success(t("appLifecycle.terminalOpened"));
       }
     } catch (error) {
-      toast.error(t("appLifecycle.launchFailed"), {
-        description: extractErrorMessage(error),
-      });
+      toast.error(
+        t(
+          tool === "dsh"
+            ? "appLifecycle.dshLaunchFailed"
+            : "appLifecycle.launchFailed",
+        ),
+        { description: extractErrorMessage(error) },
+      );
     } finally {
       setAction(null);
     }
@@ -602,9 +612,9 @@ function CliLifecycleRow({
     setAction("launch");
     try {
       await settingsApi.restartDsh();
-      toast.success("DSH Web UI 已重启");
+      toast.success(t("appLifecycle.dshRestarted"));
     } catch (error) {
-      toast.error("重启失败", {
+      toast.error(t("appLifecycle.dshRestartFailed"), {
         description: extractErrorMessage(error),
       });
     } finally {
@@ -668,7 +678,10 @@ function CliLifecycleRow({
           canUninstall={capabilities?.can_uninstall ?? false}
           canLaunch={capabilities?.can_launch ?? false}
           disabledReason={capabilities?.reason}
-          launchLabel={t("appLifecycle.launch")}
+          launchLabel={t(
+            tool === "dsh" ? "appLifecycle.dshLaunch" : "appLifecycle.launch",
+          )}
+          launchIcon={tool === "dsh" ? "monitorPlay" : "terminal"}
           onInstall={() => void runLifecycle("install")}
           onAiInstall={onAiInstall}
           onLaunch={() => void launch()}
@@ -687,7 +700,7 @@ function CliLifecycleRow({
             className="inline-flex items-center gap-1.5 rounded-md border border-border-default px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent/50"
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            重启
+            {t("appLifecycle.restart")}
           </button>
         )}
         {activeJob &&
@@ -964,6 +977,7 @@ function DesktopLifecycleRow({
           canLaunch={status?.can_launch ?? false}
           disabledReason={status?.reason}
           launchLabel={t("appLifecycle.launchDesktop")}
+          launchIcon="monitorPlay"
           onInstall={() => void runLifecycle("install")}
           onAiInstall={onAiInstall}
           onLaunch={() => void launch()}
@@ -1113,7 +1127,11 @@ export function RuntimeLifecycleCard({
               <CliLifecycleRow
                 tool={tool}
                 title={cliTitle}
-                subtitle={t("appLifecycle.cliDescription")}
+                subtitle={t(
+                  tool === "dsh"
+                    ? "appLifecycle.dshDescription"
+                    : "appLifecycle.cliDescription",
+                )}
                 refreshRequestId={refreshRequestId}
                 onAiInstall={
                   onAiInstall
