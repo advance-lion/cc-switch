@@ -5,6 +5,19 @@ import { openclawKeys } from "@/hooks/useOpenClaw";
 import { hermesKeys } from "@/hooks/useHermes";
 import { piKeys } from "@/lib/query/pi";
 
+export const providerCenterKeys = {
+  all: ["provider-center"] as const,
+  state: ["provider-center", "state"] as const,
+  agentCatalogs: ["provider-center", "agent-catalog"] as const,
+  agentCatalog: (appId: AppId) =>
+    ["provider-center", "agent-catalog", appId] as const,
+};
+
+export const providerLiveMembershipKeys = {
+  all: ["provider-live-membership"] as const,
+  app: (appId: AppId) => ["provider-live-membership", appId] as const,
+};
+
 export async function refreshProviderCenterApplyCaches(
   queryClient: QueryClient,
   appId: AppId,
@@ -18,14 +31,14 @@ export async function refreshProviderCenterApps(
 ): Promise<void> {
   const uniqueAppIds = Array.from(new Set(appIds));
   const invalidations: Array<Promise<unknown>> = [
-    queryClient.invalidateQueries({ queryKey: ["providerCenter"] }),
+    queryClient.invalidateQueries({ queryKey: providerCenterKeys.all }),
   ];
 
   for (const appId of uniqueAppIds) {
     invalidations.push(
       queryClient.invalidateQueries({ queryKey: ["providers", appId] }),
       queryClient.invalidateQueries({
-        queryKey: ["providerCenter", "agentCatalog", appId],
+        queryKey: providerCenterKeys.agentCatalog(appId),
       }),
     );
 
@@ -54,6 +67,12 @@ export async function refreshProviderCenterApps(
     } else if (appId === "pi") {
       invalidations.push(
         queryClient.invalidateQueries({ queryKey: piKeys.currentState }),
+      );
+    } else if (appId === "dsh") {
+      invalidations.push(
+        queryClient.invalidateQueries({
+          queryKey: providerLiveMembershipKeys.app(appId),
+        }),
       );
     }
   }

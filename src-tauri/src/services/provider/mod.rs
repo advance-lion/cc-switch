@@ -2,6 +2,7 @@
 //!
 //! Handles provider CRUD operations, switching, and configuration management.
 
+mod dsh;
 mod endpoints;
 mod gemini_auth;
 mod live;
@@ -23,6 +24,7 @@ use crate::settings::CustomEndpoint;
 use crate::store::AppState;
 
 // Re-export sub-module functions for external access
+pub use dsh::{DshProviderService, ProviderLiveMembership};
 pub use live::{
     import_default_config, import_hermes_providers_from_live, import_openclaw_providers_from_live,
     import_opencode_providers_from_live, read_live_settings,
@@ -4424,6 +4426,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::add(state, provider, add_to_live);
         }
+        if app_type == AppType::DeepSeekHarness {
+            return dsh::DshProviderService::add(state, provider, add_to_live);
+        }
 
         let mut provider = provider;
         // Normalize Claude model keys
@@ -4544,6 +4549,9 @@ impl ProviderService {
     ) -> Result<bool, AppError> {
         if app_type == AppType::Pi {
             return pi::update(state, original_id, provider);
+        }
+        if app_type == AppType::DeepSeekHarness {
+            return dsh::DshProviderService::update(state, original_id, provider);
         }
 
         let mut provider = provider;
@@ -4896,6 +4904,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::delete(state, id);
         }
+        if app_type == AppType::DeepSeekHarness {
+            return dsh::DshProviderService::delete(state, id);
+        }
 
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
@@ -4970,6 +4981,9 @@ impl ProviderService {
     ) -> Result<(), AppError> {
         if app_type == AppType::Pi {
             return pi::remove(state, id);
+        }
+        if app_type == AppType::DeepSeekHarness {
+            return dsh::DshProviderService::set_enabled(state, id, false);
         }
 
         match app_type {
@@ -6429,7 +6443,7 @@ impl ProviderService {
                 crate::pi_config::validate_provider_node(&provider.id, &provider.settings_config)?;
             }
             AppType::DeepSeekHarness => {
-                // DSH has no provider settings to validate
+                dsh::DshProviderService::validate_provider(&provider)?;
             }
         }
 

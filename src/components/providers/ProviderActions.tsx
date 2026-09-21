@@ -61,6 +61,7 @@ interface ProviderActionsProps {
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
   isStateChangeProtected?: boolean;
+  stateChangeHint?: string;
   defaultModelOptions?: OpenClawDefaultModelOption[];
   onSetAsDefault?: (modelId?: string) => void;
 }
@@ -106,6 +107,7 @@ export function ProviderActions({
   isDefaultModel = false,
   isRemovalProtected = false,
   isStateChangeProtected = false,
+  stateChangeHint,
   defaultModelOptions = [],
   onSetAsDefault,
 }: ProviderActionsProps) {
@@ -122,6 +124,7 @@ export function ProviderActions({
     !isAdditiveMode && !isOmo && isAutoFailoverEnabled && onToggleFailover;
   const isMembershipMode = isAdditiveMode;
   const piStateChangeHint = t("pi.current.stateUnavailableHint");
+  const protectedStateChangeHint = stateChangeHint ?? piStateChangeHint;
 
   const handleMainButtonClick = () => {
     if (isOmo) {
@@ -184,7 +187,7 @@ export function ProviderActions({
           text: isInConfig
             ? t("provider.removeFromConfig", { defaultValue: "移除" })
             : t("provider.enable", { defaultValue: "启用" }),
-          title: piStateChangeHint,
+          title: protectedStateChangeHint,
         };
       }
       if (isInConfig) {
@@ -471,21 +474,21 @@ export function ProviderActions({
           </Button>
         )}
 
-      <Button
-        size="icon"
-        variant="ghost"
-        onClick={canDelete ? onDelete : undefined}
-        disabled={!canDelete}
-        aria-label={t("common.delete")}
-        title={deleteHint}
-        className={cn(
-          iconButtonClass,
-          canDelete && "hover:text-red-500 dark:hover:text-red-400",
-          !canDelete && "opacity-40 cursor-not-allowed text-muted-foreground",
-        )}
-      >
-        <Trash2 className="h-4 w-4" />
-      </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={canDelete ? onDelete : undefined}
+          disabled={!canDelete}
+          aria-label={t("common.delete")}
+          title={deleteHint}
+          className={cn(
+            iconButtonClass,
+            canDelete && "hover:text-red-500 dark:hover:text-red-400",
+            !canDelete && "opacity-40 cursor-not-allowed text-muted-foreground",
+          )}
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
       </div>
     </div>
   );

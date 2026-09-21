@@ -31,6 +31,18 @@ export interface WebDavSyncResult {
   status: string;
 }
 
+export type ProviderLiveMembership =
+  | {
+      status: "available";
+      providerIds: string[];
+      error?: never;
+    }
+  | {
+      status: "unavailable";
+      providerIds?: never;
+      error?: string;
+    };
+
 export interface CodexAssistantChatTurn {
   role: "user" | "assistant";
   content: string;
@@ -79,7 +91,10 @@ export interface CodexDesktopStatus {
   path: string | null;
 }
 
-export type DesktopAppId = "codex-desktop" | "claude-desktop" | "hermes-desktop";
+export type DesktopAppId =
+  | "codex-desktop"
+  | "claude-desktop"
+  | "hermes-desktop";
 export type DesktopLifecycleAction = "install" | "update" | "uninstall";
 
 export interface DesktopAppStatus {
@@ -683,6 +698,24 @@ export const settingsApi = {
 
   async listCliLifecycleJobs(tool?: string): Promise<CliLifecycleJob[]> {
     return await invoke("list_cli_lifecycle_jobs", { tool });
+  },
+
+  /** Read authoritative live membership for an additive provider app. */
+  async getProviderLiveMembership(app: AppId): Promise<ProviderLiveMembership> {
+    return await invoke("get_provider_live_membership", { app });
+  },
+
+  /** Add or remove one provider from an additive app's live membership. */
+  async setProviderLiveEnabled(
+    app: AppId,
+    providerId: string,
+    enabled: boolean,
+  ): Promise<ProviderLiveMembership> {
+    return await invoke("set_provider_live_enabled", {
+      app,
+      providerId,
+      enabled,
+    });
   },
 
   /** 在用户首选终端中启动已登记 Runtime 的 CLI。后端只接受受支持的工具名。 */

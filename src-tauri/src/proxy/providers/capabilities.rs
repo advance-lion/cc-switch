@@ -107,6 +107,12 @@ pub fn resolve_compatibility(upstream_protocol: &str, target_agent: &str) -> Com
         // ── Pi (universal) ───────────────────────────────────────────
         ("pi", _) => Compatibility::Direct,
 
+        // ── DeepSeek Harness ─────────────────────────────────────────────
+        // Hand-declared llm-pi-ai providers support these three native APIs.
+        ("dsh", "openai-chat" | "openai-responses" | "anthropic" | "ollama") => {
+            Compatibility::Direct
+        }
+
         // ── Everything else ──────────────────────────────────────────
         _ => Compatibility::Unsupported {
             reason: format!(

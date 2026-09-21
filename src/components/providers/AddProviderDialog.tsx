@@ -171,7 +171,8 @@ export function AddProviderDialog({
         (appId === "opencode" ||
           appId === "openclaw" ||
           appId === "hermes" ||
-          appId === "pi") &&
+          appId === "pi" ||
+          appId === "dsh") &&
         values.providerKey
       ) {
         providerData.providerKey = values.providerKey;
@@ -342,8 +343,7 @@ export function AddProviderDialog({
           setSelectedTargetApps(
             PROVIDER_CENTER_APPS.filter((candidate) =>
               preview.targets.some(
-                (target) =>
-                  target.appType === candidate && target.compatible,
+                (target) => target.appType === candidate && target.compatible,
               ),
             ),
           );
@@ -433,11 +433,7 @@ export function AddProviderDialog({
       <Button
         type="submit"
         form="provider-form"
-        disabled={
-          isFormSubmitting ||
-          managedDraftPreviewing ||
-          !isFormReady
-        }
+        disabled={isFormSubmitting || managedDraftPreviewing || !isFormReady}
         className="bg-primary text-primary-foreground hover:bg-primary/90"
       >
         {isFormSubmitting || managedDraftPreviewing ? (

@@ -70,20 +70,32 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
   return (PROXY_APP_IDS as string[]).includes(appId);
 }
 
+export type ProviderMode = "switch" | "additive";
+
+export const PROVIDER_MODE_BY_APP: Record<AppId, ProviderMode> = {
+  claude: "switch",
+  "claude-desktop": "switch",
+  codex: "switch",
+  gemini: "switch",
+  grokbuild: "switch",
+  opencode: "additive",
+  openclaw: "additive",
+  hermes: "additive",
+  pi: "additive",
+  dsh: "additive",
+};
+
 export type AdditiveAppId = Extract<
   AppId,
-  "opencode" | "openclaw" | "hermes" | "pi"
+  "opencode" | "openclaw" | "hermes" | "pi" | "dsh"
 >;
 
-export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
-  "opencode",
-  "openclaw",
-  "hermes",
-  "pi",
-];
+export const ADDITIVE_APP_IDS = APP_IDS.filter(
+  (appId): appId is AdditiveAppId => PROVIDER_MODE_BY_APP[appId] === "additive",
+);
 
 export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
-  return (ADDITIVE_APP_IDS as string[]).includes(appId);
+  return PROVIDER_MODE_BY_APP[appId as AppId] === "additive";
 }
 
 /** Pi has no native MCP registry; do not manufacture a disabled mirror.

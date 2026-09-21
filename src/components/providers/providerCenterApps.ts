@@ -10,6 +10,7 @@ export const PROVIDER_CENTER_APPS: ProviderCenterApp[] = [
   "openclaw",
   "hermes",
   "pi",
+  "dsh",
 ];
 
 export const PROVIDER_CENTER_APP_LABELS: Record<ProviderCenterApp, string> = {
@@ -22,10 +23,9 @@ export const PROVIDER_CENTER_APP_LABELS: Record<ProviderCenterApp, string> = {
   openclaw: "OpenClaw",
   hermes: "Hermes",
   pi: "Pi",
+  dsh: "DeepSeek Harness",
 };
 
 export function providerCenterAppLabel(appType: string): string {
-  return (
-    PROVIDER_CENTER_APP_LABELS[appType as ProviderCenterApp] ?? appType
-  );
+  return PROVIDER_CENTER_APP_LABELS[appType as ProviderCenterApp] ?? appType;
 }

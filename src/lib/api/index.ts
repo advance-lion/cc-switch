@@ -23,6 +23,7 @@ export type {
   DesktopLifecycleJob,
   CliLifecycleJob,
   ToolLifecycleCapabilities,
+  ProviderLiveMembership,
 } from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";

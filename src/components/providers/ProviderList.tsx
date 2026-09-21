@@ -13,7 +13,7 @@ import {
   type CSSProperties,
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Search, X } from "lucide-react";
+import { AlertTriangle, Loader2, Play, Search, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -25,6 +25,8 @@ import {
   type ProviderCenterApp,
 } from "@/lib/api/providerCenter";
 import { providersApi } from "@/lib/api/providers";
+import { settingsApi } from "@/lib/api/settings";
+import { providerLiveMembershipKeys } from "@/lib/query/providerCenter";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { useDragSort } from "@/hooks/useDragSort";
 import {
@@ -108,6 +110,7 @@ export function ProviderList({
   onManagedDelete,
 }: ProviderListProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const { checkProvider, isChecking } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
@@ -117,7 +120,7 @@ export function ProviderList({
     queryKey: ["provider-center", "agent-catalog", appId],
     queryFn: () =>
       providerCenterApi.getAgentProviderCatalog(appId as ProviderCenterApp),
-    enabled: appId !== "dsh",
+    enabled: Boolean(appId),
   });
   const catalogByProviderId = useMemo(
     () =>
@@ -141,6 +144,52 @@ export function ProviderList({
   // Hermes: 查询 live 配置中的供应商 ID 列表，用于判断 isInConfig
   const { data: hermesLiveIds } = useHermesLiveProviderIds(appId === "hermes");
 
+  const {
+    data: dshMembership,
+    isLoading: isDshMembershipLoading,
+    isError: isDshMembershipQueryError,
+    error: dshMembershipQueryError,
+  } = useQuery({
+    queryKey: providerLiveMembershipKeys.app("dsh"),
+    queryFn: () => settingsApi.getProviderLiveMembership("dsh"),
+    enabled: appId === "dsh",
+    refetchInterval: appId === "dsh" ? 5000 : false,
+  });
+  const dshMembershipUnavailable =
+    appId === "dsh" &&
+    (isDshMembershipQueryError || dshMembership?.status === "unavailable");
+  const dshMembershipError = isDshMembershipQueryError
+    ? extractErrorMessage(dshMembershipQueryError)
+    : dshMembership?.error;
+  const [isLaunchingDsh, setIsLaunchingDsh] = useState(false);
+
+  const handleLaunchDsh = useCallback(async () => {
+    setIsLaunchingDsh(true);
+    try {
+      await settingsApi.launchDsh();
+      await queryClient.invalidateQueries({
+        queryKey: providerLiveMembershipKeys.app("dsh"),
+      });
+      toast.success(
+        t("dsh.launchStarted", {
+          defaultValue: "DeepSeek Harness Web UI 已启动",
+        }),
+      );
+    } catch (error) {
+      toast.error(
+        t("dsh.launchFailed", {
+          defaultValue: "启动 DeepSeek Harness 失败",
+        }),
+        {
+          description: extractErrorMessage(error) || undefined,
+          closeButton: true,
+        },
+      );
+    } finally {
+      setIsLaunchingDsh(false);
+    }
+  }, [queryClient, t]);
+
   // Hermes: 读取当前 model.provider，用于判断哪个供应商是"当前激活"（高亮）
   const { data: hermesModelConfig } = useHermesModelConfig(appId === "hermes");
   const hermesCurrentProviderId = hermesModelConfig?.provider;
@@ -157,9 +206,14 @@ export function ProviderList({
       if (appId === "hermes") {
         return hermesLiveIds?.includes(providerId) ?? false;
       }
-      return true; // 其他应用始终返回 true
+      if (appId === "dsh") {
+        return dshMembership?.status === "available"
+          ? dshMembership.providerIds.includes(providerId)
+          : false;
+      }
+      return true; // 非累加模式不使用 membership
     },
-    [appId, opencodeLiveIds, openclawLiveIds, hermesLiveIds],
+    [appId, opencodeLiveIds, openclawLiveIds, hermesLiveIds, dshMembership],
   );
 
   // OpenClaw: query default model to determine which provider is default
@@ -274,7 +328,6 @@ export function ProviderList({
   );
 
   // Import current live config as default provider
-  const queryClient = useQueryClient();
   const importMutation = useMutation({
     mutationFn: async (): Promise<boolean> => {
       if (appId === "opencode") {
@@ -472,6 +525,41 @@ export function ProviderList({
     return (
       <div className="mt-4 space-y-4">
         {piStateErrorNotice}
+        {dshMembershipUnavailable && (
+          <div
+            role="alert"
+            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+          >
+            <div className="flex items-center gap-2 font-medium">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {t("dsh.membership.unavailable", {
+                defaultValue: "无法读取 DeepSeek Harness 当前配置",
+              })}
+            </div>
+            <p className="mt-1 text-xs leading-relaxed">
+              {t("dsh.membership.unavailableHint", {
+                defaultValue:
+                  "DeepSeek Harness 当前不可用；数据库中的 Provider 已保留，启动后才能添加或移除。",
+              })}
+              {dshMembershipError ? ` ${dshMembershipError}` : ""}
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="mt-3"
+              disabled={isLaunchingDsh}
+              onClick={() => void handleLaunchDsh()}
+            >
+              {isLaunchingDsh ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              {t("dsh.launch", { defaultValue: "启动 DSH" })}
+            </Button>
+          </div>
+        )}
         <ProviderEmptyState
           appId={appId}
           onCreate={appId === "pi" ? undefined : onCreate}
@@ -535,9 +623,7 @@ export function ProviderList({
             ? (enabled) => handleToggleFailover(provider.id, enabled)
             : undefined
         }
-        activeProviderId={
-          supportsFailover ? activeProviderId : undefined
-        }
+        activeProviderId={supportsFailover ? activeProviderId : undefined}
         isDefaultModel={
           appId === "hermes"
             ? isHermesCurrent
@@ -553,18 +639,28 @@ export function ProviderList({
                 : false
         }
         isStateChangeProtected={
-          appId === "pi" && !isPiAuthoritativeStateReady
+          (appId === "pi" && !isPiAuthoritativeStateReady) ||
+          (appId === "dsh" &&
+            (isDshMembershipLoading || dshMembershipUnavailable))
+        }
+        stateChangeHint={
+          appId === "dsh"
+            ? isDshMembershipLoading
+              ? t("dsh.membership.loading", {
+                  defaultValue: "正在读取 DeepSeek Harness 当前配置",
+                })
+              : t("dsh.membership.unavailableHint", {
+                  defaultValue:
+                    "DeepSeek Harness 当前不可用；启动后才能添加或移除 Provider。",
+                })
+            : undefined
         }
         managedByProviderCenter={
           catalogItem?.ownership === "providerCenterProjection"
         }
         onManageScope={
           onManageScope && catalogItem?.definitionId
-            ? () =>
-                onManageScope(
-                  catalogItem.definitionId!,
-                  provider.name,
-                )
+            ? () => onManageScope(catalogItem.definitionId!, provider.name)
             : undefined
         }
         onManagedDelete={
@@ -633,6 +729,41 @@ export function ProviderList({
   return (
     <div className="mt-4 space-y-4">
       {piStateErrorNotice}
+      {dshMembershipUnavailable && (
+        <div
+          role="alert"
+          className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+        >
+          <div className="flex items-center gap-2 font-medium">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            {t("dsh.membership.unavailable", {
+              defaultValue: "无法读取 DeepSeek Harness 当前配置",
+            })}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed">
+            {t("dsh.membership.unavailableHint", {
+              defaultValue:
+                "DeepSeek Harness 当前不可用；数据库中的 Provider 已保留，启动后才能添加或移除。",
+            })}
+            {dshMembershipError ? ` ${dshMembershipError}` : ""}
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="mt-3"
+            disabled={isLaunchingDsh}
+            onClick={() => void handleLaunchDsh()}
+          >
+            {isLaunchingDsh ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Play className="h-4 w-4" />
+            )}
+            {t("dsh.launch", { defaultValue: "启动 DSH" })}
+          </Button>
+        </div>
+      )}
       {claudeDesktopStatusMessages.length > 0 && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
           <div className="flex items-center gap-2 font-medium">
@@ -782,6 +913,7 @@ interface SortableProviderCardProps {
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
   isStateChangeProtected?: boolean;
+  stateChangeHint?: string;
   managedByProviderCenter?: boolean;
   onManageScope?: () => void;
   onManagedDelete?: () => void;
@@ -817,6 +949,7 @@ function SortableProviderCard({
   isDefaultModel,
   isRemovalProtected,
   isStateChangeProtected,
+  stateChangeHint,
   managedByProviderCenter,
   onManageScope,
   onManagedDelete,
@@ -875,6 +1008,7 @@ function SortableProviderCard({
         isDefaultModel={isDefaultModel}
         isRemovalProtected={isRemovalProtected}
         isStateChangeProtected={isStateChangeProtected}
+        stateChangeHint={stateChangeHint}
         managedByProviderCenter={managedByProviderCenter}
         onManageScope={onManageScope}
         onManagedDelete={onManagedDelete}

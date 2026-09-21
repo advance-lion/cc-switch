@@ -120,6 +120,10 @@ import {
   useDisableCurrentOmoSlim,
 } from "@/lib/query/omo";
 import { invalidatePiProviderCaches, usePiCurrentState } from "@/lib/query/pi";
+import {
+  providerLiveMembershipKeys,
+  refreshProviderCenterApps,
+} from "@/lib/query/providerCenter";
 import WorkspaceFilesPanel from "@/components/workspace/WorkspaceFilesPanel";
 import EnvPanel from "@/components/openclaw/EnvPanel";
 import ToolsPanel from "@/components/openclaw/ToolsPanel";
@@ -284,10 +288,8 @@ function App() {
   const { data: agentProviderCatalog } = useQuery({
     queryKey: ["provider-center", "agent-catalog", activeApp],
     queryFn: () =>
-      providerCenterApi.getAgentProviderCatalog(
-        activeApp as ProviderCenterApp,
-      ),
-    enabled: Boolean(activeApp) && activeApp !== "dsh",
+      providerCenterApi.getAgentProviderCatalog(activeApp as ProviderCenterApp),
+    enabled: Boolean(activeApp),
     staleTime: 30_000,
   });
 
@@ -384,7 +386,7 @@ function App() {
   const providers = useMemo(() => data?.providers ?? {}, [data]);
   const codexProviderReady = Boolean(
     codexProviderData?.currentProviderId &&
-    codexProviderData.providers[codexProviderData.currentProviderId],
+      codexProviderData.providers[codexProviderData.currentProviderId],
   );
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
@@ -446,6 +448,29 @@ function App() {
         {
           description:
             translatePiProviderMutationError(detail, t) || detail || undefined,
+          closeButton: true,
+        },
+      );
+    }
+  };
+
+  const handleEnableDshProvider = async (provider: Provider) => {
+    try {
+      await settingsApi.setProviderLiveEnabled("dsh", provider.id, true);
+      await refreshProviderCenterApps(queryClient, ["dsh"]);
+      toast.success(
+        t("dsh.provider.enabled", {
+          defaultValue: "已添加到 DeepSeek Harness",
+        }),
+        { closeButton: true },
+      );
+    } catch (error) {
+      toast.error(
+        t("dsh.provider.enableFailed", {
+          defaultValue: "无法添加到 DeepSeek Harness",
+        }),
+        {
+          description: extractErrorMessage(error) || undefined,
           closeButton: true,
         },
       );
@@ -809,7 +834,8 @@ function App() {
           targetAppTypes: PROVIDER_CENTER_APPS,
         };
         const preview = await providerCenterApi.previewManagedDraft(input);
-        const lockedAppTypes = managedContext.targetAppTypes as ProviderCenterApp[];
+        const lockedAppTypes =
+          managedContext.targetAppTypes as ProviderCenterApp[];
         setManagedEditDiscovery({ preview, input, lockedAppTypes });
         setSelectedEditTargetApps(lockedAppTypes);
       } catch (error) {
@@ -857,12 +883,10 @@ function App() {
     setManagedEditApplying(true);
     try {
       await providerCenterApi.confirmManagedDraft(input, preview.token);
-      await queryClient.invalidateQueries({
-        queryKey: ["providers", activeApp],
-      });
-      await queryClient.invalidateQueries({
-        queryKey: ["provider-center"],
-      });
+      await refreshProviderCenterApps(
+        queryClient,
+        input.targetAppTypes as ProviderCenterApp[],
+      );
       toast.success("共享定义已应用");
     } catch (error) {
       toast.error(extractErrorMessage(error));
@@ -884,7 +908,11 @@ function App() {
       // Remove from live config only (for additive mode apps like OpenCode/OpenClaw)
       // Does NOT delete from database - provider remains in the list
       try {
-        await providersApi.removeFromLiveConfig(provider.id, activeApp);
+        if (activeApp === "dsh") {
+          await settingsApi.setProviderLiveEnabled("dsh", provider.id, false);
+        } else {
+          await providersApi.removeFromLiveConfig(provider.id, activeApp);
+        }
       } catch (error) {
         const detail = extractErrorMessage(error);
         const description =
@@ -900,7 +928,9 @@ function App() {
         });
         return;
       }
-      if (activeApp === "pi") {
+      if (activeApp === "dsh") {
+        await refreshProviderCenterApps(queryClient, ["dsh"]);
+      } else if (activeApp === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
       // Invalidate queries to refresh the isInConfig state
@@ -925,9 +955,13 @@ function App() {
           ? t("pi.provider.removed", {
               defaultValue: "已从 Pi 移除",
             })
-          : t("notifications.removeFromConfigSuccess", {
-              defaultValue: "已从配置移除",
-            }),
+          : activeApp === "dsh"
+            ? t("dsh.provider.removed", {
+                defaultValue: "已从 DeepSeek Harness 移除",
+              })
+            : t("notifications.removeFromConfigSuccess", {
+                defaultValue: "已从配置移除",
+              }),
         { closeButton: true },
       );
     } else {
@@ -978,32 +1012,41 @@ function App() {
       activeApp === "opencode" ||
       activeApp === "openclaw" ||
       activeApp === "hermes" ||
-      activeApp === "pi"
+      activeApp === "pi" ||
+      activeApp === "dsh"
     ) {
       let liveProviderIds: string[] = [];
       try {
-        liveProviderIds =
-          activeApp === "opencode"
-            ? await queryClient.ensureQueryData({
-                queryKey: ["opencodeLiveProviderIds"],
-                queryFn: () => providersApi.getOpenCodeLiveProviderIds(),
-              })
-            : activeApp === "openclaw"
-              ? await queryClient.ensureQueryData({
-                  queryKey: openclawKeys.liveProviderIds,
-                  queryFn: () => providersApi.getOpenClawLiveProviderIds(),
-                })
-              : activeApp === "hermes"
-                ? await queryClient.ensureQueryData({
-                    queryKey: hermesKeys.liveProviderIds,
-                    queryFn: () => providersApi.getHermesLiveProviderIds(),
-                  })
-                : (
-                    await queryClient.ensureQueryData({
-                      queryKey: ["pi", "currentState"],
-                      queryFn: () => piApi.getCurrentState(),
-                    })
-                  ).enabledProviderIds;
+        if (activeApp === "opencode") {
+          liveProviderIds = await queryClient.ensureQueryData({
+            queryKey: ["opencodeLiveProviderIds"],
+            queryFn: () => providersApi.getOpenCodeLiveProviderIds(),
+          });
+        } else if (activeApp === "openclaw") {
+          liveProviderIds = await queryClient.ensureQueryData({
+            queryKey: openclawKeys.liveProviderIds,
+            queryFn: () => providersApi.getOpenClawLiveProviderIds(),
+          });
+        } else if (activeApp === "hermes") {
+          liveProviderIds = await queryClient.ensureQueryData({
+            queryKey: hermesKeys.liveProviderIds,
+            queryFn: () => providersApi.getHermesLiveProviderIds(),
+          });
+        } else if (activeApp === "dsh") {
+          const membership = await queryClient.ensureQueryData({
+            queryKey: providerLiveMembershipKeys.app("dsh"),
+            queryFn: () => settingsApi.getProviderLiveMembership("dsh"),
+          });
+          liveProviderIds =
+            membership.status === "available" ? membership.providerIds : [];
+        } else {
+          liveProviderIds = (
+            await queryClient.ensureQueryData({
+              queryKey: ["pi", "currentState"],
+              queryFn: () => piApi.getCurrentState(),
+            })
+          ).enabledProviderIds;
+        }
       } catch (error) {
         console.error(
           "[App] Failed to load live provider IDs for duplication",
@@ -1020,11 +1063,21 @@ function App() {
       const existingKeys = Array.from(
         new Set([...Object.keys(providers), ...liveProviderIds]),
       );
-      duplicatedProvider.providerKey = generateUniqueProviderCopyKey(
-        provider.id,
-        existingKeys,
-      );
+      const copyKey = generateUniqueProviderCopyKey(provider.id, existingKeys);
+      duplicatedProvider.providerKey = copyKey;
       duplicatedProvider.addToLive = false;
+      if (activeApp === "dsh") {
+        const {
+          apiKey: _apiKey,
+          apiKeyEnv: _apiKeyEnv,
+          credentialRef: _credentialRef,
+          ...copiedSettings
+        } = duplicatedProvider.settingsConfig;
+        duplicatedProvider.settingsConfig = {
+          ...copiedSettings,
+          route: copyKey,
+        };
+      }
     }
 
     if (provider.sortIndex !== undefined) {
@@ -1286,7 +1339,9 @@ function App() {
                       onSwitch={
                         activeApp === "pi"
                           ? handleEnablePiProvider
-                          : switchProvider
+                          : activeApp === "dsh"
+                            ? handleEnableDshProvider
+                            : switchProvider
                       }
                       onEdit={(provider) => {
                         setEditingProvider(provider);
@@ -1298,7 +1353,8 @@ function App() {
                         activeApp === "opencode" ||
                         activeApp === "openclaw" ||
                         activeApp === "hermes" ||
-                        activeApp === "pi"
+                        activeApp === "pi" ||
+                        activeApp === "dsh"
                           ? (provider) =>
                               setConfirmAction({ provider, action: "remove" })
                           : undefined
@@ -1992,8 +2048,12 @@ function App() {
           managedEditPreview
             ? (() => {
                 const targets = managedEditPreview.preview.targets;
-                const created = targets.filter((t) => t.operation === "create" && t.compatible);
-                const updated = targets.filter((t) => t.operation === "update" && t.compatible);
+                const created = targets.filter(
+                  (t) => t.operation === "create" && t.compatible,
+                );
+                const updated = targets.filter(
+                  (t) => t.operation === "update" && t.compatible,
+                );
                 const detached = targets.filter((t) => !t.compatible);
                 const fmt = (target: (typeof targets)[number]) => {
                   const label =

@@ -79,6 +79,7 @@ interface ProviderCardProps {
   isDefaultModel?: boolean;
   isRemovalProtected?: boolean;
   isStateChangeProtected?: boolean;
+  stateChangeHint?: string;
   managedByProviderCenter?: boolean;
   onManageScope?: () => void;
   onManagedDelete?: () => void;
@@ -199,6 +200,7 @@ export function ProviderCard({
   isDefaultModel,
   isRemovalProtected,
   isStateChangeProtected,
+  stateChangeHint,
   managedByProviderCenter = false,
   onManageScope,
   onManagedDelete,
@@ -236,7 +238,7 @@ export function ProviderCard({
   // OMO and OMO Slim share the same card behavior
   const isAnyOmo = isOmo || isOmoSlim;
   const handleDisableAnyOmo = isOmoSlim ? onDisableOmoSlim : onDisableOmo;
-  const isAdditiveMode = (appId === "opencode" && !isAnyOmo) || appId === "pi";
+  const isAdditiveMode = isAdditiveAppId(appId) && !isAnyOmo;
 
   const { data: health } = useProviderHealth(
     provider.id,
@@ -358,7 +360,7 @@ export function ProviderCard({
     ? isCurrent
     : appId === "openclaw"
       ? Boolean(isDefaultModel)
-      : appId === "opencode" || appId === "pi"
+      : isAdditiveMode
         ? false
         : isAutoFailoverEnabled
           ? activeProviderId === provider.id
@@ -515,8 +517,7 @@ export function ProviderCard({
                   }}
                   className="inline-flex cursor-pointer items-center rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 transition-colors hover:bg-sky-200 dark:bg-sky-900/40 dark:text-sky-200 dark:hover:bg-sky-900/60"
                   title={t("provider.providerCenterManagedHint", {
-                    defaultValue:
-                      "通用 Provider；点击管理使用范围",
+                    defaultValue: "通用 Provider；点击管理使用范围",
                   })}
                 >
                   {t("provider.providerCenterManaged", {
@@ -529,8 +530,7 @@ export function ProviderCard({
                 <span
                   className="inline-flex items-center rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700/60 dark:text-slate-200"
                   title={t("provider.managedByHermesHint", {
-                    defaultValue:
-                      "由 Hermes 管理，请在 Hermes Web UI 中编辑",
+                    defaultValue: "由 Hermes 管理，请在 Hermes Web UI 中编辑",
                   })}
                 >
                   {t("provider.managedByHermes", {
@@ -750,13 +750,7 @@ export function ProviderCard({
               }
               onRemoveFromConfig={
                 onRemoveFromConfig
-                  ? () => {
-                      if (managedByProviderCenter && onManagedDelete) {
-                        onManagedDelete();
-                      } else {
-                        onRemoveFromConfig(provider);
-                      }
-                    }
+                  ? () => onRemoveFromConfig(provider)
                   : undefined
               }
               onDisableOmo={handleDisableAnyOmo}
@@ -772,6 +766,7 @@ export function ProviderCard({
               isDefaultModel={isDefaultModel}
               isRemovalProtected={isRemovalProtected}
               isStateChangeProtected={isStateChangeProtected}
+              stateChangeHint={stateChangeHint}
               defaultModelOptions={openclawDefaultModelOptions}
               onSetAsDefault={onSetAsDefault}
             />

@@ -116,9 +116,7 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
 /**
  * 获取预设的显示名称（用于 UI）
  */
-export function getPresetDisplayName(
-  preset: UniversalProviderPreset,
-): string {
+export function getPresetDisplayName(preset: UniversalProviderPreset): string {
   return preset.name;
 }
 

@@ -10,7 +10,8 @@ export type ProviderCenterApp =
   | "opencode"
   | "openclaw"
   | "hermes"
-  | "pi";
+  | "pi"
+  | "dsh";
 
 export interface ProviderDefinition {
   id: string;
@@ -233,7 +234,10 @@ export interface ManagedProviderDraftInput {
   targetAppTypes?: string[];
 }
 
-export type DeleteMode = "removeCurrent" | "detachKeepIndependent" | "deleteGlobally";
+export type DeleteMode =
+  | "removeCurrent"
+  | "detachKeepIndependent"
+  | "deleteGlobally";
 
 export const providerCenterApi = {
   get: (): Promise<ProviderCenterState> => invoke("get_provider_center"),

@@ -13,7 +13,8 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { providerCenterApi } from "@/lib/api";
-import type { DeleteMode } from "@/lib/api/providerCenter";
+import type { DeleteMode, ProviderCenterApp } from "@/lib/api/providerCenter";
+import { refreshProviderCenterApps } from "@/lib/query/providerCenter";
 import type { Provider } from "@/types";
 import { providerCenterAppLabel } from "./providerCenterApps";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -63,21 +64,20 @@ export function ProviderDeleteDialog({
     setLoading(true);
     try {
       await providerCenterApi.deleteProvider(definitionId, appType, mode);
-      await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: ["provider-center", "state"],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["provider-center", "agent-catalog"],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["providers"],
-        }),
-      ]);
-      toast.success(
-        t("provider.deleteSuccess", { defaultValue: "已删除" }),
-        { closeButton: true },
-      );
+      const affectedApps =
+        mode === "deleteGlobally"
+          ? Array.from(
+              new Set(
+                [...boundAgents, appType].filter(
+                  (app): app is ProviderCenterApp => Boolean(app),
+                ),
+              ),
+            )
+          : [appType as ProviderCenterApp];
+      await refreshProviderCenterApps(queryClient, affectedApps);
+      toast.success(t("provider.deleteSuccess", { defaultValue: "已删除" }), {
+        closeButton: true,
+      });
       resetState();
       onSuccess();
     } catch (error) {

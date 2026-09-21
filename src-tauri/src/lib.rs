@@ -31,6 +31,7 @@ mod prompt_files;
 mod provider;
 mod provider_center;
 mod proxy;
+mod secure_store;
 mod services;
 mod session_manager;
 mod settings;
@@ -1441,6 +1442,8 @@ pub fn run() {
             commands::update_provider,
             commands::delete_provider,
             commands::remove_provider_from_live_config,
+            commands::get_provider_live_membership,
+            commands::set_provider_live_enabled,
             commands::switch_provider,
             commands::import_default_config,
             commands::get_claude_desktop_status,

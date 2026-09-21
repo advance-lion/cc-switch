@@ -247,7 +247,12 @@ impl Provider {
                 );
                 (base_url, api_key)
             }
-            AppType::DeepSeekHarness => (String::new(), String::new()),
+            // DSH managed drafts still carry form credentials at command input time;
+            // the save boundary removes apiKey before persistence.
+            AppType::DeepSeekHarness => (
+                str_at(settings.get("baseURL")),
+                str_at(settings.get("apiKey")),
+            ),
         };
 
         // Normalize like the JS-script path (extract_base_url_from_provider) so a
@@ -1611,6 +1616,21 @@ mod tests {
             (
                 "https://api.deepseek.com/v1".to_string(),
                 "sk-opencode".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_dsh_native_fields() {
+        let p = provider_with(json!({
+            "baseURL": "https://api.deepseek.com/v1/",
+            "apiKey": "sk-dsh",
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::DeepSeekHarness),
+            (
+                "https://api.deepseek.com/v1".to_string(),
+                "sk-dsh".to_string()
             )
         );
     }

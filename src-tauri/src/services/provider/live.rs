@@ -189,6 +189,9 @@ pub(crate) fn provider_exists_in_live_config(
         AppType::Hermes => crate::hermes_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
         AppType::Pi => crate::pi_config::pi_provider_exists(provider_id),
+        AppType::DeepSeekHarness => {
+            crate::services::provider::DshProviderService::exists(provider_id)
+        }
         _ => Ok(false),
     }
 }
@@ -1439,7 +1442,10 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             ));
         }
         AppType::DeepSeekHarness => {
-            // DSH has no live config writing
+            return Err(AppError::InvalidInput(
+                "DeepSeek Harness providers must be written through the DSH RPC service"
+                    .to_string(),
+            ));
         }
     }
     Ok(())
@@ -1482,18 +1488,22 @@ pub(crate) fn sync_current_provider_for_app_to_live(
     state: &AppState,
     app_type: &AppType,
 ) -> Result<(), AppError> {
-    if app_type.is_additive_mode() {
-        sync_all_providers_to_live(state, app_type)?;
-    } else {
-        let current_id = match crate::settings::get_effective_current_provider(&state.db, app_type)?
-        {
-            Some(id) => id,
-            None => return Ok(()),
-        };
+    use crate::app_config::ProviderStartupSync;
 
-        let providers = state.db.get_all_providers(app_type.as_str())?;
-        if let Some(provider) = providers.get(&current_id) {
-            write_live_with_common_config_for_state(state, app_type, provider)?;
+    match app_type.provider_behavior().startup_sync {
+        ProviderStartupSync::ExplicitOnly => return Ok(()),
+        ProviderStartupSync::AllManaged => sync_all_providers_to_live(state, app_type)?,
+        ProviderStartupSync::Current => {
+            let current_id =
+                match crate::settings::get_effective_current_provider(&state.db, app_type)? {
+                    Some(id) => id,
+                    None => return Ok(()),
+                };
+
+            let providers = state.db.get_all_providers(app_type.as_str())?;
+            if let Some(provider) = providers.get(&current_id) {
+                write_live_with_common_config_for_state(state, app_type, provider)?;
+            }
         }
     }
 

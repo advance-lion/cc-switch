@@ -12,9 +12,9 @@ use crate::database::{ProviderImportCandidateRecord, ProviderImportSessionRecord
 use crate::error::AppError;
 use crate::provider::{Provider, UniversalProvider};
 use crate::proxy::providers::capabilities::Compatibility;
+use crate::secure_store::{self, SecretScope};
 use crate::services::ProviderService;
 use crate::store::AppState;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,6 @@ use uuid::Uuid;
 
 const DEFINITIONS_KEY: &str = "provider_center_definitions_v1";
 const BINDINGS_KEY: &str = "provider_center_bindings_v1";
-const SECRETS_KEY: &str = "provider_center_dpapi_secrets_v1";
 const TRANSACTIONS_KEY: &str = "provider_center_transactions_v1";
 const SNAPSHOTS_KEY: &str = "provider_center_transaction_snapshots_v1";
 const SQLITE_MIGRATED_KEY: &str = "provider_center_sqlite_migrated_v2";
@@ -412,7 +411,6 @@ fn write_json<T: Serialize>(state: &AppState, key: &str, value: &T) -> Result<()
 
 type Definitions = Vec<ProviderDefinition>;
 type Bindings = Vec<ProviderBinding>;
-type EncryptedSecrets = HashMap<String, String>;
 type EncryptedSnapshots = HashMap<String, String>;
 
 fn provider_sources(definition: &ProviderDefinition) -> Vec<ProviderSource> {
@@ -714,174 +712,27 @@ impl ProviderCenterOperationState {
 }
 
 fn secret_hint(secret: &str) -> Option<String> {
-    let chars: Vec<char> = secret.chars().collect();
-    (chars.len() >= 4).then(|| format!("…{}", chars[chars.len() - 4..].iter().collect::<String>()))
+    secure_store::secret_hint(secret)
 }
 
-// 密钥使用 Windows 当前用户 DPAPI 加密。加密后的 blob 可以随 CC Switch 数据库
-// 备份，但无法由其他 Windows 用户或机器解开；IPC/前端从不读取它。
-#[cfg(target_os = "windows")]
-fn protect_secret(secret: &str) -> Result<String, AppError> {
-    use std::ffi::c_void;
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-    };
-
-    let bytes = secret.as_bytes();
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: bytes.len() as u32,
-        pbData: bytes.as_ptr() as *mut u8,
-    };
-    let mut output = CRYPT_INTEGER_BLOB {
-        cbData: 0,
-        pbData: null_mut(),
-    };
-    let ok = unsafe {
-        CryptProtectData(
-            &input,
-            null(),
-            null(),
-            null_mut(),
-            null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if ok == 0 {
-        return Err(AppError::Message(
-            "无法使用 Windows 安全存储保护 API Key".to_string(),
-        ));
-    }
-    let protected =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as *mut c_void) };
-    Ok(BASE64.encode(protected))
-}
-
-#[cfg(target_os = "windows")]
-fn unprotect_secret(blob: &str) -> Result<String, AppError> {
-    use std::ffi::c_void;
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-    };
-
-    let mut bytes = BASE64
-        .decode(blob)
-        .map_err(|_| AppError::Message("已保存的 API Key 数据无效".to_string()))?;
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: bytes.len() as u32,
-        pbData: bytes.as_mut_ptr(),
-    };
-    let mut output = CRYPT_INTEGER_BLOB {
-        cbData: 0,
-        pbData: null_mut(),
-    };
-    let ok = unsafe {
-        CryptUnprotectData(
-            &input,
-            null_mut(),
-            null(),
-            null_mut(),
-            null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if ok == 0 {
-        return Err(AppError::Message(
-            "无法从 Windows 安全存储读取 API Key".to_string(),
-        ));
-    }
-    let secret =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as *mut c_void) };
-    String::from_utf8(secret)
-        .map_err(|_| AppError::Message("已保存的 API Key 不是有效文本".to_string()))
-}
-
-#[cfg(target_os = "windows")]
 fn save_secret(state: &AppState, id: &str, secret: &str) -> Result<(), AppError> {
-    let mut secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
-    secrets.insert(id.to_string(), protect_secret(secret)?);
-    write_json(state, SECRETS_KEY, &secrets)
+    secure_store::save(state, SecretScope::ProviderCenter, id, secret)
 }
 
-#[cfg(target_os = "windows")]
 fn remove_secret(state: &AppState, id: &str) -> Result<(), AppError> {
-    let mut secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
-    secrets.remove(id);
-    write_json(state, SECRETS_KEY, &secrets)
+    secure_store::remove(state, SecretScope::ProviderCenter, id)
 }
 
-#[cfg(target_os = "windows")]
 fn secret_metadata(state: &AppState, id: &str) -> Result<(bool, Option<String>), AppError> {
-    let secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
-    let Some(blob) = secrets.get(id) else {
-        return Ok((false, None));
-    };
-    let secret = unprotect_secret(blob)?;
-    Ok((true, secret_hint(&secret)))
+    secure_store::metadata(state, SecretScope::ProviderCenter, id)
 }
 
-#[cfg(target_os = "windows")]
 fn get_secret(state: &AppState, id: &str) -> Result<String, AppError> {
-    let secrets: EncryptedSecrets = read_json(state, SECRETS_KEY)?;
-    let blob = secrets
-        .get(id)
-        .ok_or_else(|| AppError::Message("该模型服务没有可用的 API Key".to_string()))?;
-    unprotect_secret(blob)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn secure_entry(id: &str) -> Result<keyring::Entry, AppError> {
-    keyring::Entry::new("com.ccswitch.provider-center", id)
-        .map_err(|error| AppError::Message(format!("无法访问系统安全存储: {error}")))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn save_secret(_: &AppState, id: &str, secret: &str) -> Result<(), AppError> {
-    secure_entry(id)?
-        .set_password(secret)
-        .map_err(|error| AppError::Message(format!("无法写入系统安全存储: {error}")))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn remove_secret(_: &AppState, id: &str) -> Result<(), AppError> {
-    match secure_entry(id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(AppError::Message(format!("无法清除系统安全存储: {error}"))),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn secret_metadata(_: &AppState, id: &str) -> Result<(bool, Option<String>), AppError> {
-    match secure_entry(id)?.get_password() {
-        Ok(secret) => Ok((true, secret_hint(&secret))),
-        Err(keyring::Error::NoEntry) => Ok((false, None)),
-        Err(error) => Err(AppError::Message(format!("无法读取系统安全存储: {error}"))),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn get_secret(_: &AppState, id: &str) -> Result<String, AppError> {
-    match secure_entry(id)?.get_password() {
-        Ok(secret) => Ok(secret),
-        Err(keyring::Error::NoEntry) => Err(AppError::Message(
-            "该模型服务没有可用的 API Key".to_string(),
-        )),
-        Err(error) => Err(AppError::Message(format!("无法读取系统安全存储: {error}"))),
-    }
+    secure_store::get(state, SecretScope::ProviderCenter, id)
 }
 
 fn restore_secret(state: &AppState, id: &str, previous: Option<&str>) -> Result<(), AppError> {
-    match previous {
-        Some(secret) => save_secret(state, id, secret),
-        None => remove_secret(state, id),
-    }
+    secure_store::restore(state, SecretScope::ProviderCenter, id, previous)
 }
 
 fn refresh_binding_states(
@@ -1096,6 +947,40 @@ pub fn guard_projection_mutation(
         ));
     }
     Ok(())
+}
+
+/// Resolve a Provider Center secret only for an active projection whose
+/// definition, binding, application and projected provider id all agree.
+pub(crate) fn projection_secret_for_provider(
+    state: &AppState,
+    app_type: &AppType,
+    provider: &Provider,
+    definition_id: &str,
+) -> Result<String, AppError> {
+    let definition = state
+        .db
+        .load_provider_center_definitions()?
+        .into_iter()
+        .find(|definition| definition.id == definition_id)
+        .ok_or_else(|| AppError::Message("Provider Center definition 不存在".to_string()))?;
+    let owns_projection = provider.category.as_deref() == Some("provider-center")
+        && projected_provider_id(&definition, app_type.as_str()) == provider.id
+        && state
+            .db
+            .load_provider_center_bindings()?
+            .iter()
+            .any(|binding| {
+                binding.provider_id == definition_id
+                    && binding.app_type == app_type.as_str()
+                    && binding.enabled
+                    && binding.status != "detached"
+            });
+    if !owns_projection {
+        return Err(AppError::Message(
+            "DSH Provider Center credentialRef 未通过投影所有权校验".to_string(),
+        ));
+    }
+    get_secret(state, definition_id)
 }
 
 /// Return only models that the selected application can actually use now.
@@ -2862,6 +2747,40 @@ fn redact_provider_credentials(provider: &Provider) -> Provider {
     redacted
 }
 
+fn managed_draft_api_key(
+    state: &AppState,
+    app: &AppType,
+    provider: &Provider,
+    definition_id: &str,
+    submitted_api_key: String,
+    needs_key: bool,
+) -> Result<(String, bool), AppError> {
+    if !needs_key || !submitted_api_key.trim().is_empty() {
+        return Ok((submitted_api_key, false));
+    }
+    if app != &AppType::DeepSeekHarness {
+        return Err(AppError::Message(
+            "无法从当前供应商配置中提取 API Key".to_string(),
+        ));
+    }
+
+    let definition = load_definitions(state)?
+        .into_iter()
+        .find(|definition| definition.id == definition_id)
+        .ok_or_else(|| AppError::Message("模型服务不存在".to_string()))?;
+    let projected_id = projected_provider_id(&definition, app.as_str());
+    if provider.id != projected_id {
+        return Err(AppError::Message(
+            "受管 DSH Provider 标识与投影不一致".to_string(),
+        ));
+    }
+    let stored = state
+        .db
+        .get_provider_by_id(&projected_id, app.as_str())?
+        .ok_or_else(|| AppError::Message("受管 DSH Provider 投影不存在".to_string()))?;
+    projection_secret_for_provider(state, app, &stored, definition_id).map(|secret| (secret, true))
+}
+
 /// Preview applying an original Agent Provider form payload as a managed
 /// shared definition. This performs NO writes: it validates the draft,
 /// extracts shared fields, and returns a preview token. The caller must
@@ -2898,11 +2817,14 @@ pub fn preview_managed_draft(
         ));
     }
     let needs_key = protocol != "ollama";
-    if needs_key && api_key.trim().is_empty() {
-        return Err(AppError::Message(
-            "无法从当前供应商配置中提取 API Key".to_string(),
-        ));
-    }
+    let (api_key, _) = managed_draft_api_key(
+        state,
+        &app,
+        &provider,
+        &input.definition_id,
+        api_key,
+        needs_key,
+    )?;
 
     let definitions = load_definitions(state)?;
     let existing = definitions
@@ -3055,11 +2977,14 @@ pub fn confirm_managed_draft(
         ));
     }
     let needs_key = protocol != "ollama";
-    if needs_key && api_key.trim().is_empty() {
-        return Err(AppError::Message(
-            "无法从当前供应商配置中提取 API Key".to_string(),
-        ));
-    }
+    let (api_key, keep_existing_key) = managed_draft_api_key(
+        state,
+        &app,
+        &provider,
+        &input.definition_id,
+        api_key,
+        needs_key,
+    )?;
 
     // Re-run preview to recompute and verify the token.
     let preview = preview_managed_draft(state, input.clone())?;
@@ -3087,9 +3012,16 @@ pub fn confirm_managed_draft(
         notes: provider.notes.as_deref().unwrap_or("").trim().to_string(),
         enabled: Some(true),
         expected_revision: input.expected_revision,
-        credential_action: Some(if needs_key { "replace" } else { "clear" }).map(str::to_string),
+        credential_action: Some(if !needs_key {
+            "clear"
+        } else if keep_existing_key {
+            "keep"
+        } else {
+            "replace"
+        })
+        .map(str::to_string),
         source: None,
-        api_key: needs_key.then(|| api_key.trim().to_string()),
+        api_key: (needs_key && !keep_existing_key).then(|| api_key.trim().to_string()),
         app_types: target_apps.clone(),
     };
     let definition = save_definition(state, save_input)?;
@@ -3297,7 +3229,10 @@ fn save_snapshots(
     let serialized = serde_json::to_string(snapshots)
         .map_err(|error| AppError::Message(format!("无法创建恢复快照: {error}")))?;
     let mut all: EncryptedSnapshots = read_json(state, SNAPSHOTS_KEY)?;
-    all.insert(transaction_id.to_string(), protect_secret(&serialized)?);
+    all.insert(
+        transaction_id.to_string(),
+        secure_store::protect_secret(&serialized)?,
+    );
     write_json(state, SNAPSHOTS_KEY, &all)
 }
 
@@ -3310,7 +3245,7 @@ fn load_snapshots(
     let encrypted = all
         .get(transaction_id)
         .ok_or_else(|| AppError::Message("恢复快照不存在".to_string()))?;
-    let serialized = unprotect_secret(encrypted)?;
+    let serialized = secure_store::unprotect_secret(encrypted)?;
     serde_json::from_str(&serialized)
         .map_err(|error| AppError::Message(format!("恢复快照已损坏: {error}")))
 }
@@ -3359,7 +3294,11 @@ fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(
     match snapshot.previous_projected_provider.clone() {
         Some(provider) => {
             let id = provider.id.clone();
-            if state.db.get_provider_by_id(&id, app.as_str())?.is_some() {
+            if app == AppType::DeepSeekHarness {
+                AppAdapterRegistry::global()
+                    .resolve(app.as_str())?
+                    .apply(state, provider)?;
+            } else if state.db.get_provider_by_id(&id, app.as_str())?.is_some() {
                 ProviderService::update(state, app.clone(), Some(&id), provider)?;
             } else {
                 ProviderService::add(state, app.clone(), provider, true)?;
@@ -3381,12 +3320,18 @@ fn restore_snapshot(state: &AppState, snapshot: &ProjectionSnapshot) -> Result<(
                 .db
                 .get_provider_by_id(&snapshot.projected_provider_id, app.as_str())?
                 .is_some()
-                && ProviderService::delete(state, app.clone(), &snapshot.projected_provider_id)
-                    .is_err()
             {
-                state
-                    .db
-                    .delete_provider(app.as_str(), &snapshot.projected_provider_id)?;
+                let delete_result = AppAdapterRegistry::global()
+                    .resolve(app.as_str())?
+                    .delete(state, &snapshot.projected_provider_id);
+                if let Err(error) = delete_result {
+                    if app == AppType::DeepSeekHarness {
+                        return Err(error);
+                    }
+                    state
+                        .db
+                        .delete_provider(app.as_str(), &snapshot.projected_provider_id)?;
+                }
             }
         }
     }
@@ -3528,7 +3473,12 @@ pub fn apply_transaction(
     let mut succeeded = Vec::new();
     let mut failed = false;
     let mut failed_index = None;
-    for (index, snapshot) in snapshots.iter().enumerate() {
+    for (snapshot_index, snapshot) in snapshots.iter().enumerate() {
+        let target_index = transaction
+            .targets
+            .iter()
+            .position(|target| target.app_type == snapshot.app_type)
+            .ok_or_else(|| AppError::Message("应用事务目标与快照不一致".to_string()))?;
         let adapter = AppAdapterRegistry::global().resolve(&snapshot.app_type)?;
         let projected = projection(&definition, secret.clone(), &snapshot.app_type)?;
         let template = bindings
@@ -3552,8 +3502,8 @@ pub fn apply_transaction(
             });
         match result {
             Ok(()) => {
-                transaction.targets[index].status = "applied".to_string();
-                succeeded.push(index);
+                transaction.targets[target_index].status = "applied".to_string();
+                succeeded.push(snapshot_index);
                 if let Some(binding) = bindings.iter_mut().find(|binding| {
                     binding.provider_id == provider_id && binding.app_type == snapshot.app_type
                 }) {
@@ -3567,8 +3517,8 @@ pub fn apply_transaction(
             }
             Err(error) => {
                 let message = error.to_string();
-                transaction.targets[index].status = "failed".to_string();
-                transaction.targets[index].message = Some(message.clone());
+                transaction.targets[target_index].status = "failed".to_string();
+                transaction.targets[target_index].message = Some(message.clone());
                 if let Some(binding) = bindings.iter_mut().find(|binding| {
                     binding.provider_id == provider_id && binding.app_type == snapshot.app_type
                 }) {
@@ -3578,7 +3528,7 @@ pub fn apply_transaction(
                     binding.updated_at = now();
                 }
                 failed = true;
-                failed_index = Some(index);
+                failed_index = Some(snapshot_index);
                 break;
             }
         }
@@ -3591,24 +3541,29 @@ pub fn apply_transaction(
         }
         rollback_indices.sort_unstable();
         rollback_indices.dedup();
-        for index in rollback_indices.into_iter().rev() {
-            let original_message = transaction.targets[index].message.clone();
-            match restore_snapshot(state, &snapshots[index]) {
+        for snapshot_index in rollback_indices.into_iter().rev() {
+            let snapshot = &snapshots[snapshot_index];
+            let target_index = transaction
+                .targets
+                .iter()
+                .position(|target| target.app_type == snapshot.app_type)
+                .ok_or_else(|| AppError::Message("应用事务目标与快照不一致".to_string()))?;
+            let original_message = transaction.targets[target_index].message.clone();
+            match restore_snapshot(state, snapshot) {
                 Ok(()) => {
-                    transaction.targets[index].status = "rolled_back".to_string();
-                    transaction.targets[index].message = original_message;
+                    transaction.targets[target_index].status = "rolled_back".to_string();
+                    transaction.targets[target_index].message = original_message;
                     if let Some(binding) = bindings.iter_mut().find(|binding| {
-                        binding.provider_id == provider_id
-                            && binding.app_type == snapshots[index].app_type
+                        binding.provider_id == provider_id && binding.app_type == snapshot.app_type
                     }) {
                         binding.status = "pending".to_string();
-                        binding.expected_fingerprint = snapshots[index].before_fingerprint.clone();
+                        binding.expected_fingerprint = snapshot.before_fingerprint.clone();
                     }
                 }
                 Err(error) => {
                     rollback_failed = true;
-                    transaction.targets[index].status = "rollbackFailed".to_string();
-                    transaction.targets[index].message = Some(match original_message {
+                    transaction.targets[target_index].status = "rollbackFailed".to_string();
+                    transaction.targets[target_index].message = Some(match original_message {
                         Some(original) => format!("{original}；回滚失败：{error}"),
                         None => error.to_string(),
                     });
@@ -3865,12 +3820,55 @@ pub fn disable_binding(
         {
             app_adapter(&app).delete(state, &projected_id)?;
         }
-    } else {
-        if let Some(mut provider) = state.db.get_provider_by_id(&projected_id, app.as_str())? {
-            provider.category = None;
-            state.db.save_provider(app.as_str(), &provider)?;
+        let binding = &mut bindings[binding_index];
+        binding.enabled = false;
+        binding.override_enabled = false;
+        binding.status = "detached".to_string();
+        binding.applied_revision = None;
+        binding.expected_fingerprint = None;
+        binding.last_error = None;
+        binding.updated_at = now();
+        return save_core(state, &definitions, &bindings);
+    }
+
+    let original_provider = state.db.get_provider_by_id(&projected_id, app.as_str())?;
+    let mut previous_dsh_secret = None;
+    if let Some(mut provider) = original_provider.clone() {
+        if app == AppType::DeepSeekHarness
+            && provider
+                .settings_config
+                .get("credentialRef")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|reference| reference.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("providerCenter")
+        {
+            let (configured, _) =
+                secure_store::metadata(state, SecretScope::DshProvider, &projected_id)?;
+            previous_dsh_secret = configured
+                .then(|| secure_store::get(state, SecretScope::DshProvider, &projected_id))
+                .transpose()?;
+            let secret = get_secret(state, provider_id)?;
+            secure_store::save(state, SecretScope::DshProvider, &projected_id, &secret)?;
+            provider.settings_config["credentialRef"] = serde_json::json!({
+                "source": "dshProvider",
+                "id": projected_id,
+            });
+        }
+        provider.category = None;
+        if let Err(error) = state.db.save_provider(app.as_str(), &provider) {
+            if app == AppType::DeepSeekHarness {
+                let _ = secure_store::restore(
+                    state,
+                    SecretScope::DshProvider,
+                    &projected_id,
+                    previous_dsh_secret.as_deref(),
+                );
+            }
+            return Err(error);
         }
     }
+
     let binding = &mut bindings[binding_index];
     binding.enabled = false;
     binding.override_enabled = false;
@@ -3879,7 +3877,21 @@ pub fn disable_binding(
     binding.expected_fingerprint = None;
     binding.last_error = None;
     binding.updated_at = now();
-    save_core(state, &definitions, &bindings)
+    if let Err(error) = save_core(state, &definitions, &bindings) {
+        if let Some(original) = original_provider {
+            let _ = state.db.save_provider(app.as_str(), &original);
+        }
+        if app == AppType::DeepSeekHarness {
+            let _ = secure_store::restore(
+                state,
+                SecretScope::DshProvider,
+                &projected_id,
+                previous_dsh_secret.as_deref(),
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Delete semantics for Provider Center managed providers.
@@ -4012,8 +4024,8 @@ fn delete_globally(state: &AppState, provider_id: &str) -> Result<(), AppError> 
                 }
                 Err(error) => {
                     for (app_type_str, provider) in &deleted_projections {
-                        if let Ok(app) = AppType::from_str(app_type_str) {
-                            let _ = ProviderService::add(state, app, provider.clone(), false);
+                        if let Ok(adapter) = AppAdapterRegistry::global().resolve(app_type_str) {
+                            let _ = adapter.apply(state, provider.clone());
                         }
                     }
                     return Err(error);
@@ -4428,6 +4440,301 @@ mod tests {
             let error = attach_binding(state, &no_key.id, "opencode")
                 .expect_err("non-ollama requires a credential");
             assert!(error.to_string().contains("API Key"));
+        });
+    }
+
+    #[test]
+    fn apply_transaction_maps_snapshot_results_by_app_type() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.app_types = vec!["gemini".to_string(), "opencode".to_string()];
+            let definition = save_definition(state, input).expect("seed mixed targets");
+            let preview = preview_apply(
+                state,
+                &definition.id,
+                vec!["gemini".to_string(), "opencode".to_string()],
+            )
+            .expect("preview mixed targets");
+            assert!(!preview.targets[0].compatible);
+            assert!(preview.targets[1].compatible);
+
+            let transaction = apply_transaction(
+                state,
+                &definition.id,
+                vec!["gemini".to_string(), "opencode".to_string()],
+                &preview.token,
+                Some("mixed-target-index-regression"),
+            )
+            .expect("apply compatible target");
+
+            assert_eq!(transaction.status, "applied");
+            assert_eq!(transaction.targets[0].app_type, "gemini");
+            assert_eq!(transaction.targets[0].status, "detached");
+            assert_eq!(transaction.targets[1].app_type, "opencode");
+            assert_eq!(transaction.targets[1].status, "applied");
+            assert!(state
+                .db
+                .get_provider_by_id(&projected_provider_id(&definition, "opencode"), "opencode",)
+                .expect("query OpenCode projection")
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn dsh_projection_apply_is_db_only_and_redacts_credentials() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.name = "Shared DSH".to_string();
+            input.app_types = vec!["dsh".to_string()];
+            let definition = save_definition(state, input).expect("seed DSH definition");
+            let rendered = projection(&definition, "test-only-secret".to_string(), "dsh")
+                .expect("render DSH projection");
+            ProviderService::add(state, AppType::DeepSeekHarness, rendered.clone(), false)
+                .expect("save DSH projection directly");
+            let normalized = state
+                .db
+                .get_provider_by_id(&rendered.id, "dsh")
+                .expect("query normalized DSH projection")
+                .expect("normalized DSH projection exists");
+            assert_eq!(
+                rendered.settings_config, normalized.settings_config,
+                "DSH persistence must preserve projected settings"
+            );
+            state
+                .db
+                .delete_provider("dsh", &rendered.id)
+                .expect("remove direct DSH projection fixture");
+
+            let preview = preview_apply(state, &definition.id, vec!["dsh".to_string()])
+                .expect("preview DSH projection without live RPC");
+            assert_eq!(preview.targets.len(), 1);
+            assert!(preview.targets[0].compatible);
+            assert_eq!(preview.targets[0].connection_mode, "direct");
+
+            let transaction = apply_transaction(
+                state,
+                &definition.id,
+                vec!["dsh".to_string()],
+                &preview.token,
+                Some("dsh-db-only-projection"),
+            )
+            .expect("apply DSH projection without live RPC");
+            assert_eq!(
+                transaction.status, "applied",
+                "DSH projection transaction failed: {:?}",
+                transaction.targets
+            );
+
+            let projection = state
+                .db
+                .get_provider_by_id(&projected_provider_id(&definition, "dsh"), "dsh")
+                .expect("query DSH projection")
+                .expect("DSH projection exists");
+            assert_eq!(
+                projection
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.live_config_managed),
+                Some(false)
+            );
+            assert_eq!(
+                projection.settings_config["credentialRef"]["source"],
+                json!("providerCenter")
+            );
+            assert!(projection.settings_config.get("apiKey").is_none());
+            assert!(!serde_json::to_string(&projection)
+                .expect("serialize DSH projection")
+                .contains("test-only-secret"));
+        });
+    }
+
+    #[test]
+    fn dsh_reapply_existing_live_managed_projection_is_offline_and_preserves_marker() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.name = "Shared DSH".to_string();
+            input.app_types = vec!["dsh".to_string()];
+            let definition = save_definition(state, input).expect("seed DSH definition");
+            let mut existing = projection(&definition, "test-only-secret".to_string(), "dsh")
+                .expect("render existing DSH projection");
+            existing
+                .meta
+                .get_or_insert_with(Default::default)
+                .live_config_managed = Some(true);
+            state
+                .db
+                .save_provider("dsh", &existing)
+                .expect("seed live-managed DSH projection");
+
+            let preview = preview_apply(state, &definition.id, vec!["dsh".to_string()])
+                .expect("preview existing DSH projection without live RPC");
+            let transaction = apply_transaction(
+                state,
+                &definition.id,
+                vec!["dsh".to_string()],
+                &preview.token,
+                Some("dsh-offline-reapply-live-managed"),
+            )
+            .expect("reapply existing DSH projection without live RPC");
+            assert_eq!(transaction.status, "applied");
+            assert_eq!(transaction.targets[0].status, "applied");
+
+            let reapplied = state
+                .db
+                .get_provider_by_id(&existing.id, "dsh")
+                .expect("query reapplied DSH projection")
+                .expect("reapplied DSH projection exists");
+            assert_eq!(
+                reapplied.meta.and_then(|meta| meta.live_config_managed),
+                Some(true)
+            );
+        });
+    }
+
+    #[test]
+    fn dsh_managed_edit_keeps_existing_secret_without_renderer_round_trip() {
+        with_test_home(|state| {
+            let mut definition_input = definition_input(None, None, "https://api.example.test/v1");
+            definition_input.name = "Shared DSH".to_string();
+            definition_input.app_types = vec!["dsh".to_string()];
+            let definition = save_definition(state, definition_input).expect("seed DSH definition");
+            let preview = preview_apply(state, &definition.id, vec!["dsh".to_string()])
+                .expect("preview initial DSH projection");
+            apply_transaction(
+                state,
+                &definition.id,
+                vec!["dsh".to_string()],
+                &preview.token,
+                Some("dsh-managed-edit-seed"),
+            )
+            .expect("apply initial DSH projection");
+
+            let projected_id = projected_provider_id(&definition, "dsh");
+            let mut edited = state
+                .db
+                .get_provider_by_id(&projected_id, "dsh")
+                .expect("query DSH projection")
+                .expect("DSH projection exists");
+            edited.name = "Updated DSH".to_string();
+            edited.settings_config["displayName"] = json!("Updated DSH");
+            assert!(edited.settings_config.get("apiKey").is_none());
+            let input = ManagedProviderDraftInput {
+                app_type: "dsh".to_string(),
+                provider: edited,
+                definition_id: definition.id.clone(),
+                expected_revision: Some(definition.revision),
+                target_app_types: vec!["dsh".to_string()],
+            };
+
+            let managed_preview = preview_managed_draft(state, input.clone())
+                .expect("preview DSH managed edit without API key in renderer payload");
+            let transaction = confirm_managed_draft(
+                state,
+                input,
+                &managed_preview.token,
+                Some("dsh-managed-edit-keep-secret"),
+            )
+            .expect("confirm DSH managed edit while keeping secret");
+            assert_eq!(transaction.status, "applied");
+            assert_eq!(
+                get_secret(state, &definition.id).expect("read retained secret"),
+                "test-only-secret"
+            );
+            let updated_definition = load_definitions(state)
+                .expect("load definitions")
+                .into_iter()
+                .find(|item| item.id == definition.id)
+                .expect("updated definition exists");
+            assert_eq!(updated_definition.name, "Updated DSH");
+            assert!(updated_definition.credential_configured);
+        });
+    }
+
+    #[test]
+    fn dsh_live_projection_must_be_removed_from_live_before_deletion() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.name = "Shared DSH".to_string();
+            input.app_types = vec!["dsh".to_string()];
+            let definition = save_definition(state, input).expect("seed DSH definition");
+            let mut projected = projection(&definition, "test-only-secret".to_string(), "dsh")
+                .expect("render DSH projection");
+            projected
+                .meta
+                .get_or_insert_with(Default::default)
+                .live_config_managed = Some(true);
+            state
+                .db
+                .save_provider("dsh", &projected)
+                .expect("seed live-managed DSH projection");
+
+            let error = delete_provider(state, &definition.id, "dsh", DeleteMode::RemoveCurrent)
+                .expect_err("live-managed DSH projection deletion must be blocked");
+            assert!(error.to_string().contains("先从 DeepSeek Harness 移除"));
+            assert!(state
+                .db
+                .get_provider_by_id(&projected.id, "dsh")
+                .expect("query protected DSH projection")
+                .is_some());
+            assert!(load_bindings(state)
+                .expect("load protected DSH binding")
+                .into_iter()
+                .any(|binding| {
+                    binding.provider_id == definition.id
+                        && binding.app_type == "dsh"
+                        && binding.enabled
+                }));
+            assert!(load_definitions(state)
+                .expect("load protected DSH definition")
+                .into_iter()
+                .any(|item| item.id == definition.id));
+        });
+    }
+
+    #[test]
+    fn dsh_detach_keep_independent_moves_secret_ownership() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.name = "Shared DSH".to_string();
+            input.app_types = vec!["dsh".to_string()];
+            let definition = save_definition(state, input).expect("seed DSH definition");
+            let preview = preview_apply(state, &definition.id, vec!["dsh".to_string()])
+                .expect("preview DSH projection");
+            let transaction = apply_transaction(
+                state,
+                &definition.id,
+                vec!["dsh".to_string()],
+                &preview.token,
+                Some("dsh-detach-secret-migration"),
+            )
+            .expect("apply DSH projection");
+            assert_eq!(transaction.status, "applied");
+
+            disable_binding(state, &definition.id, "dsh", false)
+                .expect("detach DSH projection as independent provider");
+            let projected_id = projected_provider_id(&definition, "dsh");
+            let detached = state
+                .db
+                .get_provider_by_id(&projected_id, "dsh")
+                .expect("query detached DSH provider")
+                .expect("detached DSH provider exists");
+            assert_eq!(detached.category, None);
+            assert_eq!(
+                detached.settings_config["credentialRef"],
+                json!({ "source": "dshProvider", "id": projected_id })
+            );
+            assert_eq!(
+                secure_store::get(state, SecretScope::DshProvider, &detached.id)
+                    .expect("read migrated DSH secret"),
+                "test-only-secret"
+            );
+            assert!(projection_secret_for_provider(
+                state,
+                &AppType::DeepSeekHarness,
+                &detached,
+                &definition.id,
+            )
+            .is_err());
         });
     }
 

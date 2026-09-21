@@ -11,12 +11,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { providerCenterApi } from "@/lib/api";
 import type { ProviderCenterApp } from "@/lib/api/providerCenter";
-import type { ProviderApplyPreviewTarget, ProviderBinding } from "@/lib/api/providerCenter";
+import type {
+  ProviderApplyPreviewTarget,
+  ProviderBinding,
+} from "@/lib/api/providerCenter";
 import {
   PROVIDER_CENTER_APPS,
   providerCenterAppLabel,
 } from "./providerCenterApps";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { refreshProviderCenterApps } from "@/lib/query/providerCenter";
 
 interface ProviderScopeDialogProps {
   open: boolean;
@@ -48,9 +52,7 @@ export function ProviderScopeDialog({
           PROVIDER_CENTER_APPS,
         ),
       ]);
-      setBindings(
-        state.bindings.filter((b) => b.providerId === definitionId),
-      );
+      setBindings(state.bindings.filter((b) => b.providerId === definitionId));
       setTargets(preview.targets);
     } catch (error) {
       toast.error(extractErrorMessage(error));
@@ -68,17 +70,36 @@ export function ProviderScopeDialog({
   const handleAttach = useCallback(
     async (appType: ProviderCenterApp) => {
       setBusyApp(appType);
+      let attached = false;
       try {
         await providerCenterApi.attach(definitionId, appType);
+        attached = true;
+        const preview = await providerCenterApi.previewApply(definitionId, [
+          appType,
+        ]);
+        const transaction = await providerCenterApi.applyTransaction(
+          definitionId,
+          [appType],
+          preview.token,
+        );
+        if (transaction.status !== "applied") {
+          throw new Error(
+            `共享配置应用未完成，事务状态：${transaction.status}`,
+          );
+        }
+        await refreshProviderCenterApps(queryClient, [appType]);
         await refresh();
-        await queryClient.invalidateQueries({
-          queryKey: ["providers", appType],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["provider-center"],
-        });
         toast.success(`已添加到 ${providerCenterAppLabel(appType)}`);
       } catch (error) {
+        if (attached) {
+          await providerCenterApi
+            .disableBinding(definitionId, appType, false)
+            .catch(() => undefined);
+          await refreshProviderCenterApps(queryClient, [appType]).catch(
+            () => undefined,
+          );
+          await refresh().catch(() => undefined);
+        }
         toast.error(extractErrorMessage(error));
       } finally {
         setBusyApp(null);
@@ -92,13 +113,8 @@ export function ProviderScopeDialog({
       setBusyApp(appType);
       try {
         await providerCenterApi.disableBinding(definitionId, appType, false);
+        await refreshProviderCenterApps(queryClient, [appType]);
         await refresh();
-        await queryClient.invalidateQueries({
-          queryKey: ["providers", appType],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["provider-center"],
-        });
         toast.success(`已从 ${providerCenterAppLabel(appType)} 移除`);
       } catch (error) {
         toast.error(extractErrorMessage(error));

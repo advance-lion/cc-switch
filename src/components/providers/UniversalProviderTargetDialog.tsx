@@ -49,7 +49,9 @@ export function UniversalProviderTargetDialog({
 }: UniversalProviderTargetDialogProps) {
   const selected = new Set(selectedAppTypes);
   const locked = new Set(lockedAppTypes ?? []);
-  const targetByApp = new Map(targets.map((target) => [target.appType, target]));
+  const targetByApp = new Map(
+    targets.map((target) => [target.appType, target]),
+  );
 
   const toggle = (appType: ProviderCenterApp, checked: boolean) => {
     if (locked.has(appType)) return;
@@ -76,8 +78,8 @@ export function UniversalProviderTargetDialog({
           {PROVIDER_CENTER_APPS.map((appType) => {
             const target = targetByApp.get(appType);
             const compatible = target?.compatible ?? false;
-            const mode = target?.connectionMode ??
-              (compatible ? "direct" : "unsupported");
+            const mode =
+              target?.connectionMode ?? (compatible ? "direct" : "unsupported");
             const isLocked = locked.has(appType);
             const isIncompatible = !compatible;
             const disabled = pending || isLocked || isIncompatible;
@@ -116,11 +118,13 @@ export function UniversalProviderTargetDialog({
                       </span>
                     )}
                     {mode === "unsupported" && (
-                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                        isLocked
-                          ? "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-200"
-                          : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200"
-                      }`}>
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                          isLocked
+                            ? "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-200"
+                            : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200"
+                        }`}
+                      >
                         {isLocked ? "将解除共享" : "不兼容"}
                       </span>
                     )}

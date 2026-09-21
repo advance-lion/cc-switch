@@ -202,7 +202,7 @@ export function EditProviderDialog({
       // OpenCode uses additive mode, while Pi's shared models.json is owned by
       // the catalog coordinator. Neither has a per-provider generic live
       // snapshot that may replace the DB aggregate in this form.
-      if (appId === "opencode" || appId === "pi") {
+      if (appId === "opencode" || appId === "pi" || appId === "dsh") {
         if (!cancelled) {
           setLiveSettings(null);
           setHasLoadedLive(true);
@@ -262,7 +262,14 @@ export function EditProviderDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover, managedContext]); // 只依赖 provider.id，不依赖整个 provider 对象
+  }, [
+    open,
+    provider?.id,
+    appId,
+    hasLoadedLive,
+    isProxyTakeover,
+    managedContext,
+  ]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
     const storedSettings = asRecord(provider?.settingsConfig);
@@ -327,7 +334,10 @@ export function EditProviderDialog({
         unknown
       >;
       const nextProviderId =
-        (appId === "opencode" || appId === "openclaw" || appId === "pi") &&
+        (appId === "opencode" ||
+          appId === "openclaw" ||
+          appId === "pi" ||
+          appId === "dsh") &&
         values.providerKey?.trim()
           ? values.providerKey.trim()
           : provider.id;
@@ -387,8 +397,8 @@ export function EditProviderDialog({
             通用 Provider
             {managedBindingTargets && managedBindingTargets.length > 0
               ? (() => {
-                  const labels = managedBindingTargets.map(
-                    (t) => providerCenterAppLabel(t),
+                  const labels = managedBindingTargets.map((t) =>
+                    providerCenterAppLabel(t),
                   );
                   if (labels.length <= 3) {
                     return ` · 已添加到 ${labels.join("、")}`;

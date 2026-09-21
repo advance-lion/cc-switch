@@ -97,7 +97,7 @@ impl AppAdapterRegistry {
             AppAdapter::new(
                 AppType::DeepSeekHarness,
                 "openai-chat",
-                &["openai-chat"],
+                &["openai-chat", "openai-responses", "anthropic", "ollama"],
                 render_dsh,
             ),
         ];
@@ -262,6 +262,12 @@ impl AppAdapter {
                 ..Default::default()
             });
         }
+        if self.app_type == AppType::DeepSeekHarness {
+            provider
+                .meta
+                .get_or_insert_with(Default::default)
+                .live_config_managed = Some(false);
+        }
         Ok(provider)
     }
 
@@ -292,9 +298,20 @@ impl AppAdapter {
         ProviderService::read_live_settings(self.app_type())
     }
 
-    pub(crate) fn apply(&self, state: &AppState, provider: Provider) -> Result<(), AppError> {
+    pub(crate) fn apply(&self, state: &AppState, mut provider: Provider) -> Result<(), AppError> {
         let id = provider.id.clone();
-        if state.db.get_provider_by_id(&id, self.app_id())?.is_some() {
+        if self.app_type == AppType::DeepSeekHarness {
+            if let Some(existing) = state.db.get_provider_by_id(&id, self.app_id())? {
+                provider
+                    .meta
+                    .get_or_insert_with(Default::default)
+                    .live_config_managed = existing
+                    .meta
+                    .and_then(|meta| meta.live_config_managed)
+                    .or(Some(false));
+            }
+            state.db.save_provider(self.app_id(), &provider)?;
+        } else if state.db.get_provider_by_id(&id, self.app_id())?.is_some() {
             ProviderService::update(state, self.app_type(), Some(&id), provider)?;
         } else {
             ProviderService::add(state, self.app_type(), provider, false)?;
@@ -303,7 +320,22 @@ impl AppAdapter {
     }
 
     pub(crate) fn delete(&self, state: &AppState, provider_id: &str) -> Result<(), AppError> {
-        ProviderService::delete(state, self.app_type(), provider_id)
+        if self.app_type == AppType::DeepSeekHarness {
+            if state
+                .db
+                .get_provider_by_id(provider_id, self.app_id())?
+                .and_then(|provider| provider.meta)
+                .and_then(|meta| meta.live_config_managed)
+                == Some(true)
+            {
+                return Err(AppError::Message(
+                    "请先从 DeepSeek Harness 移除此 Provider，再删除受管投影".to_string(),
+                ));
+            }
+            state.db.delete_provider(self.app_id(), provider_id)
+        } else {
+            ProviderService::delete(state, self.app_type(), provider_id)
+        }
     }
 }
 
@@ -653,8 +685,79 @@ fn render_pi(definition: &ProviderDefinition, secret: &str) -> Result<Provider, 
     ))
 }
 
-fn render_dsh(_definition: &ProviderDefinition, _secret: &str) -> Result<Provider, AppError> {
-    Err(render_error())
+fn render_dsh(definition: &ProviderDefinition, _secret: &str) -> Result<Provider, AppError> {
+    let api = native_api_name(&definition.protocol).ok_or_else(render_error)?;
+    let defs = model_defs(definition);
+    let base_url = openai_compatible_base_url(definition);
+    let models: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|model| {
+            let mut entry = json!({
+                "id": model.id,
+                "name": model.display_name.as_deref().unwrap_or(&model.id),
+            });
+            if let Some(context_window) = model.context_window {
+                entry["contextWindow"] = json!(context_window);
+            }
+            if let Some(max_tokens) = model.max_output_tokens {
+                entry["maxTokens"] = json!(max_tokens);
+            }
+            if !model.input_modalities.is_empty() {
+                entry["input"] = json!(model.input_modalities);
+            }
+            entry
+        })
+        .collect();
+    let route = projected_provider_id(definition, AppType::DeepSeekHarness.as_str());
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "displayName".to_string(),
+        serde_json::Value::String(definition.name.clone()),
+    );
+    settings.insert(
+        "api".to_string(),
+        serde_json::Value::String(api.to_string()),
+    );
+    settings.insert("baseURL".to_string(), serde_json::Value::String(base_url));
+    settings.insert("models".to_string(), serde_json::Value::Array(models));
+    if definition.protocol != "ollama" {
+        let credential_ref = format!("CC_SWITCH_DSH_{}_API_KEY", stable_identifier(&route));
+        settings.insert(
+            "apiKeyEnv".to_string(),
+            serde_json::Value::String(credential_ref),
+        );
+    }
+    settings.insert("schemaVersion".to_string(), json!(1));
+    settings.insert("route".to_string(), serde_json::Value::String(route));
+    if definition.protocol != "ollama" {
+        settings.insert(
+            "credentialRef".to_string(),
+            json!({
+                "source": "providerCenter",
+                "id": definition.id,
+            }),
+        );
+    }
+
+    Ok(Provider::with_id(
+        String::new(),
+        definition.name.clone(),
+        serde_json::Value::Object(settings),
+        None,
+    ))
+}
+
+fn stable_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn render_error() -> AppError {

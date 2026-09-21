@@ -400,6 +400,39 @@ pub enum AppType {
     DeepSeekHarness,
 }
 
+/// Provider selection semantics exposed by an Agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMode {
+    /// Exactly one provider is active in the Agent's live configuration.
+    Switch,
+    /// Multiple providers can coexist and are enabled independently.
+    Additive,
+}
+
+/// Mechanism used to project providers into an Agent's live configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderLiveBackend {
+    File,
+    PiService,
+    DshRpc,
+}
+
+/// Whether application startup may synchronize provider state automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStartupSync {
+    Current,
+    AllManaged,
+    ExplicitOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderBehavior {
+    pub mode: ProviderMode,
+    pub live_backend: ProviderLiveBackend,
+    pub startup_sync: ProviderStartupSync,
+    pub supports_shared_projection: bool,
+}
+
 impl AppType {
     pub fn as_str(&self) -> &str {
         match self {
@@ -416,16 +449,43 @@ impl AppType {
         }
     }
 
-    /// Check if this app uses additive mode
-    ///
-    /// - Switch mode (false): Only the current provider is written to live config (Claude, Codex, Gemini)
-    /// - Additive mode (true): Providers coexist in native config and can be enabled independently
-    ///   (OpenCode, OpenClaw, Hermes, Pi)
+    /// Return the provider lifecycle behavior for this Agent.
+    pub fn provider_behavior(&self) -> ProviderBehavior {
+        match self {
+            AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => ProviderBehavior {
+                mode: ProviderMode::Additive,
+                live_backend: ProviderLiveBackend::File,
+                startup_sync: ProviderStartupSync::AllManaged,
+                supports_shared_projection: true,
+            },
+            AppType::Pi => ProviderBehavior {
+                mode: ProviderMode::Additive,
+                live_backend: ProviderLiveBackend::PiService,
+                startup_sync: ProviderStartupSync::ExplicitOnly,
+                supports_shared_projection: true,
+            },
+            AppType::DeepSeekHarness => ProviderBehavior {
+                mode: ProviderMode::Additive,
+                live_backend: ProviderLiveBackend::DshRpc,
+                startup_sync: ProviderStartupSync::ExplicitOnly,
+                supports_shared_projection: true,
+            },
+            AppType::Claude
+            | AppType::ClaudeDesktop
+            | AppType::Codex
+            | AppType::Gemini
+            | AppType::GrokBuild => ProviderBehavior {
+                mode: ProviderMode::Switch,
+                live_backend: ProviderLiveBackend::File,
+                startup_sync: ProviderStartupSync::Current,
+                supports_shared_projection: true,
+            },
+        }
+    }
+
+    /// Check if this app uses additive mode.
     pub fn is_additive_mode(&self) -> bool {
-        matches!(
-            self,
-            AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi
-        )
+        self.provider_behavior().mode == ProviderMode::Additive
     }
 
     pub fn supports_local_proxy(&self) -> bool {
