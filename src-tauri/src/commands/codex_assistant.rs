@@ -26,6 +26,131 @@ use uuid::Uuid;
 const EVENT_NAME: &str = "codex-assistant-event";
 const MAX_INPUT_LENGTH: usize = 60_000;
 
+/// Project knowledge injected as AGENTS.md into the Codex assistant workspace.
+/// Codex CLI automatically reads AGENTS.md from its working directory on
+/// startup, giving the assistant context about CC Switch Dev itself.
+const AGENTS_MD: &str = r###"
+# CC Switch Dev - Project Guide
+
+## Overview
+CC Switch Dev is an all-in-one desktop assistant for managing AI coding tools
+(Claude Code, Codex CLI, Gemini CLI). Built with Tauri v2 (Rust + React/TS).
+
+## Tech Stack
+- Backend: Rust, Tauri v2, SQLite (rusqlite)
+- Frontend: React 18, TypeScript, Tailwind CSS, Vite
+- API bridge: Tauri invoke() commands + event listeners
+- i18n: react-i18next (zh / en)
+
+## Architecture
+
+### Rust Backend (src-tauri/src/)
+- commands/ -- Tauri command handlers (each file = one feature domain)
+- database/ -- SQLite schema, migrations, queries
+- proxy/ -- HTTP reverse proxy for API routing and failover
+- provider_center/ -- Shared provider definitions and app adapters
+- services/ -- Background services (usage sync, session import)
+- config.rs -- App config dir resolution, global state
+
+### Frontend (src/)
+- components/providers/ -- Provider list, add/edit, switching UI
+- components/provider-center/ -- Shared provider definition management
+- components/assistant/CodexAssistantDock.tsx -- This assistant chat UI
+- components/settings/ -- App settings panels
+- components/runtime/ -- CLI tool install/update/launch UI
+- components/hermes/ -- Hermes desktop integration
+- components/mcp/ -- MCP server management
+- components/sessions/ -- Session history browser
+- components/usage/ -- Usage tracking and charts
+- lib/api/ -- Tauri invoke wrappers (settings.ts, index.ts, etc.)
+- contexts/ -- React contexts (AppConfig, Toast, etc.)
+
+## Key Feature Domains
+
+### Provider System (commands/provider.rs)
+Manages API providers for Claude Code, Codex CLI, Gemini CLI, and others.
+- CRUD: add_provider, update_provider, delete_provider, get_providers
+- Switching: switch_provider (writes to live config files)
+- Live config: reads/writes ~/.claude/settings.json, ~/.codex/config.toml, etc.
+- Each provider has: name, app, base_url, api_key, model, headers
+
+### Provider Center (commands/provider_center.rs)
+Shared provider definitions that can be imported into multiple apps.
+- Definitions are app-agnostic; bindings map them to specific apps
+- Model catalog discovery via API probing
+
+### Codex Assistant (commands/codex_assistant.rs)
+The feature you are running inside right now.
+- Uses codex exec --json as backend (one process per message)
+- First message: codex exec --json -s danger-full-access -C <cwd> -
+- Resume: codex exec resume <thread_id> --json --dangerously-bypass-approvals-and-sandbox -
+- Uses real ~/.codex as CODEX_HOME (MCP, hooks, skills intact)
+- Events stream via Tauri event: codex-assistant-event
+- Generation counter prevents stale stdout readers from racing
+
+### Desktop Lifecycle (commands/desktop_lifecycle.rs)
+Manages desktop apps (Hermes, Codex Desktop, DeepSeek Harness).
+- Install, update, launch, restart, uninstall
+- Async jobs with cancellation support
+
+### CLI Lifecycle (commands/cli_lifecycle.rs)
+Manages CLI tools (codex, claude, gemini).
+- Install, update, launch terminal, uninstall
+
+### Proxy (commands/proxy.rs, proxy/)
+HTTP reverse proxy for routing API calls through CC Switch.
+- Failover across multiple providers
+- Rate limiting and usage tracking
+
+### MCP (commands/mcp.rs)
+Model Context Protocol server configuration management.
+
+### Session Manager (commands/session_manager.rs)
+Imports and browses session history from CLI tools.
+
+### Usage Tracking (commands/usage.rs)
+Tracks API token usage per provider.
+
+## Database
+SQLite at <app_config_dir>/ccswitch.db. Key tables:
+- providers, provider_bindings, model_pricing
+- usage_events, sessions
+- profiles, settings
+
+## How to Add a New Provider
+1. User adds via UI (Provider Center or per-app provider list)
+2. Frontend calls add_provider Tauri command
+3. Backend stores in SQLite + writes to live config file
+4. switch_provider updates the app live config (e.g. ~/.codex/config.toml)
+
+## Config File Locations
+- App config: <APPDATA>/com.ccswitch.desktop.dev/
+- Codex home: ~/.codex/ (config.toml, auth.json)
+- Claude config: ~/.claude/settings.json
+- CC Switch DB: <app_config_dir>/ccswitch.db
+
+## Conventions
+- Rust commands registered in lib.rs invoke_handler
+- Frontend API wrappers in src/lib/api/settings.ts
+- Events use Tauri emit() / listen()
+- Chinese is the primary UI language; English i18n keys in src/i18n/
+"###;
+
+/// Write AGENTS.md to the workspace directory so Codex CLI reads it
+/// automatically on startup and gains project context.
+fn ensure_agents_md(dir: &Path) {
+    let agents_path = dir.join("AGENTS.md");
+    if let Ok(existing) = fs::read_to_string(&agents_path) {
+        if existing == AGENTS_MD {
+            return;
+        }
+    }
+    if let Err(e) = fs::write(&agents_path, AGENTS_MD) {
+        log::warn!("[codex-assistant] failed to write AGENTS.md: {e}");
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum CodexAssistantEvent {
@@ -113,6 +238,7 @@ fn resolve_workspace_dir(raw: Option<&str>) -> Result<PathBuf, String> {
                 .join("codex-assistant")
                 .join("workspace");
             fs::create_dir_all(&path).map_err(|error| format!("无法创建助手工作目录: {error}"))?;
+            ensure_agents_md(&path);
             fs::canonicalize(path).map_err(|error| format!("无法访问助手工作目录: {error}"))?
         }
     };
@@ -629,6 +755,21 @@ pub fn cancel_codex_assistant_run(session_id: String) -> Result<bool, String> {
     let session = get_session(&session_id)?;
     session.cancelled.store(true, Ordering::Release);
     terminate_child(&session);
+    // Bump generation so the stale stdout reader exits quietly without
+    // emitting a duplicate Finished event.
+    session.generation.fetch_add(1, Ordering::AcqRel);
+    // Set running=false immediately — don't wait for the stdout reader
+    // post-loop, because MCP child processes may keep the pipe open.
+    session.running.store(false, Ordering::Release);
+    emit_event(
+        session.events.as_ref(),
+        CodexAssistantEvent::Finished {
+            session_id: session.id.clone(),
+            success: false,
+            cancelled: true,
+            message: None,
+        },
+    );
     Ok(true)
 }
 
@@ -637,6 +778,8 @@ pub fn close_codex_assistant_session(session_id: String) -> Result<bool, String>
     let session = get_session(&session_id)?;
     session.cancelled.store(true, Ordering::Release);
     terminate_child(&session);
+    session.generation.fetch_add(1, Ordering::AcqRel);
+    session.running.store(false, Ordering::Release);
     if let Ok(mut sessions) = SESSIONS.lock() {
         sessions.remove(&session_id);
     }

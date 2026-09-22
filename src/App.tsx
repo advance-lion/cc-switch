@@ -1249,17 +1249,7 @@ function App() {
             />
           );
         case "codexAssistant":
-          return (
-            <CodexAssistantDock
-              embedded
-              providerReady={codexProviderReady}
-              onOpenCodexConfiguration={() => {
-                setActiveApp("codex");
-                setCurrentView("providers");
-              }}
-              onClose={() => setCurrentView("providers")}
-            />
-          );
+          return null;
         case "hermesMemory":
           return <HermesMemoryPanel />;
         case "skills":
@@ -1980,7 +1970,7 @@ function App() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => setCurrentView("codexAssistant")}
+                                onClick={() => setCodexAssistantOpenRequest((c) => c + 1)}
                                 className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
                                 title={t("codexAssistant.title")}
                               >
@@ -2016,7 +2006,7 @@ function App() {
         {renderContent()}
       </main>
 
-      {currentView !== "codexAssistant" && (
+      {(
       <CodexAssistantDock
         providerReady={codexProviderReady}
         openRequestId={codexAssistantOpenRequest}

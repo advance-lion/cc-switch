@@ -278,6 +278,13 @@ export function CodexAssistantDock({
   const appendLogRef = useRef(appendLog);
   appendLogRef.current = appendLog;
 
+  // Track whether the dock panel is open, for use inside the event listener.
+  const openRef = useRef(false);
+  openRef.current = open;
+
+  // Unread flag: set when a message/finish arrives while the dock is closed.
+  const [hasUnread, setHasUnread] = useState(false);
+
   useEffect(() => {
     const storedPosition = localStorage.getItem(FLOATING_POSITION_STORAGE_KEY);
     if (storedPosition) {
@@ -333,11 +340,7 @@ export function CodexAssistantDock({
       if (dragAnimationFrameRef.current !== null) {
         cancelAnimationFrame(dragAnimationFrameRef.current);
       }
-      const activeSessionId = sessionIdRef.current;
-      sessionIdRef.current = null;
-      if (activeSessionId) {
-        void settingsApi.closeCodexAssistantSession(activeSessionId);
-      }
+      // Session persists in the background - do NOT kill it on unmount.
     },
     [],
   );
@@ -393,6 +396,7 @@ export function CodexAssistantDock({
             return;
           case "message":
             if (event.message) {
+              if (!openRef.current) setHasUnread(true);
               setChatMessages((current) => {
                 if (streamAssistantMessageRef.current) {
                   const last = current.at(-1);
@@ -418,6 +422,7 @@ export function CodexAssistantDock({
             ]);
             return;
           case "finished":
+            if (!openRef.current) setHasUnread(true);
             streamAssistantMessageRef.current = false;
             setRunning(false);
             setStopping(false);
@@ -658,8 +663,9 @@ export function CodexAssistantDock({
   };
 
   const closeAssistant = () => {
+    // Only hide the panel - the backend session stays alive so running
+    // tasks continue in the background and the user can reopen later.
     setOpen(false);
-    closeSession();
     onDismiss?.();
   };
 
@@ -674,6 +680,11 @@ export function CodexAssistantDock({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [open, onDismiss]);
+
+  // Clear unread indicator when the dock opens.
+  useEffect(() => {
+    if (open) setHasUnread(false);
+  }, [open]);
 
   return (
     <>
@@ -716,6 +727,12 @@ export function CodexAssistantDock({
           title={t("codexAssistant.open")}
         >
           <CodexIcon size={19} className="dark:invert-0" />
+          {(running || hasUnread) && (
+            <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-3 w-3">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-75" />
+              <span className="relative inline-flex h-3 w-3 rounded-full bg-violet-500" />
+            </span>
+          )}
         </button>
       </div>
 
