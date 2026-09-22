@@ -8,9 +8,8 @@ const settingsApiMock = vi.hoisted(() => ({
   getToolVersions: vi.fn(),
   runToolLifecycleAction: vi.fn(),
   startCodexAssistantSession: vi.fn(),
-  sendCodexAssistantMessage: vi.fn(),
-  respondCodexAssistantApproval: vi.fn(),
-  cancelCodexAssistantRun: vi.fn(),
+ sendCodexAssistantMessage: vi.fn(),
+ cancelCodexAssistantRun: vi.fn(),
   closeCodexAssistantSession: vi.fn(),
   onCodexAssistantEvent: vi.fn().mockResolvedValue(() => {}),
 }));
@@ -37,9 +36,8 @@ describe("CodexAssistantDock", () => {
       { name: "codex", version: "0.50.0", installed_but_broken: false },
     ]);
     settingsApiMock.startCodexAssistantSession.mockResolvedValue("session-1");
-    settingsApiMock.sendCodexAssistantMessage.mockResolvedValue(undefined);
-    settingsApiMock.respondCodexAssistantApproval.mockResolvedValue(undefined);
-    settingsApiMock.cancelCodexAssistantRun.mockResolvedValue(true);
+ settingsApiMock.sendCodexAssistantMessage.mockResolvedValue(undefined);
+ settingsApiMock.cancelCodexAssistantRun.mockResolvedValue(true);
     settingsApiMock.closeCodexAssistantSession.mockResolvedValue(true);
     settingsApiMock.onCodexAssistantEvent.mockResolvedValue(() => {});
   });
@@ -180,139 +178,10 @@ describe("CodexAssistantDock", () => {
         settingsApiMock.sendCodexAssistantMessage,
       ).toHaveBeenLastCalledWith("session-1", "第二个问题"),
     );
-    expect(settingsApiMock.startCodexAssistantSession).toHaveBeenCalledTimes(1);
-  });
+   expect(settingsApiMock.startCodexAssistantSession).toHaveBeenCalledTimes(1);
+ });
 
-  it("shows command approvals and sends the selected decision", async () => {
-    renderDock();
-    await openDock();
-    await sendMessage("检查项目");
-    await waitFor(() =>
-      expect(settingsApiMock.sendCodexAssistantMessage).toHaveBeenCalled(),
-    );
-
-    await emitAssistantEvent({
-      sessionId: "session-1",
-      kind: "approval",
-      approval: {
-        id: "approval-command",
-        type: "command",
-        command: "pnpm test:unit",
-        cwd: "C:\\workspace\\project",
-        reason: "Run the focused test suite",
-        networkHost: "registry.npmjs.org",
-        grantRoot: null,
-        allowForSession: true,
-        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
-      },
-    });
-
-    expect(screen.getByText("pnpm test:unit")).toBeInTheDocument();
-    expect(screen.getByText("C:\\workspace\\project")).toBeInTheDocument();
-    expect(screen.getByText("registry.npmjs.org")).toBeInTheDocument();
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "Allow for session" }),
-    );
-    await waitFor(() =>
-      expect(
-        settingsApiMock.respondCodexAssistantApproval,
-      ).toHaveBeenCalledWith(
-        "session-1",
-        "approval-command",
-        "acceptForSession",
-      ),
-    );
-    expect(
-      screen.queryByTestId("codex-approval-approval-command"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("only renders approval decisions advertised by app-server", async () => {
-    renderDock();
-    await openDock();
-    await sendMessage("执行受控命令");
-    await waitFor(() =>
-      expect(settingsApiMock.sendCodexAssistantMessage).toHaveBeenCalled(),
-    );
-
-    await emitAssistantEvent({
-      sessionId: "session-1",
-      kind: "approval",
-      approval: {
-        id: "approval-limited",
-        type: "command",
-        command: "tool --check",
-        cwd: "C:\\workspace",
-        reason: "Check the local tool",
-        networkHost: null,
-        grantRoot: null,
-        allowForSession: false,
-        availableDecisions: ["accept", "cancel"],
-      },
-    });
-
-    expect(
-      screen.getByRole("button", { name: "Allow once" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Cancel task" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Deny" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Allow for session" }),
-    ).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Cancel task" }));
-    await waitFor(() =>
-      expect(
-        settingsApiMock.respondCodexAssistantApproval,
-      ).toHaveBeenCalledWith("session-1", "approval-limited", "cancel"),
-    );
-  });
-
-  it("shows file approvals without a session-wide option and can deny them", async () => {
-    renderDock();
-    await openDock();
-    await sendMessage("修改配置");
-    await waitFor(() =>
-      expect(settingsApiMock.sendCodexAssistantMessage).toHaveBeenCalled(),
-    );
-
-    await emitAssistantEvent({
-      sessionId: "session-1",
-      kind: "approval",
-      approval: {
-        id: "approval-file",
-        type: "fileChange",
-        command: null,
-        cwd: null,
-        reason: "Update the provider configuration",
-        networkHost: null,
-        grantRoot: "C:\\workspace\\project",
-        allowForSession: false,
-        availableDecisions: ["accept", "decline"],
-      },
-    });
-
-    expect(
-      screen.getByText("Update the provider configuration"),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Allow for session" }),
-    ).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Deny" }));
-    await waitFor(() =>
-      expect(
-        settingsApiMock.respondCodexAssistantApproval,
-      ).toHaveBeenCalledWith("session-1", "approval-file", "decline"),
-    );
-  });
-
-  it("prefills an install intent as a conversation message", async () => {
+ it("prefills an install intent as a conversation message", async () => {
     render(
       <CodexAssistantDock
         providerReady={true}

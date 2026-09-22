@@ -48,35 +48,12 @@ export interface CodexAssistantChatTurn {
   content: string;
 }
 
-export type CodexAssistantApprovalDecision =
-  | "accept"
-  | "acceptForSession"
-  | "decline"
-  | "cancel";
-
-export interface CodexAssistantApproval {
-  id: string;
-  type: "command" | "fileChange";
-  command?: string | null;
-  cwd?: string | null;
-  reason?: string | null;
-  networkHost?: string | null;
-  grantRoot?: string | null;
-  allowForSession: boolean;
-  availableDecisions: CodexAssistantApprovalDecision[];
-}
-
 export type CodexAssistantEvent =
   | { sessionId: string; kind: "started" }
   | { sessionId: string; kind: "message"; message: string }
   | { sessionId: string; kind: "log"; message: string }
   | { sessionId: string; kind: "stderr"; message: string }
   | { sessionId: string; kind: "disconnected"; message: string }
-  | {
-      sessionId: string;
-      kind: "approval";
-      approval: CodexAssistantApproval;
-    }
   | {
       sessionId: string;
       kind: "finished";
@@ -279,26 +256,6 @@ export const settingsApi = {
       return;
     }
     await invoke("send_codex_assistant_message", { sessionId, message });
-  },
-
-  async respondCodexAssistantApproval(
-    sessionId: string,
-    approvalId: string,
-    decision: CodexAssistantApprovalDecision,
-  ): Promise<void> {
-    if (isCodexAssistantWebBridgeActive()) {
-      await webAssistantRequest<{ accepted: boolean }>("/approval", {
-        sessionId,
-        approvalId,
-        decision,
-      });
-      return;
-    }
-    await invoke("respond_codex_assistant_approval", {
-      sessionId,
-      approvalId,
-      decision,
-    });
   },
 
   async cancelCodexAssistantRun(sessionId: string): Promise<boolean> {

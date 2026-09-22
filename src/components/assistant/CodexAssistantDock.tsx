@@ -268,9 +268,15 @@ export function CodexAssistantDock({
   const streamAssistantMessageRef = useRef(false);
   const lastHandledOpenRequestRef = useRef(0);
 
+  // Stable ref for t so the event listener useEffect never re-runs.
+  const tRef = useRef(t);
+  tRef.current = t;
+
   const appendLog = useCallback((line: string) => {
     setLogs((current) => [...current, line].slice(-MAX_VISIBLE_LOG_LINES));
   }, []);
+  const appendLogRef = useRef(appendLog);
+  appendLogRef.current = appendLog;
 
   useEffect(() => {
     const storedPosition = localStorage.getItem(FLOATING_POSITION_STORAGE_KEY);
@@ -356,7 +362,10 @@ export function CodexAssistantDock({
 
     void settingsApi
       .onCodexAssistantEvent((event) => {
+        console.log("[codex-assistant] event:", event.kind, "session:", String(event.sessionId).slice(0,8), "current:", String(sessionIdRef.current).slice(0,8));
         if (event.sessionId !== sessionIdRef.current) return;
+        const t = tRef.current;
+        const appendLog = appendLogRef.current;
 
         switch (event.kind) {
           case "started":
@@ -370,8 +379,8 @@ export function CodexAssistantDock({
             if (event.message) appendLog(`stderr · ${event.message}`);
             return;
           case "disconnected":
-            sessionIdRef.current = null;
-            setSessionId(null);
+            // Keep the session alive: the backend preserves thread_id for
+            // resume, so the user can retry without losing context.
             streamAssistantMessageRef.current = false;
             setRunning(false);
             setStopping(false);
@@ -424,15 +433,17 @@ export function CodexAssistantDock({
         }
       })
       .then((listener) => {
+        console.log("[codex-assistant] listener ready, disposed:", dispose);
         if (dispose) listener();
         else unlisten = listener;
       });
 
     return () => {
+      console.log("[codex-assistant] cleaning up listener");
       dispose = true;
       unlisten?.();
     };
-  }, [appendLog, t]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- refs for fresh values
 
   useEffect(() => {
     if (open) void refreshRuntime();
@@ -466,6 +477,7 @@ export function CodexAssistantDock({
 
   const ensureSession = async (): Promise<string> => {
     if (sessionIdRef.current) return sessionIdRef.current;
+    console.log("[codex-assistant] ensureSession: creating new session");
     setStartingSession(true);
     try {
       const nextSessionId = await settingsApi.startCodexAssistantSession();
@@ -479,6 +491,7 @@ export function CodexAssistantDock({
 
   const sendMessage = async () => {
     const text = request.trim();
+    console.log("[codex-assistant] sendMessage: text:", text.slice(0,20), "running:", running, "starting:", startingSession);
     if (!text || running || startingSession) return;
 
     setRequest("");
@@ -488,9 +501,12 @@ export function CodexAssistantDock({
     setChatMessages((current) => [...current, { role: "user", content: text }]);
     try {
       const activeSessionId = await ensureSession();
+      console.log("[codex-assistant] sendMessage: calling backend");
       setRunning(true);
       await settingsApi.sendCodexAssistantMessage(activeSessionId, text);
+      console.log("[codex-assistant] sendMessage: backend invoke resolved");
     } catch (error) {
+      console.error("[codex-assistant] sendMessage: error", error);
       setRunning(false);
       const message =
         extractErrorMessage(error) || t("codexAssistant.runFailed");

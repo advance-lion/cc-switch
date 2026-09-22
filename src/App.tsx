@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   Loader2,
   RefreshCw,
+  Bot,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -150,6 +151,7 @@ type View =
   | "openclawEnv"
   | "openclawTools"
   | "openclawAgents"
+  | "codexAssistant"
   | "hermesMemory";
 
 interface SyncStatusUpdatedPayload {
@@ -185,6 +187,7 @@ const VALID_VIEWS: View[] = [
   "openclawEnv",
   "openclawTools",
   "openclawAgents",
+  "codexAssistant",
   "hermesMemory",
 ];
 
@@ -1245,6 +1248,18 @@ function App() {
               onPrimaryActionChange={setPromptPrimaryAction}
             />
           );
+        case "codexAssistant":
+          return (
+            <CodexAssistantDock
+              embedded
+              providerReady={codexProviderReady}
+              onOpenCodexConfiguration={() => {
+                setActiveApp("codex");
+                setCurrentView("providers");
+              }}
+              onClose={() => setCurrentView("providers")}
+            />
+          );
         case "hermesMemory":
           return <HermesMemoryPanel />;
         case "skills":
@@ -1554,6 +1569,7 @@ function App() {
                   {currentView === "openclawAgents" &&
                     t("openclaw.agents.title")}
                   {currentView === "hermesMemory" && t("hermes.memory.title")}
+                  {currentView === "codexAssistant" && t("codexAssistant.title")}
                 </h1>
               </div>
             ) : (
@@ -1961,6 +1977,15 @@ function App() {
                                   <McpIcon size={16} />
                                 </Button>
                               )}
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setCurrentView("codexAssistant")}
+                                className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                                title={t("codexAssistant.title")}
+                              >
+                                <Bot className="w-4 h-4" />
+                              </Button>
                             </>
                           )}
                         </motion.div>
@@ -1991,6 +2016,7 @@ function App() {
         {renderContent()}
       </main>
 
+      {currentView !== "codexAssistant" && (
       <CodexAssistantDock
         providerReady={codexProviderReady}
         openRequestId={codexAssistantOpenRequest}
@@ -2004,6 +2030,7 @@ function App() {
           setCurrentView("providers");
         }}
       />
+      )}
 
       <AddProviderDialog
         open={isAddOpen}

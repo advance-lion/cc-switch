@@ -12,8 +12,6 @@ export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
 export { isCodexAssistantWebBridgeActive } from "./settings";
 export type {
-  CodexAssistantApproval,
-  CodexAssistantApprovalDecision,
   CodexAssistantChatTurn,
   CodexAssistantEvent,
   CodexDesktopStatus,

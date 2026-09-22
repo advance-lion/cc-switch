@@ -1712,7 +1712,6 @@ pub fn run() {
             // Persistent Codex app-server assistant conversation
             commands::start_codex_assistant_session,
             commands::send_codex_assistant_message,
-            commands::respond_codex_assistant_approval,
             commands::cancel_codex_assistant_run,
             commands::close_codex_assistant_session,
             // Provider terminal

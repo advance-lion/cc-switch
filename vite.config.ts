@@ -14,14 +14,7 @@ const MAX_REQUEST_LENGTH = 6_000;
 type PreviewAssistantSession = {
   id: string;
   history: ChatTurn[];
-  pendingApprovalId?: string;
 };
-
-type PreviewApprovalDecision =
-  | "accept"
-  | "acceptForSession"
-  | "decline"
-  | "cancel";
 
 type DesktopAppId = "codex-desktop" | "claude-desktop";
 
@@ -383,70 +376,6 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
     getSession(body.sessionId ?? body.session_id) ??
     createSession(body.history);
 
-  const approvalDecision = (body: Record<string, unknown>) => {
-    const raw = body.decision ?? body.approved ?? body.action;
-    if (
-      raw === true ||
-      raw === "accept" ||
-      raw === "acceptForSession" ||
-      raw === "approved" ||
-      raw === "approve"
-    ) {
-      return raw === "acceptForSession"
-        ? "acceptForSession"
-        : ("accept" as PreviewApprovalDecision);
-    }
-    if (
-      raw === false ||
-      raw === "decline" ||
-      raw === "denied" ||
-      raw === "deny"
-    ) {
-      return "decline" as PreviewApprovalDecision;
-    }
-    if (raw === "cancel") return "cancel" as PreviewApprovalDecision;
-    throw new Error("请选择允许、拒绝或取消任务");
-  };
-
-  const emitPreviewApproval = (
-    session: PreviewAssistantSession,
-    request: string,
-  ) => {
-    const approvalId = randomUUID();
-    session.pendingApprovalId = approvalId;
-    emit({
-      sessionId: session.id,
-      kind: "started",
-    });
-    emit({
-      sessionId: session.id,
-      kind: "message",
-      message:
-        "这是浏览器预览。我可以展示操作确认，但不会安装软件、修改配置或执行真实命令。",
-    });
-    emit({
-      sessionId: session.id,
-      kind: "approval",
-      approval: {
-        id: approvalId,
-        type: "command",
-        command: request,
-        cwd: null,
-        reason: "浏览器预览仅模拟操作确认，不会执行真实命令。",
-        networkHost: null,
-        grantRoot: null,
-        allowForSession: false,
-        availableDecisions: ["accept", "cancel"],
-      },
-      message: "浏览器预览不会执行真实操作。你可以允许或取消此模拟确认。",
-    });
-  };
-
-  const looksLikeOperationRequest = (request: string) =>
-    /(?:安装|卸载|更新|升级|配置|修改|删除|install|uninstall|update|upgrade|configure|modify|delete|インストール|アンインストール|更新|設定|削除)/i.test(
-      request,
-    );
-
   const probeToolVersion = async (
     executable: string,
     cwd?: string,
@@ -598,23 +527,8 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
                   : normalizeChatHistory(body.history);
               const history = normalizeChatHistory(suppliedHistory);
 
-              if (looksLikeOperationRequest(requestContent)) {
-                const previewMessage =
-                  "这是浏览器预览。我可以展示操作确认，但不会安装软件、修改配置或执行真实命令。";
-                session.history = normalizeChatHistory([
-                  ...history,
-                  { role: "user", content: requestContent },
-                  { role: "assistant", content: previewMessage },
-                ]);
-                emitPreviewApproval(session, requestContent);
-                return sendJson(response, 202, {
-                  accepted: true,
-                  sessionId: session.id,
-                });
-              }
-
               const answer =
-                "这是浏览器开发预览中的模拟回答。我可以在同一个对话里帮助你了解 AI Agent、安装方式、Provider 和配置流程；涉及操作时会先展示确认卡，而且预览不会执行真实命令或修改系统。";
+                "这是浏览器开发预览中的模拟回答。我可以在同一个对话里帮助你了解 AI Agent、安装方式、Provider 和配置流程；浏览器预览不会执行真实命令或修改系统。";
               session.history = normalizeChatHistory([
                 ...history,
                 { role: "user", content: requestContent },
@@ -638,60 +552,13 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
                 sessionId: session.id,
               });
             }
-            if (
-              route === `${WEB_ASSISTANT_BASE}/approval` ||
-              route === `${WEB_ASSISTANT_BASE}/approvals`
-            ) {
-              const session = getSession(body.sessionId ?? body.session_id);
-              if (!session) throw new Error("Codex 对话不存在或已失效");
-              const approvalId = body.approvalId ?? body.approval_id;
-              if (
-                typeof approvalId !== "string" ||
-                approvalId !== session.pendingApprovalId
-              ) {
-                throw new Error("确认请求不存在或已失效");
-              }
-              const decision = approvalDecision(body);
-              delete session.pendingApprovalId;
-              const message =
-                decision === "accept" || decision === "acceptForSession"
-                  ? "已记录允许。浏览器预览不会执行真实操作。"
-                  : decision === "cancel"
-                    ? "已取消任务。浏览器预览未执行任何更改。"
-                    : "已拒绝操作。浏览器预览未执行任何更改。";
-              session.history = normalizeChatHistory([
-                ...session.history,
-                { role: "assistant", content: message },
-              ]);
-              emit({
-                sessionId: session.id,
-                kind: "message",
-                message,
-              });
-              emit({
-                sessionId: session.id,
-                kind: "finished",
-                success: true,
-                cancelled: decision === "cancel",
-                message,
-              });
-              return sendJson(response, 200, {
-                accepted: true,
-                sessionId: session.id,
-                approvalId,
-                decision,
-                simulated: true,
-                message,
-              });
-            }
             if (route === `${WEB_ASSISTANT_BASE}/cancel`) {
               const session = getSession(
                 body.sessionId ?? body.session_id ?? body.runId,
               );
-              if (!session || !session.pendingApprovalId) {
+              if (!session) {
                 throw new Error("没有正在运行的 Codex 任务");
               }
-              delete session.pendingApprovalId;
               emit({
                 sessionId: session.id,
                 kind: "finished",
