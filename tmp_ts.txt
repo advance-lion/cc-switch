@@ -1,0 +1,839 @@
+     1	import { invoke, isTauri } from "@tauri-apps/api/core";
+     2	import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+     3	import type {
+     4	  Settings,
+     5	  WebDavSyncSettings,
+     6	  S3SyncSettings,
+     7	  RemoteSnapshotInfo,
+     8	} from "@/types";
+     9	import type { AppId } from "./types";
+    10	
+    11	export interface ConfigTransferResult {
+    12	  success: boolean;
+    13	  message: string;
+    14	  filePath?: string;
+    15	  backupId?: string;
+    16	}
+    17	
+    18	export interface WebDavTestResult {
+    19	  success: boolean;
+    20	  message?: string;
+    21	}
+    22	
+    23	export interface CodexUnifyHistoryRestoreResult {
+    24	  restoredJsonlFiles: number;
+    25	  restoredStateRows: number;
+    26	  /** 还原被跳过的原因（如当前目录没有账本）；存在时不应报成功 */
+    27	  skippedReason?: string;
+    28	}
+    29	
+    30	export interface WebDavSyncResult {
+    31	  status: string;
+    32	}
+    33	
+    34	export type ProviderLiveMembership =
+    35	  | {
+    36	      status: "available";
+    37	      providerIds: string[];
+    38	      error?: never;
+    39	    }
+    40	  | {
+    41	      status: "unavailable";
+    42	      providerIds?: never;
+    43	      error?: string;
+    44	    };
+    45	
+    46	export interface CodexAssistantChatTurn {
+    47	  role: "user" | "assistant";
+    48	  content: string;
+    49	}
+    50	
+    51	export type CodexAssistantApprovalDecision =
+    52	  | "accept"
+    53	  | "acceptForSession"
+    54	  | "decline"
+    55	  | "cancel";
+    56	
+    57	export interface CodexAssistantApproval {
+    58	  id: string;
+    59	  type: "command" | "fileChange";
+    60	  command?: string | null;
+    61	  cwd?: string | null;
+    62	  reason?: string | null;
+    63	  networkHost?: string | null;
+    64	  grantRoot?: string | null;
+    65	  allowForSession: boolean;
+    66	  availableDecisions: CodexAssistantApprovalDecision[];
+    67	}
+    68	
+    69	export type CodexAssistantEvent =
+    70	  | { sessionId: string; kind: "started" }
+    71	  | { sessionId: string; kind: "message"; message: string }
+    72	  | { sessionId: string; kind: "log"; message: string }
+    73	  | { sessionId: string; kind: "stderr"; message: string }
+    74	  | { sessionId: string; kind: "disconnected"; message: string }
+    75	  | {
+    76	      sessionId: string;
+    77	      kind: "approval";
+    78	      approval: CodexAssistantApproval;
+    79	    }
+    80	  | {
+    81	      sessionId: string;
+    82	      kind: "finished";
+    83	      success: boolean;
+    84	      cancelled: boolean;
+    85	      message?: string | null;
+    86	    };
+    87	
+    88	export interface CodexDesktopStatus {
+    89	  installed: boolean;
+    90	  version: string | null;
+    91	  path: string | null;
+    92	}
+    93	
+    94	export type DesktopAppId =
+    95	  | "codex-desktop"
+    96	  | "claude-desktop"
+    97	  | "hermes-desktop";
+    98	export type DesktopLifecycleAction = "install" | "update" | "uninstall";
+    99	
+   100	export interface DesktopAppStatus {
+   101	  id: DesktopAppId;
+   102	  display_name: string;
+   103	  installed: boolean;
+   104	  version: string | null;
+   105	  latest_version: string | null;
+   106	  path: string | null;
+   107	  launch_target: string | null;
+   108	  package_identity: string | null;
+   109	  installation_source:
+   110	    | "microsoft_store"
+   111	    | "official_appx"
+   112	    | "official_exe"
+   113	    | "application_bundle"
+   114	    | "not_installed"
+   115	    | "unsupported_platform"
+   116	    | string;
+   117	  can_install: boolean;
+   118	  can_update: boolean;
+   119	  can_uninstall: boolean;
+   120	  can_launch: boolean;
+   121	  reason: string | null;
+   122	  installations?: Array<{
+   123	    version: string;
+   124	    path: string;
+   125	    launch_target: string | null;
+   126	    package_identity: string | null;
+   127	    installation_source: string;
+   128	  }>;
+   129	}
+   130	
+   131	export interface DesktopLifecycleJob {
+   132	  id: string;
+   133	  appId: DesktopAppId;
+   134	  component: "desktop";
+   135	  action: DesktopLifecycleAction;
+   136	  state:
+   137	    | "queued"
+   138	    | "running"
+   139	    | "verifying"
+   140	    | "succeeded"
+   141	    | "failed"
+   142	    | "cancelled"
+   143	    | "interrupted";
+   144	  preProbe: DesktopAppStatus | null;
+   145	  postProbe: DesktopAppStatus | null;
+   146	  errorCode: string | null;
+   147	  errorMessage: string | null;
+   148	  logs: Array<{
+   149	    at: number;
+   150	    level: "info" | "warning" | "error" | string;
+   151	    step: string;
+   152	    message: string;
+   153	  }>;
+   154	  createdAt: number;
+   155	  startedAt: number | null;
+   156	  completedAt: number | null;
+   157	}
+   158	
+   159	export type LifecycleJobState = DesktopLifecycleJob["state"];
+   160	export type LifecycleJobLogEntry = DesktopLifecycleJob["logs"][number];
+   161	
+   162	export interface CliLifecycleJob {
+   163	  id: string;
+   164	  appId: string;
+   165	  component: "cli";
+   166	  action: "install" | "update" | "uninstall";
+   167	  state: LifecycleJobState;
+   168	  preProbe: { installed: boolean; version: string | null } | null;
+   169	  postProbe: { installed: boolean; version: string | null } | null;
+   170	  errorCode: string | null;
+   171	  errorMessage: string | null;
+   172	  logs: LifecycleJobLogEntry[];
+   173	  createdAt: number;
+   174	  startedAt: number | null;
+   175	  completedAt: number | null;
+   176	}
+   177	
+   178	/**
+   179	 * 后端按实际安装来源给出的操作能力。前端不得从“已检测到命令行”推断可以卸载：
+   180	 * 官方安装器、商店和手动安装的文件均可能出现在 PATH 中。
+   181	 */
+   182	export interface ToolLifecycleCapabilities {
+   183	  name: string;
+   184	  can_install: boolean;
+   185	  can_update: boolean;
+   186	  can_uninstall: boolean;
+   187	  can_launch: boolean;
+   188	  installation_source: string;
+   189	  reason: string | null;
+   190	}
+   191	
+   192	const WEB_ASSISTANT_BRIDGE_BASE = "/__cc-switch-dev/codex-assistant";
+   193	
+   194	export const isCodexAssistantWebBridgeActive = () =>
+   195	  import.meta.env.DEV && !isTauri();
+   196	
+   197	async function webAssistantRequest<T>(
+   198	  path: string,
+   199	  body?: Record<string, unknown>,
+   200	): Promise<T> {
+   201	  const response = await fetch(`${WEB_ASSISTANT_BRIDGE_BASE}${path}`, {
+   202	    method: body ? "POST" : "GET",
+   203	    headers: body ? { "Content-Type": "application/json" } : undefined,
+   204	    body: body ? JSON.stringify(body) : undefined,
+   205	  });
+   206	  const payload = (await response.json()) as T & { error?: string };
+   207	  if (!response.ok)
+   208	    throw new Error(payload.error || "Web assistant bridge failed");
+   209	  return payload;
+   210	}
+   211	
+   212	export const settingsApi = {
+   213	  async get(): Promise<Settings> {
+   214	    return await invoke("get_settings");
+   215	  },
+   216	
+   217	  async save(settings: Settings): Promise<boolean> {
+   218	    return await invoke("save_settings", { settings });
+   219	  },
+   220	
+   221	  /** 是否存在统一 Codex 会话历史的迁移备份（关闭弹窗据此显示"恢复备份"勾选） */
+   222	  async hasCodexUnifyHistoryBackup(): Promise<boolean> {
+   223	    return await invoke("has_codex_unify_history_backup");
+   224	  },
+   225	
+   226	  /** 按迁移备份账本把当时迁入共享桶的官方会话还原回 openai 桶（幂等） */
+   227	  async restoreCodexUnifiedHistory(): Promise<CodexUnifyHistoryRestoreResult> {
+   228	    return await invoke("restore_codex_unified_history");
+   229	  },
+   230	
+   231	  async restart(): Promise<boolean> {
+   232	    return await invoke("restart_app");
+   233	  },
+   234	
+   235	  async installUpdateAndRestart(): Promise<boolean> {
+   236	    return await invoke("install_update_and_restart");
+   237	  },
+   238	
+   239	  async checkUpdates(): Promise<void> {
+   240	    await invoke("check_for_updates");
+   241	  },
+   242	
+   243	  async isPortable(): Promise<boolean> {
+   244	    return await invoke("is_portable_mode");
+   245	  },
+   246	
+   247	  async getConfigDir(appId: AppId): Promise<string> {
+   248	    return await invoke("get_config_dir", { app: appId });
+   249	  },
+   250	
+   251	  async openConfigFolder(appId: AppId): Promise<void> {
+   252	    await invoke("open_config_folder", { app: appId });
+   253	  },
+   254	
+   255	  async pickDirectory(defaultPath?: string): Promise<string | null> {
+   256	    return await invoke("pick_directory", { defaultPath });
+   257	  },
+   258	
+   259	  async startCodexAssistantSession(): Promise<string> {
+   260	    if (isCodexAssistantWebBridgeActive()) {
+   261	      const result = await webAssistantRequest<{ sessionId: string }>(
+   262	        "/session",
+   263	        {},
+   264	      );
+   265	      return result.sessionId;
+   266	    }
+   267	    return await invoke("start_codex_assistant_session");
+   268	  },
+   269	
+   270	  async sendCodexAssistantMessage(
+   271	    sessionId: string,
+   272	    message: string,
+   273	  ): Promise<void> {
+   274	    if (isCodexAssistantWebBridgeActive()) {
+   275	      await webAssistantRequest<{ accepted: boolean }>("/message", {
+   276	        sessionId,
+   277	        message,
+   278	      });
+   279	      return;
+   280	    }
+   281	    await invoke("send_codex_assistant_message", { sessionId, message });
+   282	  },
+   283	
+   284	  async respondCodexAssistantApproval(
+   285	    sessionId: string,
+   286	    approvalId: string,
+   287	    decision: CodexAssistantApprovalDecision,
+   288	  ): Promise<void> {
+   289	    if (isCodexAssistantWebBridgeActive()) {
+   290	      await webAssistantRequest<{ accepted: boolean }>("/approval", {
+   291	        sessionId,
+   292	        approvalId,
+   293	        decision,
+   294	      });
+   295	      return;
+   296	    }
+   297	    await invoke("respond_codex_assistant_approval", {
+   298	      sessionId,
+   299	      approvalId,
+   300	      decision,
+   301	    });
+   302	  },
+   303	
+   304	  async cancelCodexAssistantRun(sessionId: string): Promise<boolean> {
+   305	    if (isCodexAssistantWebBridgeActive()) {
+   306	      const result = await webAssistantRequest<{ cancelled: boolean }>(
+   307	        "/cancel",
+   308	        { sessionId },
+   309	      );
+   310	      return result.cancelled;
+   311	    }
+   312	    return await invoke("cancel_codex_assistant_run", { sessionId });
+   313	  },
+   314	
+   315	  async closeCodexAssistantSession(sessionId: string): Promise<boolean> {
+   316	    if (isCodexAssistantWebBridgeActive()) {
+   317	      const result = await webAssistantRequest<{ closed: boolean }>("/close", {
+   318	        sessionId,
+   319	      });
+   320	      return result.closed;
+   321	    }
+   322	    return await invoke("close_codex_assistant_session", { sessionId });
+   323	  },
+   324	
+   325	  async getCodexDesktopStatus(): Promise<CodexDesktopStatus> {
+   326	    if (isCodexAssistantWebBridgeActive()) {
+   327	      return await webAssistantRequest<CodexDesktopStatus>("/desktop-status");
+   328	    }
+   329	    return await invoke("get_codex_desktop_status");
+   330	  },
+   331	
+   332	  async launchCodexDesktop(): Promise<void> {
+   333	    if (isCodexAssistantWebBridgeActive()) {
+   334	      await webAssistantRequest<{ launched: boolean }>("/launch-desktop", {});
+   335	      return;
+   336	    }
+   337	    await invoke("launch_codex_desktop");
+   338	  },
+   339	
+   340	  async getDesktopAppStatus(app: DesktopAppId): Promise<DesktopAppStatus> {
+   341	    if (isCodexAssistantWebBridgeActive()) {
+   342	      return await webAssistantRequest<DesktopAppStatus>(
+   343	        `/desktop-app-status?app=${encodeURIComponent(app)}`,
+   344	      );
+   345	    }
+   346	    return await invoke("get_desktop_app_status", { app });
+   347	  },
+   348	
+   349	  async checkDesktopAppUpdates(app: DesktopAppId): Promise<DesktopAppStatus> {
+   350	    if (isCodexAssistantWebBridgeActive()) {
+   351	      return await webAssistantRequest<DesktopAppStatus>(
+   352	        "/desktop-app-check-updates",
+   353	        { app },
+   354	      );
+   355	    }
+   356	    return await invoke("check_desktop_app_updates", { app });
+   357	  },
+   358	
+   359	  async runDesktopAppLifecycleAction(
+   360	    app: DesktopAppId,
+   361	    action: DesktopLifecycleAction,
+   362	    jobId?: string,
+   363	  ): Promise<DesktopAppStatus> {
+   364	    if (isCodexAssistantWebBridgeActive()) {
+   365	      return await webAssistantRequest<DesktopAppStatus>(
+   366	        "/desktop-app-action",
+   367	        { app, action, jobId },
+   368	      );
+   369	    }
+   370	    return await invoke("run_desktop_app_lifecycle_action", {
+   371	      app,
+   372	      action,
+   373	      jobId,
+   374	    });
+   375	  },
+   376	
+   377	  async cancelDesktopLifecycleJob(jobId: string): Promise<boolean> {
+   378	    if (isCodexAssistantWebBridgeActive()) return false;
+   379	    return await invoke("cancel_desktop_lifecycle_job", { jobId });
+   380	  },
+   381	
+   382	  async getDesktopLifecycleJob(
+   383	    jobId: string,
+   384	  ): Promise<DesktopLifecycleJob | null> {
+   385	    if (isCodexAssistantWebBridgeActive()) return null;
+   386	    return await invoke("get_desktop_lifecycle_job", { jobId });
+   387	  },
+   388	
+   389	  async listDesktopLifecycleJobs(
+   390	    app?: DesktopAppId,
+   391	  ): Promise<DesktopLifecycleJob[]> {
+   392	    if (isCodexAssistantWebBridgeActive()) return [];
+   393	    return await invoke("list_desktop_lifecycle_jobs", { app });
+   394	  },
+   395	
+   396	  async launchDesktopApp(app: DesktopAppId): Promise<void> {
+   397	    if (isCodexAssistantWebBridgeActive()) {
+   398	      await webAssistantRequest<{ launched: boolean }>("/desktop-app-launch", {
+   399	        app,
+   400	      });
+   401	      return;
+   402	    }
+   403	    await invoke("launch_desktop_app", { app });
+   404	  },
+   405	
+   406	  async onCodexAssistantEvent(
+   407	    handler: (event: CodexAssistantEvent) => void,
+   408	  ): Promise<UnlistenFn> {
+   409	    if (isCodexAssistantWebBridgeActive()) {
+   410	      const stream = new EventSource(`${WEB_ASSISTANT_BRIDGE_BASE}/events`);
+   411	      stream.onmessage = (event) =>
+   412	        handler(JSON.parse(event.data) as CodexAssistantEvent);
+   413	      return () => stream.close();
+   414	    }
+   415	    return await listen("codex-assistant-event", (event) => {
+   416	      handler(event.payload as CodexAssistantEvent);
+   417	    });
+   418	  },
+   419	
+   420	  async selectConfigDirectory(defaultPath?: string): Promise<string | null> {
+   421	    return await invoke("pick_directory", { defaultPath });
+   422	  },
+   423	
+   424	  async getClaudeCodeConfigPath(): Promise<string> {
+   425	    return await invoke("get_claude_code_config_path");
+   426	  },
+   427	
+   428	  async getAppConfigPath(): Promise<string> {
+   429	    return await invoke("get_app_config_path");
+   430	  },
+   431	
+   432	  async openAppConfigFolder(): Promise<void> {
+   433	    await invoke("open_app_config_folder");
+   434	  },
+   435	
+   436	  async getAppConfigDirOverride(): Promise<string | null> {
+   437	    return await invoke("get_app_config_dir_override");
+   438	  },
+   439	
+   440	  async setAppConfigDirOverride(path: string | null): Promise<boolean> {
+   441	    return await invoke("set_app_config_dir_override", { path });
+   442	  },
+   443	
+   444	  async applyClaudePluginConfig(options: {
+   445	    official: boolean;
+   446	  }): Promise<boolean> {
+   447	    const { official } = options;
+   448	    return await invoke("apply_claude_plugin_config", { official });
+   449	  },
+   450	
+   451	  async applyClaudeOnboardingSkip(): Promise<boolean> {
+   452	    return await invoke("apply_claude_onboarding_skip");
+   453	  },
+   454	
+   455	  async clearClaudeOnboardingSkip(): Promise<boolean> {
+   456	    return await invoke("clear_claude_onboarding_skip");
+   457	  },
+   458	
+   459	  async saveFileDialog(defaultName: string): Promise<string | null> {
+   460	    return await invoke("save_file_dialog", { defaultName });
+   461	  },
+   462	
+   463	  async openFileDialog(): Promise<string | null> {
+   464	    return await invoke("open_file_dialog");
+   465	  },
+   466	
+   467	  async exportConfigToFile(filePath: string): Promise<ConfigTransferResult> {
+   468	    return await invoke("export_config_to_file", { filePath });
+   469	  },
+   470	
+   471	  async importConfigFromFile(filePath: string): Promise<ConfigTransferResult> {
+   472	    return await invoke("import_config_from_file", { filePath });
+   473	  },
+   474	
+   475	  // ─── WebDAV sync ──────────────────────────────────────────
+   476	
+   477	  async webdavTestConnection(
+   478	    settings: WebDavSyncSettings,
+   479	    preserveEmptyPassword = true,
+   480	  ): Promise<WebDavTestResult> {
+   481	    return await invoke("webdav_test_connection", {
+   482	      settings,
+   483	      preserveEmptyPassword,
+   484	    });
+   485	  },
+   486	
+   487	  async webdavSyncUpload(): Promise<WebDavSyncResult> {
+   488	    return await invoke("webdav_sync_upload");
+   489	  },
+   490	
+   491	  async webdavSyncDownload(): Promise<WebDavSyncResult> {
+   492	    return await invoke("webdav_sync_download");
+   493	  },
+   494	
+   495	  async webdavSyncSaveSettings(
+   496	    settings: WebDavSyncSettings,
+   497	    passwordTouched = false,
+   498	  ): Promise<{ success: boolean }> {
+   499	    return await invoke("webdav_sync_save_settings", {
+   500	      settings,
+   501	      passwordTouched,
+   502	    });
+   503	  },
+   504	
+   505	  async webdavSyncFetchRemoteInfo(): Promise<
+   506	    RemoteSnapshotInfo | { empty: true }
+   507	  > {
+   508	    return await invoke("webdav_sync_fetch_remote_info");
+   509	  },
+   510	
+   511	  // ===== S3 Sync API =====
+   512	
+   513	  async s3TestConnection(
+   514	    settings: S3SyncSettings,
+   515	    preserveEmptyPassword = true,
+   516	  ): Promise<WebDavTestResult> {
+   517	    return await invoke("s3_test_connection", {
+   518	      settings,
+   519	      preserveEmptyPassword,
+   520	    });
+   521	  },
+   522	
+   523	  async s3SyncUpload(): Promise<WebDavSyncResult> {
+   524	    return await invoke("s3_sync_upload");
+   525	  },
+   526	
+   527	  async s3SyncDownload(): Promise<WebDavSyncResult> {
+   528	    return await invoke("s3_sync_download");
+   529	  },
+   530	
+   531	  async s3SyncSaveSettings(
+   532	    settings: S3SyncSettings,
+   533	    passwordTouched: boolean,
+   534	  ): Promise<{ success: boolean }> {
+   535	    return await invoke("s3_sync_save_settings", {
+   536	      settings,
+   537	      passwordTouched,
+   538	    });
+   539	  },
+   540	
+   541	  async s3SyncFetchRemoteInfo(): Promise<RemoteSnapshotInfo | { empty: true }> {
+   542	    return await invoke("s3_sync_fetch_remote_info");
+   543	  },
+   544	
+   545	  async syncCurrentProvidersLive(): Promise<void> {
+   546	    const result = (await invoke("sync_current_providers_live")) as {
+   547	      success?: boolean;
+   548	      message?: string;
+   549	    };
+   550	    if (!result?.success) {
+   551	      throw new Error(result?.message || "Sync current providers failed");
+   552	    }
+   553	  },
+   554	
+   555	  async openExternal(url: string): Promise<void> {
+   556	    try {
+   557	      const u = new URL(url);
+   558	      const scheme = u.protocol.replace(":", "").toLowerCase();
+   559	      if (scheme !== "http" && scheme !== "https") {
+   560	        throw new Error("Unsupported URL scheme");
+   561	      }
+   562	    } catch {
+   563	      throw new Error("Invalid URL");
+   564	    }
+   565	    await invoke("open_external", { url });
+   566	  },
+   567	
+   568	  async setAutoLaunch(enabled: boolean): Promise<boolean> {
+   569	    return await invoke("set_auto_launch", { enabled });
+   570	  },
+   571	
+   572	  async getAutoLaunchStatus(): Promise<boolean> {
+   573	    return await invoke("get_auto_launch_status");
+   574	  },
+   575	
+   576	  async getToolVersions(
+   577	    tools?: string[],
+   578	    wslShellByTool?: Record<
+   579	      string,
+   580	      { wslShell?: string | null; wslShellFlag?: string | null }
+   581	    >,
+   582	  ): Promise<
+   583	    Array<{
+   584	      name: string;
+   585	      version: string | null;
+   586	      latest_version: string | null;
+   587	      error: string | null;
+   588	      installed_but_broken: boolean;
+   589	      env_type: "windows" | "wsl" | "macos" | "linux" | "unknown";
+   590	      wsl_distro: string | null;
+   591	    }>
+   592	  > {
+   593	    if (isCodexAssistantWebBridgeActive() && tools?.length === 1) {
+   594	      const tool = tools[0];
+   595	      const status =
+   596	        tool === "codex"
+   597	          ? await webAssistantRequest<{
+   598	              available: boolean;
+   599	              version: string | null;
+   600	            }>("/status")
+   601	          : { available: false, version: null };
+   602	      return [
+   603	        {
+   604	          name: tool,
+   605	          version: status.available ? status.version : null,
+   606	          latest_version: null,
+   607	          error: status.available ? null : "Codex CLI unavailable",
+   608	          installed_but_broken: false,
+   609	          env_type: "windows",
+   610	          wsl_distro: null,
+   611	        },
+   612	      ];
+   613	    }
+   614	    return await invoke("get_tool_versions", { tools, wslShellByTool });
+   615	  },
+   616	
+   617	  async getToolLifecycleCapabilities(
+   618	    tools: string[],
+   619	  ): Promise<ToolLifecycleCapabilities[]> {
+   620	    // 浏览器预览没有 Tauri 后端；保持界面可演示，但不把它伪装成一次真实的
+   621	    // 安装来源验证。桌面端始终走 Rust 的受控探测。
+   622	    if (isCodexAssistantWebBridgeActive()) {
+   623	      return tools.map((name) => ({
+   624	        name,
+   625	        can_install: true,
+   626	        can_update: true,
+   627	        can_uninstall: false,
+   628	        can_launch: true,
+   629	        installation_source: "web_preview",
+   630	        reason: "浏览器预览无法验证本机安装来源。",
+   631	      }));
+   632	    }
+   633	    return await invoke("get_tool_lifecycle_capabilities", { tools });
+   634	  },
+   635	
+   636	  /** 只有用户明确点“检查更新”时才访问远程版本源。 */
+   637	  async checkToolUpdates(tools: string[]): Promise<
+   638	    Array<{
+   639	      name: string;
+   640	      version: string | null;
+   641	      latest_version: string | null;
+   642	      error: string | null;
+   643	      installed_but_broken: boolean;
+   644	      env_type: "windows" | "wsl" | "macos" | "linux" | "unknown";
+   645	      wsl_distro: string | null;
+   646	    }>
+   647	  > {
+   648	    if (isCodexAssistantWebBridgeActive()) {
+   649	      return await settingsApi.getToolVersions(tools);
+   650	    }
+   651	    return await invoke("check_tool_updates", { tools });
+   652	  },
+   653	
+   654	  async runToolLifecycleAction(
+   655	    tools: string[],
+   656	    action: "install" | "update",
+   657	    wslShellByTool?: Record<
+   658	      string,
+   659	      { wslShell?: string | null; wslShellFlag?: string | null }
+   660	    >,
+   661	  ): Promise<void> {
+   662	    await invoke("run_tool_lifecycle_action", {
+   663	      tools,
+   664	      action,
+   665	      wslShellByTool,
+   666	    });
+   667	  },
+   668	
+   669	  /**
+   670	   * 任务化的 CLI 生命周期操作：后端把进度写入持久化任务记录，
+   671	   * 前端生成 jobId 并轮询 getCliLifecycleJob 获取实时日志；
+   672	   * 相同 jobId 重复提交幂等，不会重复执行安装脚本。
+   673	   */
+   674	  async runCliLifecycleAction(
+   675	    tool: string,
+   676	    action: "install" | "update" | "uninstall",
+   677	    jobId?: string,
+   678	    wslShellByTool?: Record<
+   679	      string,
+   680	      { wslShell?: string | null; wslShellFlag?: string | null }
+   681	    >,
+   682	  ): Promise<void> {
+   683	    await invoke("run_cli_lifecycle_action", {
+   684	      tool,
+   685	      action,
+   686	      jobId,
+   687	      wslShellByTool,
+   688	    });
+   689	  },
+   690	
+   691	  async cancelCliLifecycleJob(jobId: string): Promise<boolean> {
+   692	    return await invoke("cancel_cli_lifecycle_job", { jobId });
+   693	  },
+   694	
+   695	  async getCliLifecycleJob(jobId: string): Promise<CliLifecycleJob | null> {
+   696	    return await invoke("get_cli_lifecycle_job", { jobId });
+   697	  },
+   698	
+   699	  async listCliLifecycleJobs(tool?: string): Promise<CliLifecycleJob[]> {
+   700	    return await invoke("list_cli_lifecycle_jobs", { tool });
+   701	  },
+   702	
+   703	  /** Read authoritative live membership for an additive provider app. */
+   704	  async getProviderLiveMembership(app: AppId): Promise<ProviderLiveMembership> {
+   705	    return await invoke("get_provider_live_membership", { app });
+   706	  },
+   707	
+   708	  /** Add or remove one provider from an additive app's live membership. */
+   709	  async setProviderLiveEnabled(
+   710	    app: AppId,
+   711	    providerId: string,
+   712	    enabled: boolean,
+   713	  ): Promise<ProviderLiveMembership> {
+   714	    return await invoke("set_provider_live_enabled", {
+   715	      app,
+   716	      providerId,
+   717	      enabled,
+   718	    });
+   719	  },
+   720	
+   721	  /** 在用户首选终端中启动已登记 Runtime 的 CLI。后端只接受受支持的工具名。 */
+   722	  async launchToolTerminal(tool: string): Promise<void> {
+   723	    await invoke("launch_tool_terminal", { tool });
+   724	  },
+   725	
+   726	  /** 启动 DeepSeek Harness Web UI（后台运行 dsh web 并打开浏览器）。 */
+   727	  async launchDsh(): Promise<void> {
+   728	    await invoke("launch_dsh");
+   729	  },
+   730	
+   731	  /** 重启 DeepSeek Harness Web UI（杀掉端口 3080 上的进程后重新启动）。 */
+   732	  async restartDsh(): Promise<void> {
+   733	    await invoke("restart_dsh");
+   734	  },
+   735	
+   736	  /** 卸载有明确 npm 包映射的 Runtime；不会变更 Provider 或账号配置。 */
+   737	  async uninstallToolRuntime(tool: string): Promise<void> {
+   738	    await invoke("uninstall_tool_runtime", { tool });
+   739	  },
+   740	
+   741	  /** 探测各工具安装分布：枚举所有安装、标记冲突、生成锚定升级命令。
+   742	   *  诊断按钮、升级前确认、升级后补诊共用此命令，各取所需字段。 */
+   743	  async probeToolInstallations(
+   744	    tools: string[],
+   745	  ): Promise<ToolInstallationReport[]> {
+   746	    return await invoke("probe_tool_installations", { tools });
+   747	  },
+   748	
+   749	  async getRectifierConfig(): Promise<RectifierConfig> {
+   750	    return await invoke("get_rectifier_config");
+   751	  },
+   752	
+   753	  async setRectifierConfig(config: RectifierConfig): Promise<boolean> {
+   754	    return await invoke("set_rectifier_config", { config });
+   755	  },
+   756	
+   757	  async getOptimizerConfig(): Promise<OptimizerConfig> {
+   758	    return await invoke("get_optimizer_config");
+   759	  },
+   760	
+   761	  async setOptimizerConfig(config: OptimizerConfig): Promise<boolean> {
+   762	    return await invoke("set_optimizer_config", { config });
+   763	  },
+   764	
+   765	  async getLogConfig(): Promise<LogConfig> {
+   766	    return await invoke("get_log_config");
+   767	  },
+   768	
+   769	  async setLogConfig(config: LogConfig): Promise<boolean> {
+   770	    return await invoke("set_log_config", { config });
+   771	  },
+   772	};
+   773	
+   774	/** 单处工具安装的诊断信息（多处安装冲突检测）。字段对应后端 ToolInstallation。 */
+   775	export interface ToolInstallation {
+   776	  path: string;
+   777	  version: string | null;
+   778	  runnable: boolean;
+   779	  error: string | null;
+   780	  source: string;
+   781	  is_path_default: boolean;
+   782	}
+   783	
+   784	/** 一次"探测工具安装分布"的结果。字段对应后端 ToolInstallationReport。 */
+   785	export interface ToolInstallationReport {
+   786	  tool: string;
+   787	  installs: ToolInstallation[];
+   788	  is_conflict: boolean;
+   789	  needs_confirmation: boolean;
+   790	  command: string;
+   791	  anchored: boolean;
+   792	}
+   793	
+   794	export interface RectifierConfig {
+   795	  enabled: boolean;
+   796	  requestThinkingSignature: boolean;
+   797	  requestThinkingBudget: boolean;
+   798	  requestMediaFallback: boolean;
+   799	  requestMediaHeuristic: boolean;
+   800	}
+   801	
+   802	export interface OptimizerConfig {
+   803	  enabled: boolean;
+   804	  thinkingOptimizer: boolean;
+   805	  cacheInjection: boolean;
+   806	}
+   807	
+   808	export interface LogConfig {
+   809	  enabled: boolean;
+   810	  level: "error" | "warn" | "info" | "debug" | "trace";
+   811	}
+   812	
+   813	export interface BackupEntry {
+   814	  filename: string;
+   815	  sizeBytes: number;
+   816	  createdAt: string;
+   817	}
+   818	
+   819	export const backupsApi = {
+   820	  async createDbBackup(): Promise<string> {
+   821	    return await invoke("create_db_backup");
+   822	  },
+   823	
+   824	  async listDbBackups(): Promise<BackupEntry[]> {
+   825	    return await invoke("list_db_backups");
+   826	  },
+   827	
+   828	  async restoreDbBackup(filename: string): Promise<string> {
+   829	    return await invoke("restore_db_backup", { filename });
+   830	  },
+   831	
+   832	  async renameDbBackup(oldFilename: string, newName: string): Promise<string> {
+   833	    return await invoke("rename_db_backup", { oldFilename, newName });
+   834	  },
+   835	
+   836	  async deleteDbBackup(filename: string): Promise<void> {
+   837	    await invoke("delete_db_backup", { filename });
+   838	  },
+   839	};

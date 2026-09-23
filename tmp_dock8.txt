@@ -1,0 +1,783 @@
+     1	import { useCallback, useEffect, useRef, useState } from "react";
+     2	import type { PointerEvent as ReactPointerEvent } from "react";
+     3	import {
+     4	  Bot,
+     5	  Check,
+     6	  ChevronRight,
+     7	  CircleAlert,
+     8	  CircleStop,
+     9	  Loader2,
+    10	  MessageCircle,
+    11	  Send,
+    12	  Terminal,
+    13	  X,
+    14	} from "lucide-react";
+    15	import { useTranslation } from "react-i18next";
+    16	import { toast } from "sonner";
+    17	import { Button } from "@/components/ui/button";
+    18	import { Input } from "@/components/ui/input";
+    19	import { CodexIcon } from "@/components/BrandIcons";
+    20	import { cn } from "@/lib/utils";
+    21	import {
+    22	  isCodexAssistantWebBridgeActive,
+    23	  settingsApi,
+    24	  type CodexAssistantChatTurn,
+    25	} from "@/lib/api";
+    26	import { extractErrorMessage } from "@/utils/errorUtils";
+    27	
+    28	type CodexRuntime = {
+    29	  version: string | null;
+    30	  installed_but_broken: boolean;
+    31	};
+    32	
+    33	type FloatingPosition = {
+    34	  x: number;
+    35	  y: number;
+    36	};
+    37	
+    38	const FLOATING_BUTTON_SIZE = 34;
+    39	const FLOATING_BUTTON_MARGIN = 16;
+    40	const FLOATING_POSITION_STORAGE_KEY = "cc-switch-codex-assistant-position";
+    41	const MAX_VISIBLE_LOG_LINES = 180;
+    42	
+    43	const clampFloatingPosition = (
+    44	  position: FloatingPosition,
+    45	): FloatingPosition => ({
+    46	  x: Math.min(
+    47	    Math.max(FLOATING_BUTTON_MARGIN, position.x),
+    48	    Math.max(
+    49	      FLOATING_BUTTON_MARGIN,
+    50	      window.innerWidth - FLOATING_BUTTON_SIZE - FLOATING_BUTTON_MARGIN,
+    51	    ),
+    52	  ),
+    53	  y: Math.min(
+    54	    Math.max(FLOATING_BUTTON_MARGIN, position.y),
+    55	    Math.max(
+    56	      FLOATING_BUTTON_MARGIN,
+    57	      window.innerHeight - FLOATING_BUTTON_SIZE - FLOATING_BUTTON_MARGIN,
+    58	    ),
+    59	  ),
+    60	});
+    61	
+    62	const defaultFloatingPosition = (): FloatingPosition =>
+    63	  clampFloatingPosition({
+    64	    x: window.innerWidth - FLOATING_BUTTON_SIZE - FLOATING_BUTTON_MARGIN,
+    65	    y: window.innerHeight / 2 - FLOATING_BUTTON_SIZE / 2,
+    66	  });
+    67	
+    68	export interface CodexAssistantInstallIntent {
+    69	  tool: string;
+    70	  appName: string;
+    71	  supportsCustomLocation?: boolean;
+    72	  supportsVersionPin?: boolean;
+    73	}
+    74	
+    75	interface CodexAssistantDockProps {
+    76	  providerReady: boolean;
+    77	  onOpenCodexConfiguration: () => void;
+    78	  onDismiss?: () => void;
+    79	  onInstallationCompleted?: (tool: string) => void;
+    80	  installIntent?: CodexAssistantInstallIntent | null;
+    81	  /** Incremented by external entry points such as “Add custom Agent”. */
+    82	  openRequestId?: number;
+    83	}
+    84	
+    85	/** A persistent Codex app-server conversation running in full-auto mode. */
+    86	export function CodexAssistantDock({
+    87	  providerReady,
+    88	  onOpenCodexConfiguration,
+    89	  onDismiss,
+    90	  onInstallationCompleted,
+    91	  installIntent,
+    92	  openRequestId = 0,
+    93	}: CodexAssistantDockProps) {
+    94	  const { t } = useTranslation();
+    95	  const webBridgeActive = isCodexAssistantWebBridgeActive();
+    96	  const [open, setOpen] = useState(false);
+    97	  const [showFloatingGreeting, setShowFloatingGreeting] = useState(true);
+    98	  const [chatMessages, setChatMessages] = useState<CodexAssistantChatTurn[]>(
+    99	    [],
+   100	  );
+   101	  const [runtime, setRuntime] = useState<CodexRuntime | null>(null);
+   102	  const [checking, setChecking] = useState(false);
+   103	  const [installing, setInstalling] = useState(false);
+   104	  const [request, setRequest] = useState("");
+   105	  const [logs, setLogs] = useState<string[]>([]);
+   106	  const [runError, setRunError] = useState<string | null>(null);
+   107	  const [startingSession, setStartingSession] = useState(false);
+   108	  const [running, setRunning] = useState(false);
+   109	  const [stopping, setStopping] = useState(false);
+   110	  const [sessionId, setSessionId] = useState<string | null>(null);
+   111	  const [floatingPosition, setFloatingPosition] =
+   112	    useState<FloatingPosition | null>(null);
+   113	  const floatingDockRef = useRef<HTMLDivElement>(null);
+   114	  const latestFloatingPositionRef = useRef<FloatingPosition | null>(null);
+   115	  const pendingFloatingPositionRef = useRef<FloatingPosition | null>(null);
+   116	  const dragAnimationFrameRef = useRef<number | null>(null);
+   117	  const dragStateRef = useRef<{
+   118	    pointerId: number;
+   119	    startClientX: number;
+   120	    startClientY: number;
+   121	    startPosition: FloatingPosition;
+   122	    moved: boolean;
+   123	  } | null>(null);
+   124	  const suppressOpenRef = useRef(false);
+   125	  const sessionIdRef = useRef<string | null>(null);
+   126	  const streamAssistantMessageRef = useRef(false);
+   127	  const lastHandledOpenRequestRef = useRef(0);
+   128	
+   129	  const appendLog = useCallback((line: string) => {
+   130	    setLogs((current) => [...current, line].slice(-MAX_VISIBLE_LOG_LINES));
+   131	  }, []);
+   132	
+   133	  useEffect(() => {
+   134	    const storedPosition = localStorage.getItem(FLOATING_POSITION_STORAGE_KEY);
+   135	    if (storedPosition) {
+   136	      try {
+   137	        const parsed = JSON.parse(storedPosition) as Partial<FloatingPosition>;
+   138	        if (typeof parsed.x === "number" && typeof parsed.y === "number") {
+   139	          const next = clampFloatingPosition(parsed as FloatingPosition);
+   140	          latestFloatingPositionRef.current = next;
+   141	          setFloatingPosition(next);
+   142	          return;
+   143	        }
+   144	      } catch {
+   145	        // Ignore stale stored coordinates.
+   146	      }
+   147	    }
+   148	    const next = defaultFloatingPosition();
+   149	    latestFloatingPositionRef.current = next;
+   150	    setFloatingPosition(next);
+   151	  }, []);
+   152	
+   153	  useEffect(() => {
+   154	    if (
+   155	      openRequestId <= 0 ||
+   156	      openRequestId === lastHandledOpenRequestRef.current
+   157	    ) {
+   158	      return;
+   159	    }
+   160	    lastHandledOpenRequestRef.current = openRequestId;
+   161	    if (installIntent) {
+   162	      setRequest(
+   163	        t("codexAssistant.installRequest", { app: installIntent.appName }),
+   164	      );
+   165	    }
+   166	    setShowFloatingGreeting(false);
+   167	    setOpen(true);
+   168	  }, [installIntent, openRequestId, t]);
+   169	
+   170	  useEffect(() => {
+   171	    const keepFloatingButtonVisible = () => {
+   172	      const next = clampFloatingPosition(
+   173	        latestFloatingPositionRef.current ?? defaultFloatingPosition(),
+   174	      );
+   175	      latestFloatingPositionRef.current = next;
+   176	      setFloatingPosition(next);
+   177	    };
+   178	    window.addEventListener("resize", keepFloatingButtonVisible);
+   179	    return () =>
+   180	      window.removeEventListener("resize", keepFloatingButtonVisible);
+   181	  }, []);
+   182	
+   183	  useEffect(
+   184	    () => () => {
+   185	      if (dragAnimationFrameRef.current !== null) {
+   186	        cancelAnimationFrame(dragAnimationFrameRef.current);
+   187	      }
+   188	      const activeSessionId = sessionIdRef.current;
+   189	      sessionIdRef.current = null;
+   190	      if (activeSessionId) {
+   191	        void settingsApi.closeCodexAssistantSession(activeSessionId);
+   192	      }
+   193	    },
+   194	    [],
+   195	  );
+   196	
+   197	  const refreshRuntime = useCallback(async () => {
+   198	    setChecking(true);
+   199	    try {
+   200	      const [next] = await settingsApi.getToolVersions(["codex"]);
+   201	      setRuntime(next ?? null);
+   202	    } catch (error) {
+   203	      toast.error(t("codexAssistant.runtimeCheckFailed"), {
+   204	        description: extractErrorMessage(error) || undefined,
+   205	      });
+   206	    } finally {
+   207	      setChecking(false);
+   208	    }
+   209	  }, [t]);
+   210	
+   211	  useEffect(() => {
+   212	    let dispose = false;
+   213	    let unlisten: (() => void) | undefined;
+   214	
+   215	    void settingsApi
+   216	      .onCodexAssistantEvent((event) => {
+   217	        if (event.sessionId !== sessionIdRef.current) return;
+   218	
+   219	        switch (event.kind) {
+   220	          case "started":
+   221	            streamAssistantMessageRef.current = false;
+   222	            setRunning(true);
+   223	            return;
+   224	          case "log":
+   225	            if (event.message) appendLog(event.message);
+   226	            return;
+   227	          case "stderr":
+   228	            if (event.message) appendLog(`stderr · ${event.message}`);
+   229	            return;
+   230	          case "disconnected":
+   231	            sessionIdRef.current = null;
+   232	            setSessionId(null);
+   233	            streamAssistantMessageRef.current = false;
+   234	            setRunning(false);
+   235	            setStopping(false);
+   236	            setRunError(event.message);
+   237	            toast.error(t("codexAssistant.runFailed"), {
+   238	              description: event.message,
+   239	            });
+   240	            return;
+   241	          case "message":
+   242	            if (event.message) {
+   243	              setChatMessages((current) => {
+   244	                if (streamAssistantMessageRef.current) {
+   245	                  const last = current.at(-1);
+   246	                  if (last?.role === "assistant") {
+   247	                    return [
+   248	                      ...current.slice(0, -1),
+   249	                      { ...last, content: last.content + event.message },
+   250	                    ];
+   251	                  }
+   252	                }
+   253	                streamAssistantMessageRef.current = true;
+   254	                return [
+   255	                  ...current,
+   256	                  { role: "assistant", content: event.message },
+   257	                ];
+   258	              });
+   259	            }
+   260	            return;
+   261	          case "finished":
+   262	            streamAssistantMessageRef.current = false;
+   263	            setRunning(false);
+   264	            setStopping(false);
+   265	            if (!event.success && !event.cancelled) {
+   266	              const message = event.message || t("codexAssistant.runFailed");
+   267	              setRunError(message);
+   268	              toast.error(t("codexAssistant.runFailed"), {
+   269	                description: message,
+   270	              });
+   271	            }
+   272	        }
+   273	      })
+   274	      .then((listener) => {
+   275	        if (dispose) listener();
+   276	        else unlisten = listener;
+   277	      });
+   278	
+   279	    return () => {
+   280	      dispose = true;
+   281	      unlisten?.();
+   282	    };
+   283	  }, [appendLog, t]);
+   284	
+   285	  useEffect(() => {
+   286	    if (open) void refreshRuntime();
+   287	  }, [open, refreshRuntime]);
+   288	
+   289	  const installCodex = async () => {
+   290	    setInstalling(true);
+   291	    try {
+   292	      await settingsApi.runToolLifecycleAction(["codex"], "install");
+   293	      await refreshRuntime();
+   294	      onInstallationCompleted?.("codex");
+   295	      toast.success(t("codexAssistant.runtimeInstalled"));
+   296	    } catch (error) {
+   297	      toast.error(t("codexAssistant.runtimeInstallFailed"), {
+   298	        description: extractErrorMessage(error) || undefined,
+   299	      });
+   300	    } finally {
+   301	      setInstalling(false);
+   302	    }
+   303	  };
+   304	
+   305	  const cliReady = Boolean(runtime?.version && !runtime?.installed_but_broken);
+   306	  const effectiveCliReady = cliReady || webBridgeActive;
+   307	  const effectiveProviderReady = providerReady || webBridgeActive;
+   308	  const ready = effectiveCliReady && effectiveProviderReady;
+   309	  const blockedReason = !effectiveCliReady
+   310	    ? t("codexAssistant.cliRequired")
+   311	    : !effectiveProviderReady
+   312	      ? t("codexAssistant.providerRequired")
+   313	      : null;
+   314	
+   315	  const ensureSession = async (): Promise<string> => {
+   316	    if (sessionIdRef.current) return sessionIdRef.current;
+   317	    setStartingSession(true);
+   318	    try {
+   319	      const nextSessionId = await settingsApi.startCodexAssistantSession();
+   320	      sessionIdRef.current = nextSessionId;
+   321	      setSessionId(nextSessionId);
+   322	      return nextSessionId;
+   323	    } finally {
+   324	      setStartingSession(false);
+   325	    }
+   326	  };
+   327	
+   328	  const sendMessage = async () => {
+   329	    const text = request.trim();
+   330	    if (!text || running || startingSession) return;
+   331	
+   332	    setRequest("");
+   333	    setRunError(null);
+   334	    setLogs([]);
+   335	    streamAssistantMessageRef.current = false;
+   336	    setChatMessages((current) => [...current, { role: "user", content: text }]);
+   337	    try {
+   338	      const activeSessionId = await ensureSession();
+   339	      setRunning(true);
+   340	      await settingsApi.sendCodexAssistantMessage(activeSessionId, text);
+   341	    } catch (error) {
+   342	      setRunning(false);
+   343	      const message =
+   344	        extractErrorMessage(error) || t("codexAssistant.runFailed");
+   345	      setRunError(message);
+   346	      toast.error(t("codexAssistant.runFailed"), { description: message });
+   347	    }
+   348	  };
+   349	
+   350	  const cancelRun = async () => {
+   351	    const activeSessionId = sessionIdRef.current;
+   352	    if (!activeSessionId || stopping) return;
+   353	    setStopping(true);
+   354	    try {
+   355	      await settingsApi.cancelCodexAssistantRun(activeSessionId);
+   356	      appendLog(t("codexAssistant.cancelling"));
+   357	    } catch (error) {
+   358	      setStopping(false);
+   359	      toast.error(t("codexAssistant.cancelFailed"), {
+   360	        description: extractErrorMessage(error) || undefined,
+   361	      });
+   362	    }
+   363	  };
+   364	
+   365	  const closeSession = () => {
+   366	    const activeSessionId = sessionIdRef.current;
+   367	    sessionIdRef.current = null;
+   368	    setSessionId(null);
+   369	    streamAssistantMessageRef.current = false;
+   370	    setRunning(false);
+   371	    setStopping(false);
+   372	    if (activeSessionId) {
+   373	      void settingsApi
+   374	        .closeCodexAssistantSession(activeSessionId)
+   375	        .catch(() => undefined);
+   376	    }
+   377	  };
+   378	
+   379	  const persistFloatingPosition = (position: FloatingPosition) => {
+   380	    localStorage.setItem(
+   381	      FLOATING_POSITION_STORAGE_KEY,
+   382	      JSON.stringify(position),
+   383	    );
+   384	  };
+   385	
+   386	  const moveFloatingButton = (position: FloatingPosition) => {
+   387	    latestFloatingPositionRef.current = position;
+   388	    pendingFloatingPositionRef.current = position;
+   389	    if (dragAnimationFrameRef.current !== null) return;
+   390	
+   391	    dragAnimationFrameRef.current = requestAnimationFrame(() => {
+   392	      const next = pendingFloatingPositionRef.current;
+   393	      const dock = floatingDockRef.current;
+   394	      if (next && dock) {
+   395	        dock.style.transform = `translate3d(${next.x}px, ${next.y}px, 0)`;
+   396	      }
+   397	      dragAnimationFrameRef.current = null;
+   398	    });
+   399	  };
+   400	
+   401	  const handlePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+   402	    if (event.button !== 0) return;
+   403	    event.preventDefault();
+   404	    const current =
+   405	      latestFloatingPositionRef.current ??
+   406	      floatingPosition ??
+   407	      defaultFloatingPosition();
+   408	    event.currentTarget.setPointerCapture(event.pointerId);
+   409	    dragStateRef.current = {
+   410	      pointerId: event.pointerId,
+   411	      startClientX: event.clientX,
+   412	      startClientY: event.clientY,
+   413	      startPosition: current,
+   414	      moved: false,
+   415	    };
+   416	  };
+   417	
+   418	  const handlePointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+   419	    const drag = dragStateRef.current;
+   420	    if (!drag || drag.pointerId !== event.pointerId) return;
+   421	    event.preventDefault();
+   422	    const deltaX = event.clientX - drag.startClientX;
+   423	    const deltaY = event.clientY - drag.startClientY;
+   424	    if (Math.abs(deltaX) + Math.abs(deltaY) > 4) drag.moved = true;
+   425	    if (!drag.moved) return;
+   426	    moveFloatingButton(
+   427	      clampFloatingPosition({
+   428	        x: drag.startPosition.x + deltaX,
+   429	        y: drag.startPosition.y + deltaY,
+   430	      }),
+   431	    );
+   432	  };
+   433	
+   434	  const finishDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
+   435	    const drag = dragStateRef.current;
+   436	    if (!drag || drag.pointerId !== event.pointerId) return;
+   437	    dragStateRef.current = null;
+   438	    if (!drag.moved) return;
+   439	    const nextPosition = clampFloatingPosition({
+   440	      x: drag.startPosition.x + event.clientX - drag.startClientX,
+   441	      y: drag.startPosition.y + event.clientY - drag.startClientY,
+   442	    });
+   443	    moveFloatingButton(nextPosition);
+   444	    setFloatingPosition(nextPosition);
+   445	    persistFloatingPosition(nextPosition);
+   446	    suppressOpenRef.current = true;
+   447	  };
+   448	
+   449	  const openAssistant = () => {
+   450	    if (suppressOpenRef.current) {
+   451	      suppressOpenRef.current = false;
+   452	      return;
+   453	    }
+   454	    setShowFloatingGreeting(false);
+   455	    setOpen(true);
+   456	  };
+   457	
+   458	  const closeAssistant = () => {
+   459	    setOpen(false);
+   460	    closeSession();
+   461	    onDismiss?.();
+   462	  };
+   463	
+   464	  useEffect(() => {
+   465	    if (!open) return;
+   466	    const handleKeyDown = (event: KeyboardEvent) => {
+   467	      if (event.key === "Escape") {
+   468	        event.preventDefault();
+   469	        closeAssistant();
+   470	      }
+   471	    };
+   472	    window.addEventListener("keydown", handleKeyDown);
+   473	    return () => window.removeEventListener("keydown", handleKeyDown);
+   474	  }, [open, onDismiss]);
+   475	
+   476	  return (
+   477	    <>
+   478	      <div
+   479	        ref={floatingDockRef}
+   480	        style={
+   481	          floatingPosition
+   482	            ? {
+   483	                left: 0,
+   484	                top: 0,
+   485	                transform: `translate3d(${floatingPosition.x}px, ${floatingPosition.y}px, 0)`,
+   486	              }
+   487	            : { right: FLOATING_BUTTON_MARGIN, top: "calc(50% - 17px)" }
+   488	        }
+   489	        className="fixed z-[120] isolate will-change-transform"
+   490	      >
+   491	        {showFloatingGreeting && (
+   492	          <div className="pointer-events-none absolute right-[calc(100%+10px)] top-1/2 hidden w-56 -translate-y-1/2 rounded-2xl border border-violet-500/25 bg-background/75 py-2 pl-3 pr-8 text-left text-xs leading-relaxed text-foreground/75 opacity-90 shadow-[0_8px_24px_-16px_rgba(76,29,149,0.45)] backdrop-blur-[2px] sm:block">
+   493	            <span>{t("codexAssistant.floatingGreeting")}</span>
+   494	            <button
+   495	              type="button"
+   496	              className="pointer-events-auto absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground/70 transition-colors hover:bg-violet-500/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500/40"
+   497	              onClick={() => setShowFloatingGreeting(false)}
+   498	              aria-label={t("codexAssistant.dismissGreeting")}
+   499	              title={t("codexAssistant.dismissGreeting")}
+   500	            >
+   501	              <X className="h-3 w-3" />
+   502	            </button>
+   503	          </div>
+   504	        )}
+   505	        <button
+   506	          type="button"
+   507	          onClick={openAssistant}
+   508	          onPointerDown={handlePointerDown}
+   509	          onPointerMove={handlePointerMove}
+   510	          onPointerUp={finishDrag}
+   511	          onPointerCancel={finishDrag}
+   512	          className="flex h-[34px] w-[34px] cursor-grab touch-none select-none items-center justify-center rounded-full border border-violet-500/35 bg-background text-violet-600 shadow-[0_10px_22px_-10px_rgba(109,40,217,0.7)] backdrop-blur transition-[background-color,box-shadow] hover:bg-violet-500/10 active:cursor-grabbing dark:text-violet-300"
+   513	          aria-label={t("codexAssistant.open")}
+   514	          title={t("codexAssistant.open")}
+   515	        >
+   516	          <CodexIcon size={19} className="dark:invert-0" />
+   517	        </button>
+   518	      </div>
+   519	
+   520	      <aside
+   521	        aria-hidden={!open}
+   522	        className={cn(
+   523	          "fixed inset-y-0 right-0 z-[130] flex w-[390px] max-w-[calc(100vw-24px)] flex-col border-l border-border bg-background shadow-[-18px_0_44px_-24px_rgba(15,23,42,0.45)] transition-transform duration-300 ease-out",
+   524	          open ? "translate-x-0" : "translate-x-full",
+   525	        )}
+   526	      >
+   527	        <header className="flex items-center justify-between border-b border-border px-5 py-4">
+   528	          <div className="flex items-center gap-3">
+   529	            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-indigo-500 text-white shadow-sm">
+   530	              <CodexIcon size={17} className="dark:invert-0" />
+   531	            </span>
+   532	            <div>
+   533	              <h2 className="text-sm font-semibold">
+   534	                {t("codexAssistant.title")}
+   535	              </h2>
+   536	              <p className="text-xs text-muted-foreground">
+   537	                {t("codexAssistant.subtitle")}
+   538	              </p>
+   539	            </div>
+   540	          </div>
+   541	          <Button
+   542	            variant="ghost"
+   543	            size="icon"
+   544	            className="h-8 w-8"
+   545	            onClick={closeAssistant}
+   546	            aria-label={t("common.close")}
+   547	          >
+   548	            <X className="h-4 w-4" />
+   549	          </Button>
+   550	        </header>
+   551	
+   552	        <div className="flex-1 space-y-5 overflow-y-auto p-5">
+   553	          <div className="rounded-2xl border border-violet-500/15 bg-violet-500/[0.045] p-4">
+   554	            <div className="flex items-start gap-3">
+   555	              <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-violet-500/10 text-violet-600 dark:text-violet-300">
+   556	                <Bot className="h-4 w-4" />
+   557	              </span>
+   558	              <div className="space-y-1.5 text-sm leading-relaxed">
+   559	                <p className="font-medium">{t("codexAssistant.greeting")}</p>
+   560	                <p className="text-muted-foreground">
+   561	                  {t("codexAssistant.intro")}
+   562	                </p>
+   563	              </div>
+   564	            </div>
+   565	          </div>
+   566	
+   567	          <section className="space-y-2">
+   568	            <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+   569	              {t("codexAssistant.readiness")}
+   570	            </p>
+   571	            <button
+   572	              type="button"
+   573	              onClick={() => !cliReady && void installCodex()}
+   574	              disabled={installing || checking || cliReady}
+   575	              className="flex w-full items-center gap-3 rounded-xl border border-border bg-card px-3 py-3 text-left transition hover:border-violet-500/30 disabled:cursor-default"
+   576	            >
+   577	              <span
+   578	                className={cn(
+   579	                  "flex h-8 w-8 items-center justify-center rounded-lg",
+   580	                  cliReady
+   581	                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-300"
+   582	                    : "bg-amber-500/10 text-amber-600 dark:text-amber-300",
+   583	                )}
+   584	              >
+   585	                {installing || checking ? (
+   586	                  <Loader2 className="h-4 w-4 animate-spin" />
+   587	                ) : cliReady ? (
+   588	                  <Check className="h-4 w-4" />
+   589	                ) : (
+   590	                  <Terminal className="h-4 w-4" />
+   591	                )}
+   592	              </span>
+   593	              <span className="min-w-0 flex-1">
+   594	                <span className="block text-sm font-medium">
+   595	                  {t("codexAssistant.codexCli")}
+   596	                </span>
+   597	                <span className="block text-xs text-muted-foreground">
+   598	                  {cliReady
+   599	                    ? t("codexAssistant.cliReady", {
+   600	                        version: runtime?.version,
+   601	                      })
+   602	                    : t("codexAssistant.installCli")}
+   603	                </span>
+   604	              </span>
+   605	              {!cliReady && (
+   606	                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+   607	              )}
+   608	            </button>
+   609	
+   610	            <button
+   611	              type="button"
+   612	              onClick={() => {
+   613	                closeAssistant();
+   614	                onOpenCodexConfiguration();
+   615	              }}
+   616	              className="flex w-full items-center gap-3 rounded-xl border border-border bg-card px-3 py-3 text-left transition hover:border-violet-500/30"
+   617	            >
+   618	              <span
+   619	                className={cn(
+   620	                  "flex h-8 w-8 items-center justify-center rounded-lg",
+   621	                  effectiveProviderReady
+   622	                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-300"
+   623	                    : "bg-amber-500/10 text-amber-600 dark:text-amber-300",
+   624	                )}
+   625	              >
+   626	                {effectiveProviderReady ? (
+   627	                  <Check className="h-4 w-4" />
+   628	                ) : (
+   629	                  <CircleAlert className="h-4 w-4" />
+   630	                )}
+   631	              </span>
+   632	              <span className="min-w-0 flex-1">
+   633	                <span className="block text-sm font-medium">
+   634	                  {t("codexAssistant.modelProvider")}
+   635	                </span>
+   636	                <span className="block text-xs text-muted-foreground">
+   637	                  {effectiveProviderReady
+   638	                    ? t("codexAssistant.providerReady")
+   639	                    : t("codexAssistant.configureProvider")}
+   640	                </span>
+   641	              </span>
+   642	              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+   643	            </button>
+   644	          </section>
+   645	
+   646	          <section className="space-y-3">
+   647	            <p className="px-1 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+   648	              {t("codexAssistant.chatLabel")}
+   649	            </p>
+   650	            {webBridgeActive && (
+   651	              <p className="rounded-lg border border-sky-500/20 bg-sky-500/[0.045] px-3 py-2 text-xs leading-relaxed text-sky-800 dark:text-sky-200">
+   652	                {t("codexAssistant.webBridgeNotice")}
+   653	              </p>
+   654	            )}
+   655	
+   656	            <div className="space-y-2" aria-live="polite">
+   657	              {chatMessages.length === 0 ? (
+   658	                <p className="rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+   659	                  {t("codexAssistant.chatEmpty")}
+   660	                </p>
+   661	              ) : (
+   662	                chatMessages.map((message, index) => (
+   663	                  <div
+   664	                    key={`${message.role}-${index}`}
+   665	                    className={cn(
+   666	                      "max-w-[92%] whitespace-pre-wrap break-words rounded-xl px-3 py-2 text-sm leading-relaxed",
+   667	                      message.role === "user"
+   668	                        ? "ml-auto bg-violet-500/15 text-foreground"
+   669	                        : "mr-auto border border-border bg-card",
+   670	                    )}
+   671	                  >
+   672	                    {message.content}
+   673	                  </div>
+   674	                ))
+   675	              )}
+   676	            </div>
+   677	
+   678	            {approvals.length > 0 && (
+   679	              <div className="space-y-2" aria-live="assertive">
+   680	                <p className="flex items-center gap-1.5 px-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+   681	                  <ShieldAlert className="h-3.5 w-3.5" />
+   682	                  {t("codexAssistant.approvalRequired", {
+   683	                    defaultValue: "Your approval is required",
+   684	                  })}
+   685	                </p>
+   686	                {approvals.map((approval) => (
+   687	                  <ApprovalCard
+   688	                    key={approval.id}
+   689	                    approval={approval}
+   690	                    responding={respondingApprovalIds.has(approval.id)}
+   691	                    onRespond={(decision) =>
+   692	                      void respondToApproval(approval.id, decision)
+   693	                    }
+   694	                  />
+   695	                ))}
+   696	              </div>
+   697	            )}
+   698	
+   699	            <div className="rounded-xl border border-border bg-card p-3">
+   700	              <Input
+   701	                value={request}
+   702	                onChange={(event) => setRequest(event.target.value)}
+   703	                onKeyDown={(event) => {
+   704	                  if (event.key === "Enter") void sendMessage();
+   705	                }}
+   706	                disabled={!ready || running || startingSession}
+   707	                placeholder={
+   708	                  ready
+   709	                    ? t("codexAssistant.chatPlaceholder")
+   710	                    : (blockedReason ?? undefined)
+   711	                }
+   712	                className="border-0 bg-transparent px-0 shadow-none focus:ring-0"
+   713	              />
+   714	              <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-2">
+   715	                <span className="text-[11px] text-muted-foreground">
+   716	                  {ready ? t("codexAssistant.chatHint") : blockedReason}
+   717	                </span>
+   718	                <Button
+   719	                  size="icon"
+   720	                  className="h-8 w-8 rounded-lg"
+   721	                  disabled={
+   722	                    !ready || !request.trim() || running || startingSession
+   723	                  }
+   724	                  onClick={() => void sendMessage()}
+   725	                  aria-label={t("codexAssistant.sendChat")}
+   726	                >
+   727	                  {running || startingSession ? (
+   728	                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+   729	                  ) : (
+   730	                    <Send className="h-3.5 w-3.5" />
+   731	                  )}
+   732	                </Button>
+   733	              </div>
+   734	            </div>
+   735	
+   736	            {running && sessionId && (
+   737	              <Button
+   738	                variant="outline"
+   739	                size="sm"
+   740	                className="w-full"
+   741	                disabled={stopping}
+   742	                onClick={() => void cancelRun()}
+   743	              >
+   744	                {stopping ? (
+   745	                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+   746	                ) : (
+   747	                  <CircleStop className="h-3.5 w-3.5" />
+   748	                )}
+   749	                {stopping
+   750	                  ? t("codexAssistant.cancelling")
+   751	                  : t("codexAssistant.stopRun")}
+   752	              </Button>
+   753	            )}
+   754	
+   755	            {runError && (
+   756	              <p className="rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-destructive">
+   757	                {runError}
+   758	              </p>
+   759	            )}
+   760	
+   761	            {logs.length > 0 && (
+   762	              <div className="overflow-hidden rounded-xl border border-border bg-muted/35">
+   763	                <p className="border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
+   764	                  {t("codexAssistant.executionLog")}
+   765	                </p>
+   766	                <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+   767	                  {logs.join("\n")}
+   768	                </pre>
+   769	              </div>
+   770	            )}
+   771	          </section>
+   772	        </div>
+   773	
+   774	        <footer className="border-t border-border px-5 py-3 text-xs text-muted-foreground">
+   775	          <span className="inline-flex items-center gap-1.5">
+   776	            <MessageCircle className="h-3.5 w-3.5 text-violet-500" />
+   777	            {t("codexAssistant.safetyNote")}
+   778	          </span>
+   779	        </footer>
+   780	      </aside>
+   781	    </>
+   782	  );
+   783	}
