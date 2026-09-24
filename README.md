@@ -44,15 +44,9 @@
 
 右侧浮窗按钮，点击展开对话面板，直接和 Codex CLI 对话。不需要打开终端，不需要切换页面。
 
-![首页浮窗按钮](screenshots/01_home_floating_button.png)
+**对话示例**：展开面板后可直接提问并查看助手回复，下图展示了应用介绍的对话。
 
-**面板展开后**：顶部显示就绪状态（CLI 版本 + Provider 配置），中间是对话区，底部是运行日志。
-
-![Dock 面板](screenshots/02_dock_panel.png)
-
-**对话进行中**：流式输出实时显示，命令执行前弹出审批卡片。
-
-![对话中](screenshots/03_conversation.png)
+![Codex 助手展开后的提问与回复](screenshots/02_dock_panel.png)
 
 #### 会话持久化
 
@@ -61,8 +55,6 @@
 #### 未读 / 运行中指示器
 
 浮窗按钮在有任务运行或有未读消息时显示紫色脉动圆点，从任意页面可见。打开面板后自动清除。
-
-![脉动指示器](screenshots/04_indicator.png)
 
 #### AGENTS.md 知识注入
 
@@ -86,6 +78,14 @@
 - AI 安装按钮：点击后直接打开 Codex 助手 Dock，把安装意图传给 AI，让 AI 帮你完成安装
 - 支持 Claude Code、Codex CLI、Gemini CLI、DeepSeek Harness、Hermes 等多种 Agent
 
+下图以 DeepSeek Harness 为例，展示安装状态、启动、检查更新和卸载入口；右侧圆形按钮用于打开 Codex 助手。
+
+![DeepSeek Harness 生命周期管理与 Codex 助手入口](screenshots/01_home_floating_button.png)
+
+顶部的“更多应用”菜单用于切换 Agent，也提供“添加自定义 Agent”的助手入口。
+
+![更多应用菜单与添加自定义 Agent 入口](screenshots/05_provider_center.png)
+
 ---
 
 ### 3. 通用 Provider 体系
@@ -106,6 +106,10 @@
 - 新安装的 Agent 可以从已有通用 Provider 一键映射过来，无需重新配置
 - 编辑通用 Provider 时显示已绑定的 Agent 列表，修改后同步更新所有投影
 
+在“管理共享投影目标”中选择目标 Agent，查看“直接兼容”“需要路由”或“不兼容”状态，再预览变更。
+
+![管理共享投影目标与协议兼容状态](screenshots/03_conversation.png)
+
 #### Provider 删除选项
 
 删除时提供三种选择：
@@ -118,13 +122,15 @@
 
 ### 4. Provider Center
 
-![Provider Center](screenshots/05_provider_center.png)
-
 - 统一管理所有 Agent 的 Provider 配置
 - 管理投影（通用 Provider 到 Agent 配置的映射）
 - Codex routing badge：显示当前路由状态
 - 管理草稿：预览配置差异，确认后写入
 - 绑定目标锁定：防止误修改已绑定的 Agent
+
+应用共享定义变更前，确认窗口会列出本次涉及的 Agent 及其兼容方式。
+
+![应用共享定义变更前的确认窗口](screenshots/04_indicator.png)
 
 ---
 
