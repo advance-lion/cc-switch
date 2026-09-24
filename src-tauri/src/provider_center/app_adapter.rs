@@ -7,7 +7,7 @@
 
 use crate::app_config::AppType;
 use crate::error::AppError;
-use crate::provider::{Provider, ProviderMeta};
+use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute, Provider, ProviderMeta};
 use crate::proxy::providers::capabilities::{self, Compatibility};
 use crate::services::ProviderService;
 use crate::store::AppState;
@@ -245,7 +245,10 @@ impl AppAdapter {
         definition: &ProviderDefinition,
         secret: &str,
     ) -> Result<Provider, AppError> {
-        self.validate_protocol(&definition.protocol)?;
+        let compatibility = self.resolve_compatibility(&definition.protocol);
+        if let Compatibility::Unsupported { reason } = &compatibility {
+            return Err(AppError::Message(reason.clone()));
+        }
         let mut provider = (self.render)(definition, secret)?;
         provider.id = projected_provider_id(definition, self.app_id());
         provider.category = Some("provider-center".to_string());
@@ -256,17 +259,48 @@ impl AppAdapter {
         // wire_api="responses" in the TOML and no apiFormat, causing the
         // frontend to skip the "需要路由" badge and the proxy to never
         // transform Responses→Chat requests.
-        if let Some(api_format) = protocol_to_api_format(&definition.protocol) {
-            provider.meta = Some(ProviderMeta {
-                api_format: Some(api_format),
-                ..Default::default()
+        let meta = provider.meta.get_or_insert_with(ProviderMeta::default);
+        meta.api_format = protocol_to_api_format(&definition.protocol);
+        if self.app_type == AppType::ClaudeDesktop {
+            meta.claude_desktop_mode = Some(match compatibility {
+                Compatibility::Direct => ClaudeDesktopMode::Direct,
+                Compatibility::Proxy { .. } => ClaudeDesktopMode::Proxy,
+                Compatibility::Unsupported { .. } => unreachable!(),
             });
+            if matches!(meta.claude_desktop_mode, Some(ClaudeDesktopMode::Proxy)) {
+                let mut definitions = model_defs(definition);
+                if definitions.is_empty() {
+                    definitions.push(ProviderModelDefinition {
+                        id: "default".to_string(),
+                        ..Default::default()
+                    });
+                }
+                for (index, route) in crate::claude_desktop_config::DEFAULT_PROXY_ROUTES
+                    .iter()
+                    .enumerate()
+                {
+                    let model = &definitions[index.min(definitions.len() - 1)];
+                    meta.claude_desktop_model_routes.insert(
+                        route.route_id.to_string(),
+                        ClaudeDesktopModelRoute {
+                            model: model.id.clone(),
+                            label_override: model
+                                .display_name
+                                .clone()
+                                .or_else(|| Some(model.id.clone())),
+                            supports_1m: Some(
+                                model
+                                    .context_window
+                                    .is_some_and(|tokens| tokens >= 1_000_000)
+                                    || route.supports_1m,
+                            ),
+                        },
+                    );
+                }
+            }
         }
         if self.app_type == AppType::DeepSeekHarness {
-            provider
-                .meta
-                .get_or_insert_with(Default::default)
-                .live_config_managed = Some(false);
+            meta.live_config_managed = Some(false);
         }
         Ok(provider)
     }

@@ -81,6 +81,8 @@ interface CodexAssistantDockProps {
   onOpenCodexConfiguration: () => void;
   onDismiss?: () => void;
   onInstallationCompleted?: (tool: string) => void;
+  /** Successful assistant turns may have installed a new managed Agent. */
+  onRunCompleted?: () => void;
   installIntent?: CodexAssistantInstallIntent | null;
   /** Incremented by external entry points such as “Add custom Agent”. */
   openRequestId?: number;
@@ -226,6 +228,7 @@ export function CodexAssistantDock({
   onOpenCodexConfiguration,
   onDismiss,
   onInstallationCompleted,
+  onRunCompleted,
   installIntent,
   openRequestId = 0,
 }: CodexAssistantDockProps) {
@@ -271,6 +274,8 @@ export function CodexAssistantDock({
   // Stable ref for t so the event listener useEffect never re-runs.
   const tRef = useRef(t);
   tRef.current = t;
+  const onRunCompletedRef = useRef(onRunCompleted);
+  onRunCompletedRef.current = onRunCompleted;
 
   const appendLog = useCallback((line: string) => {
     setLogs((current) => [...current, line].slice(-MAX_VISIBLE_LOG_LINES));
@@ -365,7 +370,14 @@ export function CodexAssistantDock({
 
     void settingsApi
       .onCodexAssistantEvent((event) => {
-        console.log("[codex-assistant] event:", event.kind, "session:", String(event.sessionId).slice(0,8), "current:", String(sessionIdRef.current).slice(0,8));
+        console.log(
+          "[codex-assistant] event:",
+          event.kind,
+          "session:",
+          String(event.sessionId).slice(0, 8),
+          "current:",
+          String(sessionIdRef.current).slice(0, 8),
+        );
         if (event.sessionId !== sessionIdRef.current) return;
         const t = tRef.current;
         const appendLog = appendLogRef.current;
@@ -434,6 +446,8 @@ export function CodexAssistantDock({
               toast.error(t("codexAssistant.runFailed"), {
                 description: message,
               });
+            } else if (event.success) {
+              onRunCompletedRef.current?.();
             }
         }
       })
@@ -496,7 +510,14 @@ export function CodexAssistantDock({
 
   const sendMessage = async () => {
     const text = request.trim();
-    console.log("[codex-assistant] sendMessage: text:", text.slice(0,20), "running:", running, "starting:", startingSession);
+    console.log(
+      "[codex-assistant] sendMessage: text:",
+      text.slice(0, 20),
+      "running:",
+      running,
+      "starting:",
+      startingSession,
+    );
     if (!text || running || startingSession) return;
 
     setRequest("");

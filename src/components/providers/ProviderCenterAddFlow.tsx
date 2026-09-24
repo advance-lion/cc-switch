@@ -196,10 +196,12 @@ export function ProviderCenterAddFlow({
     );
   }, [appId, path, selectedId]);
 
-  // Clean up orphaned pending binding when preview is cleared without applying.
-  // This ensures canceling a preview does not leave an enabled/pending binding.
+  // Clean up an orphaned pending binding only after the attach/preview request
+  // has settled. While that request is in flight `preview` is still null, so
+  // omitting the busy guard races the cleanup against previewApply and can
+  // detach the binding immediately after it was attached.
   useEffect(() => {
-    if (!preview && newlyAttachedBinding) {
+    if (!busy && !preview && newlyAttachedBinding) {
       const { providerId, appType } = newlyAttachedBinding;
       void providerCenterApi
         .disableBinding(providerId, appType, true)
@@ -207,7 +209,7 @@ export function ProviderCenterAddFlow({
         .catch(() => {})
         .finally(() => setNewlyAttachedBinding(null));
     }
-  }, [preview, newlyAttachedBinding, loadDefinitions]);
+  }, [busy, preview, newlyAttachedBinding, loadDefinitions]);
 
   const selectedDefinition = useMemo(
     () => definitions.find((definition) => definition.id === selectedId),

@@ -155,6 +155,66 @@ describe("ProviderCenterAddFlow", () => {
     expect(onComplete).toHaveBeenCalledOnce();
   });
 
+  it("does not detach a newly attached binding while its preview is in flight", async () => {
+    let resolvePreview!: (value: {
+      token: string;
+      providerId: string;
+      providerRevision: number;
+      createdAt: number;
+      targets: Array<{
+        appType: string;
+        operation: "create";
+        compatible: boolean;
+        drifted: boolean;
+      }>;
+    }) => void;
+    providerCenterApiMock.previewApply.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePreview = resolve;
+      }),
+    );
+    const user = userEvent.setup();
+    renderFlow({
+      appId: "codex",
+      path: "use-universal",
+      onPathChange: vi.fn(),
+      onComplete: vi.fn(),
+    });
+
+    await user.selectOptions(
+      await screen.findByLabelText("provider.addPaths.selectUniversal"),
+      definition.id,
+    );
+    await user.click(
+      screen.getByRole("button", { name: "providerCenter.previewApply" }),
+    );
+    await waitFor(() =>
+      expect(providerCenterApiMock.attach).toHaveBeenCalled(),
+    );
+    expect(providerCenterApiMock.disableBinding).not.toHaveBeenCalled();
+
+    resolvePreview({
+      token: "preview-token",
+      providerId: definition.id,
+      providerRevision: definition.revision,
+      createdAt: 1,
+      targets: [
+        {
+          appType: "codex",
+          operation: "create",
+          compatible: true,
+          drifted: false,
+        },
+      ],
+    });
+    expect(
+      await screen.findByRole("button", {
+        name: "providerCenter.preview.confirm",
+      }),
+    ).toBeEnabled();
+    expect(providerCenterApiMock.disableBinding).not.toHaveBeenCalled();
+  });
+
   it("filters Provider Center projections from a read-only import scan", async () => {
     const user = userEvent.setup();
     const projected = candidate({

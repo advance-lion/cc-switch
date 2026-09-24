@@ -111,6 +111,17 @@ export const icons: Record<string, string> = {
   jiekou: `<svg height="1em" style="flex:none;line-height:1" viewBox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><title>JieKou AI</title><path d="M16 4H4V20H16C18.2091 20 20 18.2091 20 16V8H24V16C24 20.4183 20.4183 24 16 24H4C1.79086 24 0 22.2091 0 20V0H16V4Z" fill="#000000"></path><path d="M20 4H24V0H20V4Z" fill="#0071E3"></path></svg>`,
 };
 
+// DSH uses DeepSeek's official whale as a monochrome Agent mark. Keeping the
+// key equal to the Agent ID lets AgentIcon discover it without another UI map.
+icons.dsh = icons.deepseek
+  .replace("<title>DeepSeek</title>", "<title>DeepSeek Harness</title>")
+  .replace('fill="#4D6BFE"', 'fill="currentColor"');
+
+// Compact Qoder mark based on the official CLI logo.  It stays inline so a
+// globally installed package can be moved or upgraded without breaking the
+// Agent switcher's icon URL.
+icons.qoder = `<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><title>Qoder</title><defs><linearGradient id="qoder-agent-gradient" x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse"><stop stop-color="#1366EC"/><stop offset="1" stop-color="#7366FF"/></linearGradient></defs><path fill="url(#qoder-agent-gradient)" d="M4.35 3.4 10.7 3.3c-.44 1.08-.93 1.67-1.45 1.77l-3.58.66v8.78c0 1.89 2.5 3.53 4.77 4.7.42.21.62 1.02.59 2.44l-1.69-.58C5.53 19.68 3.2 18.86 3.2 14.5V4.9c0-.82.52-1.48 1.15-1.5Zm15.3 0-6.35-.1c.44 1.08.93 1.67 1.45 1.77l3.58.66v8.78c0 1.89-2.5 3.53-4.77 4.7-.42.21-.62 1.02-.59 2.44l1.69-.58c3.81-1.39 6.14-2.21 6.14-6.57V4.9c0-.82-.52-1.48-1.15-1.5ZM12.3 7.65l-1.7 8.15a.5.5 0 0 0 .38.59l.72.16a.5.5 0 0 0 .59-.39l1.7-8.14a.5.5 0 0 0-.38-.6l-.72-.15a.5.5 0 0 0-.59.38ZM9.5 8.32a.75.75 0 0 1 0 1.06L7.1 12l2.4 2.62a.75.75 0 1 1-1.1 1.02l-2.88-3.13a.75.75 0 0 1 0-1.02L8.4 8.36a.75.75 0 0 1 1.1-.04Zm5 0a.75.75 0 0 0 0 1.06L16.9 12l-2.4 2.62a.75.75 0 1 0 1.1 1.02l2.88-3.13a.75.75 0 0 0 0-1.02L15.6 8.36a.75.75 0 0 0-1.1-.04Z"/></svg>`;
+
 export const iconUrls: Record<string, string> = {
   a6api: _a6api,
   apikeyfun: _apikeyfun,

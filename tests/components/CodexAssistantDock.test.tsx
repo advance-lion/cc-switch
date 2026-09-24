@@ -8,8 +8,8 @@ const settingsApiMock = vi.hoisted(() => ({
   getToolVersions: vi.fn(),
   runToolLifecycleAction: vi.fn(),
   startCodexAssistantSession: vi.fn(),
- sendCodexAssistantMessage: vi.fn(),
- cancelCodexAssistantRun: vi.fn(),
+  sendCodexAssistantMessage: vi.fn(),
+  cancelCodexAssistantRun: vi.fn(),
   closeCodexAssistantSession: vi.fn(),
   onCodexAssistantEvent: vi.fn().mockResolvedValue(() => {}),
 }));
@@ -36,8 +36,8 @@ describe("CodexAssistantDock", () => {
       { name: "codex", version: "0.50.0", installed_but_broken: false },
     ]);
     settingsApiMock.startCodexAssistantSession.mockResolvedValue("session-1");
- settingsApiMock.sendCodexAssistantMessage.mockResolvedValue(undefined);
- settingsApiMock.cancelCodexAssistantRun.mockResolvedValue(true);
+    settingsApiMock.sendCodexAssistantMessage.mockResolvedValue(undefined);
+    settingsApiMock.cancelCodexAssistantRun.mockResolvedValue(true);
     settingsApiMock.closeCodexAssistantSession.mockResolvedValue(true);
     settingsApiMock.onCodexAssistantEvent.mockResolvedValue(() => {});
   });
@@ -178,10 +178,35 @@ describe("CodexAssistantDock", () => {
         settingsApiMock.sendCodexAssistantMessage,
       ).toHaveBeenLastCalledWith("session-1", "第二个问题"),
     );
-   expect(settingsApiMock.startCodexAssistantSession).toHaveBeenCalledTimes(1);
- });
+    expect(settingsApiMock.startCodexAssistantSession).toHaveBeenCalledTimes(1);
+  });
 
- it("prefills an install intent as a conversation message", async () => {
+  it("requests a managed-Agent rescan after a successful assistant turn", async () => {
+    const onRunCompleted = vi.fn();
+    render(
+      <CodexAssistantDock
+        providerReady={true}
+        onOpenCodexConfiguration={vi.fn()}
+        onRunCompleted={onRunCompleted}
+      />,
+    );
+    await openDock();
+    await sendMessage("安装 Qoder");
+    await waitFor(() =>
+      expect(settingsApiMock.sendCodexAssistantMessage).toHaveBeenCalled(),
+    );
+
+    await emitAssistantEvent({
+      sessionId: "session-1",
+      kind: "finished",
+      success: true,
+      cancelled: false,
+    });
+
+    expect(onRunCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefills an install intent as a conversation message", async () => {
     render(
       <CodexAssistantDock
         providerReady={true}
@@ -225,10 +250,9 @@ describe("CodexAssistantDock", () => {
 
     await sendMessage("second");
     await waitFor(() =>
-      expect(settingsApiMock.sendCodexAssistantMessage).toHaveBeenLastCalledWith(
-        "session-2",
-        "second",
-      ),
+      expect(
+        settingsApiMock.sendCodexAssistantMessage,
+      ).toHaveBeenLastCalledWith("session-2", "second"),
     );
     expect(settingsApiMock.startCodexAssistantSession).toHaveBeenCalledTimes(2);
   });

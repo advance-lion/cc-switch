@@ -3,36 +3,30 @@ import { FolderOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { cn } from "@/lib/utils";
-import { ProviderIcon } from "@/components/ProviderIcon";
+import { AgentIcon, getAgentVisual } from "@/components/AgentIcon";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type { VisibleApps } from "@/types";
 import type { AppId } from "@/lib/api";
-import { DEFAULT_VISIBLE_APPS } from "@/config/appConfig";
+import { APP_IDS, DEFAULT_VISIBLE_APPS } from "@/config/appConfig";
 
 interface AppVisibilitySettingsProps {
   settings: SettingsFormState;
   onChange: (updates: Partial<SettingsFormState>) => void;
 }
 
-const APP_CONFIG: Array<{
-  id: AppId;
-  icon: string;
-  nameKey: string;
-}> = [
-  { id: "claude", icon: "claude", nameKey: "apps.claudeCode" },
-  {
-    id: "claude-desktop",
-    icon: "claude",
-    nameKey: "apps.claudeDesktop",
-  },
-  { id: "codex", icon: "openai", nameKey: "apps.codex" },
-  { id: "gemini", icon: "gemini", nameKey: "apps.gemini" },
-  { id: "grokbuild", icon: "grok", nameKey: "apps.grokbuild" },
-  { id: "opencode", icon: "opencode", nameKey: "apps.opencode" },
-  { id: "openclaw", icon: "openclaw", nameKey: "apps.openclaw" },
-  { id: "hermes", icon: "hermes", nameKey: "apps.hermes" },
-  { id: "pi", icon: "pi", nameKey: "apps.pi" },
-];
+const APP_NAME_KEYS: Partial<Record<AppId, string>> = {
+  claude: "apps.claudeCode",
+  "claude-desktop": "apps.claudeDesktop",
+  codex: "apps.codex",
+  gemini: "apps.gemini",
+  grokbuild: "apps.grokbuild",
+  opencode: "apps.opencode",
+  openclaw: "apps.openclaw",
+  hermes: "apps.hermes",
+  pi: "apps.pi",
+};
+
+const APP_CONFIG = APP_IDS.map((id) => ({ id, nameKey: APP_NAME_KEYS[id] }));
 
 export function AppVisibilitySettings({
   settings,
@@ -71,6 +65,9 @@ export function AppVisibilitySettings({
       <div className="flex flex-wrap gap-1 rounded-md border border-border-default bg-background p-1">
         {APP_CONFIG.map((app) => {
           const isVisible = visibleApps[app.id];
+          const name = app.nameKey
+            ? t(app.nameKey)
+            : getAgentVisual(app.id).label;
           // Disable button if this is the last visible app
           const isDisabled = isVisible && visibleCount <= 1;
 
@@ -80,10 +77,9 @@ export function AppVisibilitySettings({
               active={isVisible}
               disabled={isDisabled}
               onClick={() => handleToggle(app.id)}
-              icon={app.icon}
-              name={t(app.nameKey)}
+              appId={app.id}
             >
-              {t(app.nameKey)}
+              {name}
             </AppButton>
           );
         })}
@@ -103,8 +99,7 @@ interface AppButtonProps {
   active: boolean;
   disabled?: boolean;
   onClick: () => void;
-  icon: string;
-  name: string;
+  appId: AppId;
   children: React.ReactNode;
 }
 
@@ -112,8 +107,7 @@ function AppButton({
   active,
   disabled,
   onClick,
-  icon,
-  name,
+  appId,
   children,
 }: AppButtonProps) {
   return (
@@ -130,7 +124,7 @@ function AppButton({
           : "text-muted-foreground hover:text-foreground hover:bg-muted",
       )}
     >
-      <ProviderIcon icon={icon} name={name} size={14} />
+      <AgentIcon agentId={appId} size={14} />
       {children}
     </Button>
   );

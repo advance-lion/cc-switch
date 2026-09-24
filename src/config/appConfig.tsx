@@ -1,13 +1,7 @@
 import React from "react";
 import type { AppId } from "@/lib/api/types";
 import type { VisibleApps } from "@/types";
-import {
-  ClaudeIcon,
-  CodexIcon,
-  GeminiIcon,
-  OpenClawIcon,
-} from "@/components/BrandIcons";
-import { ProviderIcon } from "@/components/ProviderIcon";
+import { AgentIcon, getAgentVisual } from "@/components/AgentIcon";
 
 export interface AppConfig {
   label: string;
@@ -119,101 +113,80 @@ export function isMcpAppId(appId: string): appId is McpAppId {
 
 export const APP_ICON_MAP: Record<AppId, AppConfig> = {
   claude: {
-    label: "Claude",
-    icon: <ClaudeIcon size={14} />,
+    label: getAgentVisual("claude").shortLabel,
+    icon: <AgentIcon agentId="claude" size={14} />,
     activeClass:
       "bg-orange-500/10 ring-1 ring-orange-500/20 hover:bg-orange-500/20 text-orange-600 dark:text-orange-400",
     badgeClass:
       "bg-orange-500/10 text-orange-700 dark:text-orange-300 hover:bg-orange-500/20 border-0 gap-1.5",
   },
   "claude-desktop": {
-    label: "Claude Desktop",
-    icon: <ClaudeIcon size={14} />,
+    label: getAgentVisual("claude-desktop").shortLabel,
+    icon: <AgentIcon agentId="claude-desktop" size={14} />,
     activeClass:
       "bg-amber-500/10 ring-1 ring-amber-500/20 hover:bg-amber-500/20 text-amber-700 dark:text-amber-300",
     badgeClass:
       "bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 border-0 gap-1.5",
   },
   codex: {
-    label: "Codex",
-    icon: <CodexIcon size={14} />,
+    label: getAgentVisual("codex").shortLabel,
+    icon: <AgentIcon agentId="codex" size={14} />,
     activeClass:
       "bg-green-500/10 ring-1 ring-green-500/20 hover:bg-green-500/20 text-green-600 dark:text-green-400",
     badgeClass:
       "bg-green-500/10 text-green-700 dark:text-green-300 hover:bg-green-500/20 border-0 gap-1.5",
   },
   gemini: {
-    label: "Gemini",
-    icon: <GeminiIcon size={14} />,
+    label: getAgentVisual("gemini").shortLabel,
+    icon: <AgentIcon agentId="gemini" size={14} />,
     activeClass:
       "bg-blue-500/10 ring-1 ring-blue-500/20 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400",
     badgeClass:
       "bg-blue-500/10 text-blue-700 dark:text-blue-300 hover:bg-blue-500/20 border-0 gap-1.5",
   },
   grokbuild: {
-    label: "Grok Build",
-    icon: (
-      <ProviderIcon
-        icon="grok"
-        name="Grok Build"
-        size={14}
-        showFallback={false}
-      />
-    ),
+    label: getAgentVisual("grokbuild").shortLabel,
+    icon: <AgentIcon agentId="grokbuild" size={14} showFallback={false} />,
     activeClass:
       "bg-cyan-500/10 ring-1 ring-cyan-500/20 hover:bg-cyan-500/20 text-cyan-700 dark:text-cyan-300",
     badgeClass:
       "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/20 border-0 gap-1.5",
   },
   opencode: {
-    label: "OpenCode",
-    icon: (
-      <ProviderIcon
-        icon="opencode"
-        name="OpenCode"
-        size={14}
-        showFallback={false}
-      />
-    ),
+    label: getAgentVisual("opencode").shortLabel,
+    icon: <AgentIcon agentId="opencode" size={14} showFallback={false} />,
     activeClass:
       "bg-indigo-500/10 ring-1 ring-indigo-500/20 hover:bg-indigo-500/20 text-indigo-600 dark:text-indigo-400",
     badgeClass:
       "bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-500/20 border-0 gap-1.5",
   },
   openclaw: {
-    label: "OpenClaw",
-    icon: <OpenClawIcon size={14} />,
+    label: getAgentVisual("openclaw").shortLabel,
+    icon: <AgentIcon agentId="openclaw" size={14} />,
     activeClass:
       "bg-rose-500/10 ring-1 ring-rose-500/20 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400",
     badgeClass:
       "bg-rose-500/10 text-rose-700 dark:text-rose-300 hover:bg-rose-500/20 border-0 gap-1.5",
   },
   hermes: {
-    label: "Hermes",
-    icon: (
-      <ProviderIcon
-        icon="hermes"
-        name="Hermes"
-        size={14}
-        showFallback={false}
-      />
-    ),
+    label: getAgentVisual("hermes").shortLabel,
+    icon: <AgentIcon agentId="hermes" size={14} showFallback={false} />,
     activeClass:
       "bg-violet-500/10 ring-1 ring-violet-500/20 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400",
     badgeClass:
       "bg-violet-500/10 text-violet-700 dark:text-violet-300 hover:bg-violet-500/20 border-0 gap-1.5",
   },
   pi: {
-    label: "Pi",
-    icon: <ProviderIcon icon="pi" name="Pi" size={14} showFallback={false} />,
+    label: getAgentVisual("pi").shortLabel,
+    icon: <AgentIcon agentId="pi" size={14} showFallback={false} />,
     activeClass:
       "bg-fuchsia-500/10 ring-1 ring-fuchsia-500/20 hover:bg-fuchsia-500/20 text-fuchsia-600 dark:text-fuchsia-400",
     badgeClass:
       "bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300 hover:bg-fuchsia-500/20 border-0 gap-1.5",
   },
   dsh: {
-    label: "DeepSeek Harness",
-    icon: <ProviderIcon icon="dsh" name="DSH" size={14} showFallback={false} />,
+    label: getAgentVisual("dsh").label,
+    icon: <AgentIcon agentId="dsh" size={14} showFallback={false} />,
     activeClass:
       "bg-blue-500/10 ring-1 ring-blue-500/20 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400",
     badgeClass:

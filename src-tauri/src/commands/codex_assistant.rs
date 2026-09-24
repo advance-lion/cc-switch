@@ -14,7 +14,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-   sync::{
+    sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
@@ -123,6 +123,16 @@ SQLite at <app_config_dir>/ccswitch.db. Key tables:
 3. Backend stores in SQLite + writes to live config file
 4. switch_provider updates the app live config (e.g. ~/.codex/config.toml)
 
+## Installing a New Agent
+- Installing a CLI package and registering an Agent in CC Switch are separate steps.
+- After an installation, always verify the real executable with `<command> --version`.
+- CC Switch rescans its managed-Agent adapters after every successful assistant turn.
+- Qoder is registered as the `qoder` runtime and must be installed from the official
+  `@qoder-ai/qodercli` package. Its lifecycle is managed here, but its Provider
+  projection is not yet supported; never claim that Provider settings were synced.
+- For an Agent without a managed adapter, state plainly that installation succeeded
+  but CC Switch integration still needs an adapter. Do not describe it as registered.
+
 ## Config File Locations
 - App config: <APPDATA>/com.ccswitch.desktop.dev/
 - Codex home: ~/.codex/ (config.toml, auth.json)
@@ -150,34 +160,19 @@ fn ensure_agents_md(dir: &Path) {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum CodexAssistantEvent {
     #[serde(rename_all = "camelCase")]
-    Started {
-        session_id: String,
-    },
+    Started { session_id: String },
     #[serde(rename_all = "camelCase")]
-    Message {
-        session_id: String,
-        message: String,
-    },
+    Message { session_id: String, message: String },
     #[serde(rename_all = "camelCase")]
-    Log {
-        session_id: String,
-        message: String,
-    },
+    Log { session_id: String, message: String },
     #[serde(rename_all = "camelCase")]
-    Stderr {
-        session_id: String,
-        message: String,
-    },
+    Stderr { session_id: String, message: String },
     #[serde(rename_all = "camelCase")]
-    Disconnected {
-        session_id: String,
-        message: String,
-    },
+    Disconnected { session_id: String, message: String },
     #[serde(rename_all = "camelCase")]
     Finished {
         session_id: String,
@@ -487,10 +482,7 @@ fn summarize_item(item: &Value) -> Option<String> {
             }
         }
         "web_search" => {
-            let query = item
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let query = item.get("query").and_then(Value::as_str).unwrap_or("");
             Some(format!("[web_search] {query}"))
         }
         "file_change" => {
@@ -518,7 +510,10 @@ fn summarize_item(item: &Value) -> Option<String> {
 }
 
 fn read_stdout(session: Arc<CodexExecSession>, stdout: impl Read + Send + 'static, gen: u64) {
-    log::info!("[codex-assistant] stdout reader started session={}", session.id);
+    log::info!(
+        "[codex-assistant] stdout reader started session={}",
+        session.id
+    );
     for line in BufReader::new(stdout).lines() {
         match line {
             Ok(line) if !line.trim().is_empty() => match serde_json::from_str::<Value>(&line) {
@@ -553,7 +548,10 @@ fn read_stdout(session: Arc<CodexExecSession>, stdout: impl Read + Send + 'stati
     // If a newer message has already started (generation mismatch), this
     // reader is stale and must not touch session state or emit events.
     if session.generation.load(Ordering::Acquire) != gen {
-        log::info!("[codex-assistant] stale stdout reader gen={} superseded, exiting quietly", gen);
+        log::info!(
+            "[codex-assistant] stale stdout reader gen={} superseded, exiting quietly",
+            gen
+        );
         return;
     }
 
@@ -683,8 +681,16 @@ pub fn send_codex_assistant_message(session_id: String, message: String) -> Resu
         let args: Vec<_> = command.get_args().collect();
         log::info!(
             "[codex-assistant] spawn: exe={:?} args={:?} codex_home={:?} cwd={:?} thread_id={:?}",
-            exe, args, codex_home, session.cwd,
-            session.thread_id.lock().ok().and_then(|g| g.clone()).unwrap_or_default()
+            exe,
+            args,
+            codex_home,
+            session.cwd,
+            session
+                .thread_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_default()
         );
     }
 
@@ -1061,4 +1067,3 @@ mod tests {
         );
     }
 }
-

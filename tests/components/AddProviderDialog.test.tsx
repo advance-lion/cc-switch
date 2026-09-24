@@ -10,8 +10,16 @@ import { useEffect, type ReactElement, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { providerCenterApi } from "@/lib/api/providerCenter";
+import type { ProviderApplyPreview } from "@/lib/api/providerCenter";
 import type { ProviderFormValues } from "@/components/providers/forms/ProviderForm";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
+
+const toastMocks = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("sonner", () => ({ toast: toastMocks }));
 
 vi.mock("@/lib/api/providerCenter", () => ({
   providerCenterApi: {
@@ -219,6 +227,66 @@ describe("AddProviderDialog", () => {
     );
     // confirmManagedDraft must NOT be called before user confirms
     expect(providerCenterApi.confirmManagedDraft).not.toHaveBeenCalled();
+  });
+
+  it("does not report success or close when the managed transaction rolls back", async () => {
+    const onOpenChange = vi.fn();
+    const preview: ProviderApplyPreview = {
+      token: "preview-token",
+      providerId: "shared-provider",
+      providerRevision: 1,
+      createdAt: 1,
+      targets: [
+        {
+          appType: "codex",
+          operation: "create",
+          compatible: true,
+          connectionMode: "direct",
+          requiresTakeover: false,
+          drifted: false,
+        },
+      ],
+    };
+    vi.mocked(providerCenterApi.previewManagedDraft).mockResolvedValue(preview);
+    vi.mocked(providerCenterApi.confirmManagedDraft).mockResolvedValue({
+      id: "failed-transaction",
+      providerId: "shared-provider",
+      providerRevision: 1,
+      status: "rolled_back",
+      createdAt: 1,
+      completedAt: 2,
+      targets: [
+        {
+          appType: "codex",
+          status: "rolled_back",
+          message: "写入后配置校验失败",
+        },
+      ],
+    });
+
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={onOpenChange}
+        appId="codex"
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "通用 Provider" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /universalProvider\.add/ }),
+    );
+    await screen.findByRole("button", { name: "预览并继续" });
+    fireEvent.click(screen.getByRole("button", { name: "预览并继续" }));
+    await screen.findByRole("button", { name: "确认添加" });
+    fireEvent.click(screen.getByRole("button", { name: "确认添加" }));
+
+    await waitFor(() =>
+      expect(toastMocks.error).toHaveBeenCalledWith("写入后配置校验失败"),
+    );
+    expect(toastMocks.success).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
 
   it("使用 ProviderForm 返回的自定义端点", async () => {

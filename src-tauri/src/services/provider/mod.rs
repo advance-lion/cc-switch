@@ -4283,6 +4283,27 @@ impl ProviderService {
         }
     }
 
+    /// Normalize a Provider Center projection to the representation that the
+    /// regular add/update paths persist. Provider Center fingerprints must be
+    /// calculated from this representation; otherwise storage-only cleanup
+    /// (notably stripping an enabled Codex common-config snippet) looks like
+    /// an external write and causes a successful save to be rolled back.
+    pub(crate) fn normalize_provider_center_projection_for_storage(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &mut Provider,
+    ) -> Result<(), AppError> {
+        // Pi and DSH use their own persistence implementations. Neither runs
+        // these normalizers in AppAdapter::apply.
+        if matches!(app_type, AppType::Pi | AppType::DeepSeekHarness) {
+            return Ok(());
+        }
+
+        Self::normalize_provider_if_claude(app_type, provider);
+        Self::validate_provider_settings(app_type, provider)?;
+        normalize_provider_common_config_for_storage(state.db.as_ref(), app_type, provider)
+    }
+
     /// Check whether a provider exists in live config, tolerating parse errors
     /// only for providers that are explicitly marked as DB-only.
     fn check_live_config_exists(

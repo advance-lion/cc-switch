@@ -550,11 +550,11 @@ export const settingsApi = {
     if (isCodexAssistantWebBridgeActive() && tools?.length === 1) {
       const tool = tools[0];
       const status =
-        tool === "codex"
+        tool === "codex" || tool === "qoder"
           ? await webAssistantRequest<{
               available: boolean;
               version: string | null;
-            }>("/status")
+            }>(`/tool-status?tool=${encodeURIComponent(tool)}`)
           : { available: false, version: null };
       return [
         {

@@ -76,7 +76,11 @@ import {
 import { AppSwitcher } from "@/components/AppSwitcher";
 import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
-import { RuntimeLifecycleCard } from "@/components/runtime/RuntimeLifecycleCard";
+import {
+  ManagedAgentLifecycleCard,
+  RuntimeLifecycleCard,
+} from "@/components/runtime/RuntimeLifecycleCard";
+import { registerAgentVisual } from "@/components/AgentIcon";
 import {
   CodexAssistantDock,
   type CodexAssistantInstallIntent,
@@ -136,6 +140,7 @@ import {
   DEFAULT_VISIBLE_APPS,
   isProxyAppId,
 } from "@/config/appConfig";
+import { discoverManagedAgents, type ManagedAgent } from "@/lib/managedAgents";
 
 type View =
   | "providers"
@@ -164,12 +169,18 @@ const DEFAULT_DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px
 const HEADER_HEIGHT = 64; // px
 
 const STORAGE_KEY = "cc-switch-last-app";
+const EMPTY_MANAGED_AGENTS: ManagedAgent[] = [];
 const getInitialApp = (): AppId => {
   const saved = localStorage.getItem(STORAGE_KEY) as AppId | null;
   if (saved && APP_IDS.includes(saved)) {
     return saved;
   }
   return "claude";
+};
+
+const getInitialManagedAgent = (): string | null => {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  return saved?.startsWith("managed:") ? saved.slice("managed:".length) : null;
 };
 
 const VIEW_STORAGE_KEY = "cc-switch-last-view";
@@ -204,6 +215,9 @@ function App() {
   const queryClient = useQueryClient();
 
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
+  const [activeManagedAgentId, setActiveManagedAgentId] = useState<
+    string | null
+  >(getInitialManagedAgent);
   const sharedFeatureApp: AppId =
     activeApp === "claude-desktop" ? "claude" : activeApp;
   const [currentView, setCurrentView] = useState<View>(getInitialView);
@@ -216,6 +230,41 @@ function App() {
     useState<CodexAssistantInstallIntent | null>(null);
   const [appLifecycleRefreshRequest, setAppLifecycleRefreshRequest] =
     useState(0);
+
+  const { data: managedAgentsData, refetch: refetchManagedAgents } = useQuery({
+    queryKey: ["managed-agents", "installed"],
+    queryFn: discoverManagedAgents,
+    staleTime: 5_000,
+    refetchOnWindowFocus: true,
+  });
+  const managedAgents = managedAgentsData ?? EMPTY_MANAGED_AGENTS;
+  const activeManagedAgent = useMemo(
+    () =>
+      managedAgents.find((agent) => agent.id === activeManagedAgentId) ?? null,
+    [activeManagedAgentId, managedAgents],
+  );
+
+  useEffect(() => {
+    const cleanups = managedAgents.map((agent) =>
+      registerAgentVisual(agent.id, {
+        label: agent.name,
+        shortLabel: agent.shortLabel,
+        icon: agent.icon,
+      }),
+    );
+    return () => cleanups.reverse().forEach((cleanup) => cleanup());
+  }, [managedAgents]);
+
+  useEffect(() => {
+    if (
+      managedAgentsData &&
+      activeManagedAgentId &&
+      !managedAgentsData.some((agent) => agent.id === activeManagedAgentId)
+    ) {
+      setActiveManagedAgentId(null);
+      localStorage.setItem(STORAGE_KEY, activeApp);
+    }
+  }, [activeApp, activeManagedAgentId, managedAgentsData]);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
@@ -885,7 +934,16 @@ function App() {
     const { preview, input } = managedEditPreview;
     setManagedEditApplying(true);
     try {
-      await providerCenterApi.confirmManagedDraft(input, preview.token);
+      const result = await providerCenterApi.confirmManagedDraft(
+        input,
+        preview.token,
+      );
+      if (result.status !== "applied") {
+        const failure = result.targets.find(
+          (target) => target.status !== "applied" && target.message,
+        );
+        throw new Error(failure?.message ?? `应用未完成（${result.status}）`);
+      }
       await refreshProviderCenterApps(
         queryClient,
         input.targetAppTypes as ProviderCenterApp[],
@@ -893,6 +951,7 @@ function App() {
       toast.success("共享定义已应用");
     } catch (error) {
       toast.error(extractErrorMessage(error));
+      await queryClient.invalidateQueries({ queryKey: ["provider-center"] });
     } finally {
       setManagedEditApplying(false);
       setManagedEditPreview(null);
@@ -1226,6 +1285,31 @@ function App() {
 
   const renderContent = () => {
     const content = (() => {
+      if (currentView === "providers" && activeManagedAgent) {
+        return (
+          <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
+            <div className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1">
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={`managed:${activeManagedAgent.id}`}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.15 }}
+                  className="space-y-4"
+                >
+                  <ManagedAgentLifecycleCard
+                    agent={activeManagedAgent}
+                    refreshRequestId={appLifecycleRefreshRequest}
+                    onChanged={() => void refetchManagedAgents()}
+                  />
+                </motion.div>
+              </AnimatePresence>
+            </div>
+          </div>
+        );
+      }
+
       switch (currentView) {
         case "settings":
           return (
@@ -1559,7 +1643,8 @@ function App() {
                   {currentView === "openclawAgents" &&
                     t("openclaw.agents.title")}
                   {currentView === "hermesMemory" && t("hermes.memory.title")}
-                  {currentView === "codexAssistant" && t("codexAssistant.title")}
+                  {currentView === "codexAssistant" &&
+                    t("codexAssistant.title")}
                 </h1>
               </div>
             ) : (
@@ -1611,6 +1696,7 @@ function App() {
 
           <div className="flex flex-1 min-w-0 items-center justify-end gap-1.5">
             {currentView === "providers" &&
+              !activeManagedAgent &&
               (activeApp === "claude-desktop" || proxyAppId) && (
                 <div
                   className="flex shrink-0 items-center gap-1.5"
@@ -1631,6 +1717,7 @@ function App() {
                 </div>
               )}
             {currentView === "providers" &&
+              !activeManagedAgent &&
               (settingsData?.showProfileSwitcher ?? true) && (
                 <div
                   className="flex shrink-0 items-center"
@@ -1645,7 +1732,16 @@ function App() {
               {currentView === "providers" && (
                 <AppSwitcher
                   activeApp={activeApp}
-                  onSwitch={setActiveApp}
+                  onSwitch={(app) => {
+                    setActiveManagedAgentId(null);
+                    setActiveApp(app);
+                  }}
+                  managedAgents={managedAgents}
+                  activeManagedAgentId={activeManagedAgentId}
+                  onSwitchManagedAgent={(agentId) => {
+                    setActiveManagedAgentId(agentId);
+                    setCurrentView("providers");
+                  }}
                   visibleApps={visibleApps}
                   onAddCustomAgent={() => {
                     setCodexAssistantInstallIntent(null);
@@ -1806,7 +1902,7 @@ function App() {
                     )}
                   </>
                 )}
-                {currentView === "providers" && (
+                {currentView === "providers" && !activeManagedAgent && (
                   <>
                     <div className="flex items-center gap-1 p-1 bg-muted rounded-xl">
                       <AnimatePresence mode="wait">
@@ -1970,7 +2066,9 @@ function App() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => setCodexAssistantOpenRequest((c) => c + 1)}
+                                onClick={() =>
+                                  setCodexAssistantOpenRequest((c) => c + 1)
+                                }
                                 className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
                                 title={t("codexAssistant.title")}
                               >
@@ -2006,21 +2104,26 @@ function App() {
         {renderContent()}
       </main>
 
-      {(
-      <CodexAssistantDock
-        providerReady={codexProviderReady}
-        openRequestId={codexAssistantOpenRequest}
-        installIntent={codexAssistantInstallIntent}
-        onInstallationCompleted={() =>
-          setAppLifecycleRefreshRequest((current) => current + 1)
-        }
-        onDismiss={() => setCodexAssistantInstallIntent(null)}
-        onOpenCodexConfiguration={() => {
-          setActiveApp("codex");
-          setCurrentView("providers");
-        }}
-      />
-      )}
+      {
+        <CodexAssistantDock
+          providerReady={codexProviderReady}
+          openRequestId={codexAssistantOpenRequest}
+          installIntent={codexAssistantInstallIntent}
+          onInstallationCompleted={() =>
+            setAppLifecycleRefreshRequest((current) => current + 1)
+          }
+          onRunCompleted={() => {
+            setAppLifecycleRefreshRequest((current) => current + 1);
+            void refetchManagedAgents();
+          }}
+          onDismiss={() => setCodexAssistantInstallIntent(null)}
+          onOpenCodexConfiguration={() => {
+            setActiveManagedAgentId(null);
+            setActiveApp("codex");
+            setCurrentView("providers");
+          }}
+        />
+      }
 
       <AddProviderDialog
         open={isAddOpen}

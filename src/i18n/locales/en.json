@@ -1095,8 +1095,17 @@
   "appSwitcher": {
     "more": "More apps",
     "addCustomAgent": "Add custom Agent",
-    "addCustomAgentHint": "Ask Codex how to add it",
+    "addCustomAgentHint": "Installed Agents are detected and managed here",
     "customAgentExecutorPending": "Ask Codex first; any real operation requires confirmation before it runs."
+  },
+  "managedAgent": {
+    "title": "Manage {{app}}",
+    "autoDetected": "Auto-detected",
+    "description": "Detected from this computer; CC Switch now manages its version and lifecycle.",
+    "cliDescription": "Official command-line package: {{package}}",
+    "providerTitle": "Models and Providers",
+    "notIntegrated": "Not integrated",
+    "providerPendingDescription": "CC Switch currently manages installation, version, and launch for {{app}}. Provider configuration remains native to the Agent until its config format is verified."
   },
   "codexAssistant": {
     "open": "Open Codex assistant",

@@ -2888,15 +2888,22 @@ pub fn preview_managed_draft(
     // Determine target app types. If not specified, default to the current
     // agent only (preserving the original single-agent behavior).
     let target_apps = normalized_target_app_types(&input.target_app_types, Some(&app_str));
+    let bindings = load_bindings(state)?;
 
     let mut targets = Vec::new();
     for target_app in &target_apps {
+        let expected_fingerprint = bindings
+            .iter()
+            .find(|binding| {
+                binding.provider_id == input.definition_id && binding.app_type == *target_app
+            })
+            .and_then(|binding| binding.expected_fingerprint.as_ref());
         targets.push(evaluate_preview_target(
             state,
             &preview_definition,
             &secret,
             target_app,
-            None,
+            expected_fingerprint,
         )?);
     }
 
@@ -3047,12 +3054,13 @@ pub fn confirm_managed_draft(
     // Apply via the standard transaction path. AppAdapter::apply uses
     // add_to_live=false and does not call switch, so this writes only to
     // the per-agent provider DB — no live config, no proxy start.
-    let transaction = apply_transaction(
+    let transaction = apply_transaction_with_drift_policy(
         state,
         &definition.id,
         target_apps,
         &preview.token,
         idempotency_key,
+        true,
     )?;
 
     Ok(transaction)
@@ -3357,6 +3365,24 @@ pub fn apply_transaction(
     preview_token_value: &str,
     idempotency_key: Option<&str>,
 ) -> Result<ProviderApplyTransaction, AppError> {
+    apply_transaction_with_drift_policy(
+        state,
+        provider_id,
+        app_types,
+        preview_token_value,
+        idempotency_key,
+        false,
+    )
+}
+
+fn apply_transaction_with_drift_policy(
+    state: &AppState,
+    provider_id: &str,
+    app_types: Vec<String>,
+    preview_token_value: &str,
+    idempotency_key: Option<&str>,
+    allow_confirmed_drift: bool,
+) -> Result<ProviderApplyTransaction, AppError> {
     if let Some(key) = idempotency_key {
         if key.len() > 128
             || key.is_empty()
@@ -3375,11 +3401,13 @@ pub fn apply_transaction(
         return Err(AppError::Message("应用预览已过期，请重新预览".to_string()));
     }
     // Reject if any target has drifted (external modification conflict).
-    if let Some(drifted) = preview.targets.iter().find(|t| t.drifted) {
-        return Err(AppError::Message(format!(
-            "目标 {} 的配置已被外部修改，请先确认冲突后重试",
-            drifted.app_type
-        )));
+    if !allow_confirmed_drift {
+        if let Some(drifted) = preview.targets.iter().find(|t| t.drifted) {
+            return Err(AppError::Message(format!(
+                "目标 {} 的配置已被外部修改，请先确认冲突后重试",
+                drifted.app_type
+            )));
+        }
     }
     let definitions = load_definitions(state)?;
     let definition = definitions
@@ -3451,10 +3479,15 @@ pub fn apply_transaction(
             .iter()
             .find(|b| b.provider_id == provider_id && b.app_type == target.app_type)
             .and_then(|b| b.provider_template.clone());
-        let projected = match template {
+        let mut projected = match template {
             Some(template) => merge_template_with_projection(&template, projected),
             None => projected,
         };
+        ProviderService::normalize_provider_center_projection_for_storage(
+            state,
+            &app,
+            &mut projected,
+        )?;
         let previous = state.db.get_provider_by_id(&projected.id, app.as_str())?;
         let before_fingerprint = previous.as_ref().map(provider_fingerprint).transpose()?;
         let current = ProviderService::current(state, app)?;
@@ -4950,6 +4983,109 @@ mod tests {
     }
 
     #[test]
+    fn confirm_codex_managed_draft_applies_all_targets_after_storage_normalization() {
+        with_test_home(|state| {
+            let common_config = r#"disable_response_storage = true
+model_reasoning_effort = "low"
+
+[features]
+js_repl = false
+"#;
+            state
+                .db
+                .set_config_snippet("codex", Some(common_config.to_string()))
+                .expect("save Codex common config");
+
+            let mut provider = Provider::with_id(
+                "source-codex-provider".to_string(),
+                "Codex Shared Draft".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "test-secret-key" },
+                    "config": r#"model_provider = "custom"
+model = "gpt-test"
+model_reasoning_effort = "low"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://api.example.test/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+js_repl = false
+"#
+                }),
+                None,
+            );
+            provider.meta = Some(crate::provider::ProviderMeta {
+                common_config_enabled: Some(true),
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            let definition_id = Uuid::new_v4().to_string();
+            let input = ManagedProviderDraftInput {
+                app_type: "codex".to_string(),
+                provider,
+                definition_id: definition_id.clone(),
+                expected_revision: None,
+                target_app_types: vec![
+                    "claude".to_string(),
+                    "claude-desktop".to_string(),
+                    "codex".to_string(),
+                    "openclaw".to_string(),
+                    "pi".to_string(),
+                    "dsh".to_string(),
+                ],
+            };
+
+            let preview =
+                preview_managed_draft(state, input.clone()).expect("preview Codex managed draft");
+            let transaction = confirm_managed_draft(
+                state,
+                input,
+                &preview.token,
+                Some("confirm-codex-common-config-normalization"),
+            )
+            .expect("confirm Codex managed draft");
+
+            assert_eq!(transaction.status, "applied");
+            assert!(transaction
+                .targets
+                .iter()
+                .all(|target| target.status == "applied"));
+
+            let definition = load_definitions(state)
+                .expect("load definitions")
+                .into_iter()
+                .find(|definition| definition.id == definition_id)
+                .expect("definition exists");
+            let persisted = state
+                .db
+                .get_provider_by_id(&projected_provider_id(&definition, "codex"), "codex")
+                .expect("query Codex projection")
+                .expect("Codex projection exists");
+            let binding = load_bindings(state)
+                .expect("load bindings")
+                .into_iter()
+                .find(|binding| binding.provider_id == definition_id && binding.app_type == "codex")
+                .expect("Codex binding exists");
+            let persisted_fingerprint =
+                provider_fingerprint(&persisted).expect("persisted fingerprint");
+
+            assert_eq!(binding.status, "applied");
+            assert_eq!(
+                binding.expected_fingerprint.as_deref(),
+                Some(persisted_fingerprint.as_str())
+            );
+            assert!(!persisted.settings_config["config"]
+                .as_str()
+                .expect("persisted Codex config")
+                .contains("disable_response_storage"));
+        });
+    }
+
+    #[test]
     fn confirm_managed_draft_explicit_openclaw_multi_target_has_zero_live_side_effects() {
         with_test_home(|state| {
             let openclaw_path = crate::openclaw_config::get_openclaw_config_path();
@@ -5141,6 +5277,78 @@ mod tests {
                 .expect("query openclaw")
                 .expect("openclaw projection exists");
             assert_eq!(openclaw_projected.name, "Updated Shared Name");
+        });
+    }
+
+    #[test]
+    fn confirm_managed_draft_accepts_the_drift_shown_in_its_preview() {
+        with_test_home(|state| {
+            let definition = seed_open_code_and_openclaw_definition(state);
+            let initial_preview = preview_apply(
+                state,
+                &definition.id,
+                vec!["opencode".to_string(), "openclaw".to_string()],
+            )
+            .expect("preview initial projections");
+            let initial = apply_transaction(
+                state,
+                &definition.id,
+                vec!["opencode".to_string(), "openclaw".to_string()],
+                &initial_preview.token,
+                Some("apply-before-managed-drift-edit"),
+            )
+            .expect("apply initial projections");
+            assert_eq!(initial.status, "applied");
+
+            // Reproduce a stale pending binding left by an interrupted/rolled
+            // back projection: the expected fingerprint remains, while the
+            // projected provider row is missing.
+            let projected_id = projected_provider_id(&definition, "opencode");
+            state
+                .db
+                .delete_provider("opencode", &projected_id)
+                .expect("remove projected provider");
+
+            let provider = Provider::with_id(
+                projected_id,
+                "Updated Shared Name".to_string(),
+                json!({
+                    "options": {
+                        "baseURL": "https://api.example.test/v1",
+                        "apiKey": "test-secret-key"
+                    }
+                }),
+                None,
+            );
+            let input = ManagedProviderDraftInput {
+                app_type: "opencode".to_string(),
+                provider,
+                definition_id: definition.id.clone(),
+                expected_revision: Some(definition.revision),
+                target_app_types: vec!["opencode".to_string(), "openclaw".to_string()],
+            };
+
+            let edit_preview =
+                preview_managed_draft(state, input.clone()).expect("preview drifted edit");
+            assert!(edit_preview
+                .targets
+                .iter()
+                .any(|target| target.app_type == "opencode" && target.drifted));
+
+            let transaction = confirm_managed_draft(
+                state,
+                input,
+                &edit_preview.token,
+                Some("confirm-managed-drift-edit"),
+            )
+            .expect("explicitly confirmed drift should be applied");
+
+            assert_eq!(transaction.status, "applied");
+            assert!(state
+                .db
+                .get_provider_by_id(&projected_provider_id(&definition, "opencode"), "opencode")
+                .expect("query repaired projection")
+                .is_some());
         });
     }
 
@@ -5506,13 +5714,28 @@ mod tests {
 
     #[test]
     fn claude_desktop_rejects_incompatible_protocols() {
-        // Claude Desktop × openai-chat is now Proxy-compatible (via local route transform).
-        assert!(projection(
+        // Claude Desktop uses the local Anthropic gateway for non-native protocols.
+        let desktop_proxy = projection(
             &definition("openai-chat"),
             "sk-secret".to_string(),
-            "claude-desktop"
+            "claude-desktop",
         )
-        .is_ok());
+        .expect("Claude Desktop supports OpenAI Chat through the local proxy");
+        assert_eq!(
+            desktop_proxy
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.claude_desktop_mode.as_ref()),
+            Some(&crate::provider::ClaudeDesktopMode::Proxy)
+        );
+        assert!(!desktop_proxy
+            .meta
+            .as_ref()
+            .expect("proxy metadata")
+            .claude_desktop_model_routes
+            .is_empty());
+        crate::claude_desktop_config::validate_provider(&desktop_proxy)
+            .expect("projected proxy provider must pass the real Desktop validator");
         assert!(projection(
             &definition("anthropic"),
             "sk-secret".to_string(),

@@ -141,8 +141,8 @@ pub struct CodexDesktopStatus {
     path: Option<String>,
 }
 
-pub(super) const VALID_TOOLS: [&str; 9] = [
-    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "dsh",
+pub(super) const VALID_TOOLS: [&str; 10] = [
+    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "dsh", "qoder",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1166,6 +1166,7 @@ pub(super) fn tool_display_name(tool: &str) -> &'static str {
         "hermes" => "Hermes",
         "pi" => "Pi",
         "dsh" => "DeepSeek Harness",
+        "qoder" => "Qoder",
         _ => "Unknown",
     }
 }
@@ -1248,6 +1249,7 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "openclaw" => Some("npm i -g openclaw@latest"),
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
         "dsh" => Some("npm i -g @deepseek-ai/dsh@latest"),
+        "qoder" => Some("npm i -g @qoder-ai/qodercli@latest"),
         _ => None,
     }
 }
@@ -3275,6 +3277,7 @@ pub(super) fn npm_package_for(tool: &str) -> Option<&'static str> {
         "openclaw" => Some("openclaw"),
         "pi" => Some("@earendil-works/pi-coding-agent"),
         "dsh" => Some("@deepseek-ai/dsh"),
+        "qoder" => Some("@qoder-ai/qodercli"),
         _ => None,
     }
 }
@@ -5986,6 +5989,19 @@ mod tests {
         // The verified distribution exposes `pi --version`, but no updater
         // contract is assumed; upgrades stay on the package-manager path.
         assert_eq!(official_update_args("pi"), None);
+    }
+
+    #[test]
+    fn qoder_lifecycle_metadata_matches_official_distribution() {
+        let requested = vec!["unsupported".to_string(), "qoder".to_string()];
+        assert_eq!(normalize_requested_tools(&requested), vec!["qoder"]);
+        assert_eq!(tool_display_name("qoder"), "Qoder");
+        assert_eq!(npm_package_for("qoder"), Some("@qoder-ai/qodercli"));
+        assert_eq!(
+            npm_install_command_for("qoder"),
+            Some("npm i -g @qoder-ai/qodercli@latest")
+        );
+        assert_eq!(official_update_args("qoder"), None);
     }
 
     #[test]

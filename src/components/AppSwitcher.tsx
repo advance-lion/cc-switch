@@ -2,7 +2,11 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import type { VisibleApps } from "@/types";
-import { ProviderIcon } from "@/components/ProviderIcon";
+import {
+  AgentIcon,
+  getAgentVisual,
+  useAgentVisualRegistryRevision,
+} from "@/components/AgentIcon";
 import {
   Popover,
   PopoverContent,
@@ -11,6 +15,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Monitor, MoreHorizontal, Plus, Terminal } from "lucide-react";
 import { APP_IDS } from "@/config/appConfig";
+import type { ManagedAgent } from "@/lib/managedAgents";
 
 const APP_BADGE_ICON: Partial<
   Record<AppId, { icon: typeof Terminal; offsetY?: number }>
@@ -22,6 +27,9 @@ const APP_BADGE_ICON: Partial<
 interface AppSwitcherProps {
   activeApp: AppId;
   onSwitch: (app: AppId) => void;
+  managedAgents?: ManagedAgent[];
+  activeManagedAgentId?: string | null;
+  onSwitchManagedAgent?: (agentId: string) => void;
   visibleApps?: VisibleApps;
   /** Opens the controlled Codex-assisted custom-Agent flow. */
   onAddCustomAgent?: () => void;
@@ -29,43 +37,13 @@ interface AppSwitcherProps {
 
 const STORAGE_KEY = "cc-switch-last-app";
 
-const APP_ICON_NAME: Record<AppId, string> = {
-  claude: "claude",
-  "claude-desktop": "claude",
-  codex: "openai",
-  gemini: "gemini",
-  grokbuild: "grok",
-  opencode: "opencode",
-  openclaw: "openclaw",
-  hermes: "hermes",
-  pi: "pi",
-  dsh: "dsh",
-};
-
-const APP_DISPLAY_NAME: Record<AppId, string> = {
-  claude: "Claude Code",
-  "claude-desktop": "Claude Desktop",
-  codex: "Codex",
-  gemini: "Gemini",
-  grokbuild: "Grok Build",
-  opencode: "OpenCode",
-  openclaw: "OpenClaw",
-  hermes: "Hermes",
-  pi: "Pi",
-  dsh: "DSH",
-};
-
 /** 应用图标 + 角标（Claude Code / Desktop 用角标区分终端与桌面） */
-function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
-  const badgeConfig = APP_BADGE_ICON[app];
+function AppGlyph({ app, isActive }: { app: string; isActive: boolean }) {
+  const badgeConfig = APP_BADGE_ICON[app as AppId];
   const BadgeIcon = badgeConfig?.icon;
   return (
     <span className="relative inline-flex shrink-0">
-      <ProviderIcon
-        icon={APP_ICON_NAME[app]}
-        name={APP_DISPLAY_NAME[app]}
-        size={20}
-      />
+      <AgentIcon agentId={app} size={20} />
       {BadgeIcon && (
         <span
           className={cn(
@@ -94,24 +72,42 @@ function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
 export function AppSwitcher({
   activeApp,
   onSwitch,
+  managedAgents = [],
+  activeManagedAgentId,
+  onSwitchManagedAgent,
   visibleApps,
   onAddCustomAgent,
 }: AppSwitcherProps) {
   const { t } = useTranslation();
+  useAgentVisualRegistryRevision();
   const rootRef = useRef<HTMLDivElement>(null);
   const [moreOpen, setMoreOpen] = useState(false);
 
-  const handleSwitch = (app: AppId) => {
-    if (app === activeApp) return;
+  const managedAgentIds = new Set(managedAgents.map((agent) => agent.id));
+  const selectedAgentId = activeManagedAgentId ?? activeApp;
+
+  const handleSwitch = (app: string) => {
+    if (app === selectedAgentId) return;
+    if (managedAgentIds.has(app)) {
+      localStorage.setItem(STORAGE_KEY, `managed:${app}`);
+      onSwitchManagedAgent?.(app);
+      return;
+    }
     localStorage.setItem(STORAGE_KEY, app);
-    onSwitch(app);
+    onSwitch(app as AppId);
   };
 
   // Filter apps based on visibility settings (default all visible)
-  const appsToShow = APP_IDS.filter((app) => {
+  const builtinApps = APP_IDS.filter((app) => {
     if (!visibleApps) return true;
     return visibleApps[app];
   });
+  const appsToShow = [
+    ...builtinApps,
+    ...managedAgents
+      .map((agent) => agent.id)
+      .filter((id) => !APP_IDS.includes(id as AppId)),
+  ];
   const appCount = appsToShow.length;
 
   const [visibleCount, setVisibleCount] = useState(appCount);
@@ -158,8 +154,11 @@ export function AppSwitcher({
 
   const visibleList = appsToShow.slice(0, Math.max(1, visibleCount));
   // 激活应用被收进溢出区时，顶替最后一个可见位，保证始终可点亮
-  if (appsToShow.includes(activeApp) && !visibleList.includes(activeApp)) {
-    visibleList[visibleList.length - 1] = activeApp;
+  if (
+    appsToShow.includes(selectedAgentId) &&
+    !visibleList.includes(selectedAgentId)
+  ) {
+    visibleList[visibleList.length - 1] = selectedAgentId;
   }
   const overflowList = appsToShow.filter((app) => !visibleList.includes(app));
 
@@ -170,14 +169,14 @@ export function AppSwitcher({
       style={{ WebkitAppRegion: "no-drag" } as any}
     >
       {visibleList.map((app) => {
-        const isActive = activeApp === app;
+        const isActive = selectedAgentId === app;
         return (
           <button
             key={app}
             type="button"
             onClick={() => handleSwitch(app)}
-            title={APP_DISPLAY_NAME[app]}
-            aria-label={APP_DISPLAY_NAME[app]}
+            title={getAgentVisual(app).shortLabel}
+            aria-label={getAgentVisual(app).shortLabel}
             className={cn(
               "group inline-flex items-center px-3 h-8 rounded-md text-sm font-medium transition-all duration-200",
               isActive
@@ -222,7 +221,7 @@ export function AppSwitcher({
               className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
               <AppGlyph app={app} isActive={false} />
-              <span className="truncate">{APP_DISPLAY_NAME[app]}</span>
+              <span className="truncate">{getAgentVisual(app).shortLabel}</span>
             </button>
           ))}
           <div

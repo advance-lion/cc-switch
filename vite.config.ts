@@ -378,12 +378,13 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
 
   const probeToolVersion = async (
     executable: string,
+    args: string[] = ["--version"],
     cwd?: string,
     env?: NodeJS.ProcessEnv,
   ) => {
     return await new Promise<{ success: boolean; output: string }>(
       (resolve) => {
-        const child = spawn(executable, ["--version"], {
+        const child = spawn(executable, args, {
           cwd,
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
@@ -451,6 +452,35 @@ if ($null -eq $pkg) { Write-Output 'null'; exit 0 }
               version: result.output || null,
             });
           })();
+          return;
+        }
+        if (
+          request.method === "GET" &&
+          route === `${WEB_ASSISTANT_BASE}/tool-status`
+        ) {
+          const tool = requestUrl.searchParams.get("tool");
+          if (tool !== "codex" && tool !== "qoder") {
+            return sendJson(response, 400, {
+              error: `Unsupported managed tool: ${String(tool ?? "")}`,
+            });
+          }
+          void (async () => {
+            const result =
+              process.platform === "win32" && tool === "qoder"
+                ? await probeToolVersion("cmd.exe", [
+                    "/D",
+                    "/S",
+                    "/C",
+                    "qoder --version",
+                  ])
+                : await probeToolVersion(tool);
+            sendJson(response, 200, {
+              available: result.success,
+              version: result.output || null,
+            });
+          })().catch(() =>
+            sendJson(response, 200, { available: false, version: null }),
+          );
           return;
         }
         if (

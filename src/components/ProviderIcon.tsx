@@ -17,6 +17,10 @@ interface ProviderIconProps {
   showFallback?: boolean; // 是否显示 fallback
 }
 
+function isDirectImageUrl(icon: string): boolean {
+  return /^(?:https?:\/\/|data:image\/|blob:|asset:|tauri:|\/)/i.test(icon);
+}
+
 export const ProviderIcon: React.FC<ProviderIconProps> = ({
   icon,
   name,
@@ -35,9 +39,9 @@ export const ProviderIcon: React.FC<ProviderIconProps> = ({
 
   // 获取图标 URL（URL_ICONS 列表中的 SVG / 光栅图片）
   const iconUrl = useMemo(() => {
-    if (icon && isUrlIcon(icon)) {
-      return getIconUrl(icon);
-    }
+    if (!icon) return "";
+    if (isUrlIcon(icon)) return getIconUrl(icon);
+    if (isDirectImageUrl(icon)) return icon;
     return "";
   }, [icon]);
 

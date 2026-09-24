@@ -354,6 +354,20 @@ export const iconMetadata: Record<string, IconMetadata> = {
     keywords: ["deep", "seek"],
     defaultColor: "#1E88E5",
   },
+  dsh: {
+    name: "dsh",
+    displayName: "DeepSeek Harness",
+    category: "tool",
+    keywords: ["dsh", "deepseek", "harness", "agent"],
+    defaultColor: "currentColor",
+  },
+  qoder: {
+    name: "qoder",
+    displayName: "Qoder",
+    category: "tool",
+    keywords: ["qoder", "qodercli", "agent", "cli"],
+    defaultColor: "currentColor",
+  },
   doubao: {
     name: "doubao",
     displayName: "doubao",

@@ -1095,8 +1095,17 @@
   "appSwitcher": {
     "more": "更多应用",
     "addCustomAgent": "添加自定义 Agent",
-    "addCustomAgentHint": "询问 Codex 如何添加",
+    "addCustomAgentHint": "安装后自动检测并加入统一维护",
     "customAgentExecutorPending": "可以先询问 Codex；任何实际操作都会在执行前请求确认。"
+  },
+  "managedAgent": {
+    "title": "{{app}} 统一维护",
+    "autoDetected": "已自动接入",
+    "description": "已从本机安装中检测到此 Agent；版本与生命周期由 CC Switch 统一维护。",
+    "cliDescription": "官方命令行包：{{package}}",
+    "providerTitle": "模型与 Provider",
+    "notIntegrated": "尚未接入",
+    "providerPendingDescription": "当前只接管 {{app}} 的安装、版本与启动。Provider 配置仍由该 Agent 自己维护，避免写入未经验证的配置格式。"
   },
   "codexAssistant": {
     "open": "打开 Codex 助手",

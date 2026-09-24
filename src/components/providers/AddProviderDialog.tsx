@@ -397,7 +397,16 @@ export function AddProviderDialog({
     const { preview, input } = managedDraftPreview;
     setManagedDraftApplying(true);
     try {
-      await providerCenterApi.confirmManagedDraft(input, preview.token);
+      const result = await providerCenterApi.confirmManagedDraft(
+        input,
+        preview.token,
+      );
+      if (result.status !== "applied") {
+        const failure = result.targets.find(
+          (target) => target.status !== "applied" && target.message,
+        );
+        throw new Error(failure?.message ?? `应用未完成（${result.status}）`);
+      }
       await queryClient.invalidateQueries({
         queryKey: ["providers", appId],
       });

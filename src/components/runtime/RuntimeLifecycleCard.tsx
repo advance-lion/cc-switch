@@ -28,6 +28,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { APP_ICON_MAP } from "@/config/appConfig";
+import { AgentIcon } from "@/components/AgentIcon";
+import type { ManagedAgent } from "@/lib/managedAgents";
 import {
   settingsApi,
   type AppId,
@@ -49,7 +51,8 @@ type RuntimeTool =
   | "openclaw"
   | "hermes"
   | "pi"
-  | "dsh";
+  | "dsh"
+  | "qoder";
 
 type ToolVersion = {
   name: string;
@@ -393,12 +396,14 @@ function CliLifecycleRow({
   subtitle,
   refreshRequestId,
   onAiInstall,
+  onLifecycleChanged,
 }: {
   tool: RuntimeTool;
   title: string;
   subtitle: string;
   refreshRequestId: number;
   onAiInstall?: () => void;
+  onLifecycleChanged?: () => void;
 }) {
   const { t } = useTranslation();
   const cached = cliCache.get(tool);
@@ -551,6 +556,7 @@ function CliLifecycleRow({
       }
       const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
       setLastJob(jobs[0] ?? null);
+      onLifecycleChanged?.();
       toast.success(
         t(
           nextAction === "install"
@@ -636,6 +642,7 @@ function CliLifecycleRow({
       setLastJob(jobs[0] ?? null);
       setUninstallOpen(false);
       setUninstallCompletedOpen(true);
+      onLifecycleChanged?.();
     } catch (error) {
       const jobs = await settingsApi.listCliLifecycleJobs(tool).catch(() => []);
       setLastJob(jobs[0] ?? null);
@@ -691,7 +698,9 @@ function CliLifecycleRow({
               : refresh(true))
           }
           onUninstall={() => setUninstallOpen(true)}
-          onRedetect={() => void refresh(false)}
+          onRedetect={() => {
+            void refresh(false).finally(() => onLifecycleChanged?.());
+          }}
           onCancel={activeJobId ? () => void cancelLifecycle() : undefined}
         />
         {tool === "dsh" && installed && !busy && (
@@ -1166,6 +1175,100 @@ export function RuntimeLifecycleCard({
                 }
               />
             )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </section>
+  );
+}
+
+interface ManagedAgentLifecycleCardProps {
+  agent: ManagedAgent;
+  refreshRequestId?: number;
+  onChanged?: () => void;
+}
+
+/**
+ * Lifecycle-only Agent view.  Provider integration is kept explicit so a
+ * newly discovered CLI never inherits another Agent's Provider adapter.
+ */
+export function ManagedAgentLifecycleCard({
+  agent,
+  refreshRequestId = 0,
+  onChanged,
+}: ManagedAgentLifecycleCardProps) {
+  const { t } = useTranslation();
+  const [isExpanded, setIsExpanded] = useState(true);
+
+  return (
+    <section className="sticky top-0 z-20 rounded-2xl border bg-background/95 p-4 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/85">
+      <Collapsible open={isExpanded} onOpenChange={setIsExpanded}>
+        <CollapsibleTrigger
+          className="flex w-full items-start justify-between gap-3 text-left"
+          aria-label={t(
+            isExpanded
+              ? "appLifecycle.collapseDetails"
+              : "appLifecycle.expandDetails",
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border bg-muted/40">
+              <AgentIcon agentId={agent.id} size={20} />
+            </div>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="truncate text-sm font-semibold">
+                  {t("managedAgent.title", { app: agent.name })}
+                </h2>
+                <Badge
+                  variant="outline"
+                  className="border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300"
+                >
+                  {t("managedAgent.autoDetected")}
+                </Badge>
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {t("managedAgent.description")}
+              </p>
+            </div>
+          </div>
+          <ChevronDown
+            className={`mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
+              isExpanded ? "rotate-180" : ""
+            }`}
+            aria-hidden="true"
+          />
+        </CollapsibleTrigger>
+
+        <CollapsibleContent className="pt-3">
+          <div className="space-y-2.5">
+            <CliLifecycleRow
+              tool={agent.tool as RuntimeTool}
+              title={`${agent.name} CLI`}
+              subtitle={t("managedAgent.cliDescription", {
+                package: agent.packageName,
+              })}
+              refreshRequestId={refreshRequestId}
+              onLifecycleChanged={onChanged}
+            />
+            <div className="flex items-start justify-between gap-4 rounded-xl border border-dashed border-amber-500/30 bg-amber-500/[0.045] px-3.5 py-3">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-foreground">
+                  {t("managedAgent.providerTitle")}
+                </p>
+                <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                  {t("managedAgent.providerPendingDescription", {
+                    app: agent.name,
+                  })}
+                </p>
+              </div>
+              <Badge
+                variant="outline"
+                className="shrink-0 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+              >
+                {t("managedAgent.notIntegrated")}
+              </Badge>
+            </div>
           </div>
         </CollapsibleContent>
       </Collapsible>
