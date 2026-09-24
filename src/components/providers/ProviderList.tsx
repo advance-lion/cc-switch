@@ -144,23 +144,29 @@ export function ProviderList({
   // Hermes: 查询 live 配置中的供应商 ID 列表，用于判断 isInConfig
   const { data: hermesLiveIds } = useHermesLiveProviderIds(appId === "hermes");
 
+  const membershipApp =
+    appId === "qoder" || appId === "dsh" ? appId : undefined;
   const {
-    data: dshMembership,
-    isLoading: isDshMembershipLoading,
-    isError: isDshMembershipQueryError,
-    error: dshMembershipQueryError,
+    data: liveMembership,
+    isLoading: isLiveMembershipLoading,
+    isError: isLiveMembershipQueryError,
+    error: liveMembershipQueryError,
   } = useQuery({
-    queryKey: providerLiveMembershipKeys.app("dsh"),
-    queryFn: () => settingsApi.getProviderLiveMembership("dsh"),
-    enabled: appId === "dsh",
-    refetchInterval: appId === "dsh" ? 5000 : false,
+    queryKey: providerLiveMembershipKeys.app(membershipApp ?? "dsh"),
+    queryFn: () =>
+      settingsApi.getProviderLiveMembership(membershipApp ?? "dsh"),
+    enabled: Boolean(membershipApp),
+    refetchInterval: membershipApp ? 5000 : false,
   });
   const dshMembershipUnavailable =
     appId === "dsh" &&
-    (isDshMembershipQueryError || dshMembership?.status === "unavailable");
-  const dshMembershipError = isDshMembershipQueryError
-    ? extractErrorMessage(dshMembershipQueryError)
-    : dshMembership?.error;
+    (isLiveMembershipQueryError || liveMembership?.status === "unavailable");
+  const qoderMembershipUnavailable =
+    appId === "qoder" &&
+    (isLiveMembershipQueryError || liveMembership?.status === "unavailable");
+  const liveMembershipError = isLiveMembershipQueryError
+    ? extractErrorMessage(liveMembershipQueryError)
+    : liveMembership?.error;
   const [isLaunchingDsh, setIsLaunchingDsh] = useState(false);
 
   const handleLaunchDsh = useCallback(async () => {
@@ -206,14 +212,14 @@ export function ProviderList({
       if (appId === "hermes") {
         return hermesLiveIds?.includes(providerId) ?? false;
       }
-      if (appId === "dsh") {
-        return dshMembership?.status === "available"
-          ? dshMembership.providerIds.includes(providerId)
+      if (appId === "qoder" || appId === "dsh") {
+        return liveMembership?.status === "available"
+          ? liveMembership.providerIds.includes(providerId)
           : false;
       }
       return true; // 非累加模式不使用 membership
     },
-    [appId, opencodeLiveIds, openclawLiveIds, hermesLiveIds, dshMembership],
+    [appId, opencodeLiveIds, openclawLiveIds, hermesLiveIds, liveMembership],
   );
 
   // OpenClaw: query default model to determine which provider is default
@@ -507,6 +513,26 @@ export function ProviderList({
         </p>
       </div>
     ) : null;
+  const qoderMembershipNotice = qoderMembershipUnavailable ? (
+    <div
+      role="alert"
+      className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+    >
+      <div className="flex items-center gap-2 font-medium">
+        <AlertTriangle className="h-4 w-4 shrink-0" />
+        {t("qoder.membership.unavailable", {
+          defaultValue: "无法读取 Qoder 当前配置",
+        })}
+      </div>
+      <p className="mt-1 text-xs leading-relaxed">
+        {t("qoder.membership.unavailableHint", {
+          defaultValue:
+            "Qoder settings.json 当前不可读；数据库中的 Provider 已保留，修复配置后才能启用或移除。",
+        })}
+        {liveMembershipError ? ` ${liveMembershipError}` : ""}
+      </p>
+    </div>
+  ) : null;
 
   if (isLoading) {
     return (
@@ -525,6 +551,7 @@ export function ProviderList({
     return (
       <div className="mt-4 space-y-4">
         {piStateErrorNotice}
+        {qoderMembershipNotice}
         {dshMembershipUnavailable && (
           <div
             role="alert"
@@ -541,7 +568,7 @@ export function ProviderList({
                 defaultValue:
                   "DeepSeek Harness 当前不可用；数据库中的 Provider 已保留，启动后才能添加或移除。",
               })}
-              {dshMembershipError ? ` ${dshMembershipError}` : ""}
+              {liveMembershipError ? ` ${liveMembershipError}` : ""}
             </p>
             <Button
               type="button"
@@ -640,12 +667,14 @@ export function ProviderList({
         }
         isStateChangeProtected={
           (appId === "pi" && !isPiAuthoritativeStateReady) ||
-          (appId === "dsh" &&
-            (isDshMembershipLoading || dshMembershipUnavailable))
+          ((appId === "qoder" || appId === "dsh") &&
+            (isLiveMembershipLoading ||
+              dshMembershipUnavailable ||
+              qoderMembershipUnavailable))
         }
         stateChangeHint={
           appId === "dsh"
-            ? isDshMembershipLoading
+            ? isLiveMembershipLoading
               ? t("dsh.membership.loading", {
                   defaultValue: "正在读取 DeepSeek Harness 当前配置",
                 })
@@ -653,7 +682,16 @@ export function ProviderList({
                   defaultValue:
                     "DeepSeek Harness 当前不可用；启动后才能添加或移除 Provider。",
                 })
-            : undefined
+            : appId === "qoder"
+              ? isLiveMembershipLoading
+                ? t("qoder.membership.loading", {
+                    defaultValue: "正在读取 Qoder 当前配置",
+                  })
+                : t("qoder.membership.unavailableHint", {
+                    defaultValue:
+                      "Qoder settings.json 当前不可读；修复配置后才能启用或移除 Provider。",
+                  })
+              : undefined
         }
         managedByProviderCenter={
           catalogItem?.ownership === "providerCenterProjection"
@@ -729,6 +767,7 @@ export function ProviderList({
   return (
     <div className="mt-4 space-y-4">
       {piStateErrorNotice}
+      {qoderMembershipNotice}
       {dshMembershipUnavailable && (
         <div
           role="alert"
@@ -745,7 +784,7 @@ export function ProviderList({
               defaultValue:
                 "DeepSeek Harness 当前不可用；数据库中的 Provider 已保留，启动后才能添加或移除。",
             })}
-            {dshMembershipError ? ` ${dshMembershipError}` : ""}
+            {liveMembershipError ? ` ${liveMembershipError}` : ""}
           </p>
           <Button
             type="button"

@@ -11,6 +11,7 @@ export type ProviderCenterApp =
   | "openclaw"
   | "hermes"
   | "pi"
+  | "qoder"
   | "dsh";
 
 export interface ProviderDefinition {

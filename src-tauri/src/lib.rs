@@ -31,6 +31,7 @@ mod prompt_files;
 mod provider;
 mod provider_center;
 mod proxy;
+mod qoder_config;
 mod secure_store;
 mod services;
 mod session_manager;

@@ -171,7 +171,10 @@ const HEADER_HEIGHT = 64; // px
 const STORAGE_KEY = "cc-switch-last-app";
 const EMPTY_MANAGED_AGENTS: ManagedAgent[] = [];
 const getInitialApp = (): AppId => {
-  const saved = localStorage.getItem(STORAGE_KEY) as AppId | null;
+  const legacySaved = localStorage.getItem(STORAGE_KEY);
+  const saved = (
+    legacySaved === "managed:qoder" ? "qoder" : legacySaved
+  ) as AppId | null;
   if (saved && APP_IDS.includes(saved)) {
     return saved;
   }
@@ -306,7 +309,10 @@ function App() {
 
   // Fallback from sessions view when switching to an app without session support
   useEffect(() => {
-    if (currentView === "mcp" && sharedFeatureApp === "pi") {
+    if (
+      currentView === "mcp" &&
+      (sharedFeatureApp === "pi" || sharedFeatureApp === "qoder")
+    ) {
       setCurrentView("providers");
       return;
     }
@@ -451,7 +457,8 @@ function App() {
       currentView === "openclawAgents");
   const { data: openclawHealthWarnings = [] } =
     useOpenClawHealth(isOpenClawView);
-  const hasSkillsSupport = sharedFeatureApp !== "openclaw";
+  const hasSkillsSupport =
+    sharedFeatureApp !== "openclaw" && sharedFeatureApp !== "qoder";
   const hasSessionSupport =
     sharedFeatureApp === "claude" ||
     sharedFeatureApp === "codex" ||
@@ -461,7 +468,8 @@ function App() {
     sharedFeatureApp === "gemini" ||
     sharedFeatureApp === "hermes" ||
     sharedFeatureApp === "pi";
-  const hasMcpSupport = sharedFeatureApp !== "pi";
+  const hasMcpSupport =
+    sharedFeatureApp !== "pi" && sharedFeatureApp !== "qoder";
 
   const {
     addProvider,
@@ -526,6 +534,19 @@ function App() {
           closeButton: true,
         },
       );
+    }
+  };
+
+  const handleEnableQoderProvider = async (provider: Provider) => {
+    try {
+      await settingsApi.setProviderLiveEnabled("qoder", provider.id, true);
+      await refreshProviderCenterApps(queryClient, ["qoder"]);
+      toast.success("已添加到 Qoder", { closeButton: true });
+    } catch (error) {
+      toast.error("无法添加到 Qoder", {
+        description: extractErrorMessage(error) || undefined,
+        closeButton: true,
+      });
     }
   };
 
@@ -970,8 +991,12 @@ function App() {
       // Remove from live config only (for additive mode apps like OpenCode/OpenClaw)
       // Does NOT delete from database - provider remains in the list
       try {
-        if (activeApp === "dsh") {
-          await settingsApi.setProviderLiveEnabled("dsh", provider.id, false);
+        if (activeApp === "qoder" || activeApp === "dsh") {
+          await settingsApi.setProviderLiveEnabled(
+            activeApp,
+            provider.id,
+            false,
+          );
         } else {
           await providersApi.removeFromLiveConfig(provider.id, activeApp);
         }
@@ -990,8 +1015,8 @@ function App() {
         });
         return;
       }
-      if (activeApp === "dsh") {
-        await refreshProviderCenterApps(queryClient, ["dsh"]);
+      if (activeApp === "qoder" || activeApp === "dsh") {
+        await refreshProviderCenterApps(queryClient, [activeApp]);
       } else if (activeApp === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
@@ -1075,6 +1100,7 @@ function App() {
       activeApp === "openclaw" ||
       activeApp === "hermes" ||
       activeApp === "pi" ||
+      activeApp === "qoder" ||
       activeApp === "dsh"
     ) {
       let liveProviderIds: string[] = [];
@@ -1094,10 +1120,10 @@ function App() {
             queryKey: hermesKeys.liveProviderIds,
             queryFn: () => providersApi.getHermesLiveProviderIds(),
           });
-        } else if (activeApp === "dsh") {
+        } else if (activeApp === "qoder" || activeApp === "dsh") {
           const membership = await queryClient.ensureQueryData({
-            queryKey: providerLiveMembershipKeys.app("dsh"),
-            queryFn: () => settingsApi.getProviderLiveMembership("dsh"),
+            queryKey: providerLiveMembershipKeys.app(activeApp),
+            queryFn: () => settingsApi.getProviderLiveMembership(activeApp),
           });
           liveProviderIds =
             membership.status === "available" ? membership.providerIds : [];
@@ -1428,9 +1454,11 @@ function App() {
                       onSwitch={
                         activeApp === "pi"
                           ? handleEnablePiProvider
-                          : activeApp === "dsh"
-                            ? handleEnableDshProvider
-                            : switchProvider
+                          : activeApp === "qoder"
+                            ? handleEnableQoderProvider
+                            : activeApp === "dsh"
+                              ? handleEnableDshProvider
+                              : switchProvider
                       }
                       onEdit={(provider) => {
                         setEditingProvider(provider);
@@ -1443,6 +1471,7 @@ function App() {
                         activeApp === "openclaw" ||
                         activeApp === "hermes" ||
                         activeApp === "pi" ||
+                        activeApp === "qoder" ||
                         activeApp === "dsh"
                           ? (provider) =>
                               setConfirmAction({ provider, action: "remove" })

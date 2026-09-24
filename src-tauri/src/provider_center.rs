@@ -4582,6 +4582,46 @@ mod tests {
     }
 
     #[test]
+    fn qoder_projection_uses_additive_template_without_implicit_activation() {
+        with_test_home(|state| {
+            let mut input = definition_input(None, None, "https://api.example.test/v1");
+            input.name = "Shared Qoder".to_string();
+            input.app_types = vec!["qoder".to_string()];
+            let definition = save_definition(state, input).expect("seed Qoder definition");
+
+            let preview = preview_apply(state, &definition.id, vec!["qoder".to_string()])
+                .expect("preview Qoder projection");
+            assert_eq!(preview.targets.len(), 1);
+            assert!(preview.targets[0].compatible);
+            assert_eq!(preview.targets[0].connection_mode, "direct");
+
+            let transaction = apply_transaction(
+                state,
+                &definition.id,
+                vec!["qoder".to_string()],
+                &preview.token,
+                Some("qoder-additive-projection"),
+            )
+            .expect("apply Qoder projection");
+            assert_eq!(transaction.status, "applied");
+
+            let projection_id = projected_provider_id(&definition, "qoder");
+            let projected = state
+                .db
+                .get_provider_by_id(&projection_id, "qoder")
+                .expect("query Qoder projection")
+                .expect("Qoder projection exists");
+            assert_eq!(projected.settings_config["protocol"], json!("openai"));
+            assert!(projected.settings_config["models"].is_array());
+            assert!(
+                !crate::qoder_config::qoder_provider_exists(&projection_id)
+                    .expect("query Qoder native membership"),
+                "Provider Center registration must not silently activate an additive provider"
+            );
+        });
+    }
+
+    #[test]
     fn dsh_reapply_existing_live_managed_projection_is_offline_and_preserves_marker() {
         with_test_home(|state| {
             let mut input = definition_input(None, None, "https://api.example.test/v1");

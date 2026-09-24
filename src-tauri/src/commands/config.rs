@@ -146,6 +146,15 @@ pub async fn get_config_status(
                 path,
             })
         }
+        AppType::Qoder => {
+            let config_path = crate::qoder_config::get_qoder_settings_path();
+            Ok(ConfigStatus {
+                exists: config_path.exists(),
+                path: crate::qoder_config::get_qoder_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            })
+        }
         AppType::DeepSeekHarness => Ok(ConfigStatus {
             exists: false,
             path: String::new(),
@@ -172,6 +181,7 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
+        AppType::Qoder => crate::qoder_config::get_qoder_dir(),
         AppType::DeepSeekHarness => {
             return Err("DeepSeekHarness has no config directory".to_string())
         }
@@ -194,6 +204,7 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
+        AppType::Qoder => crate::qoder_config::get_qoder_dir(),
         AppType::DeepSeekHarness => {
             return Err("DeepSeekHarness has no config directory".to_string())
         }

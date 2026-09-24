@@ -71,6 +71,7 @@ const TOOL_BY_APP: Partial<Record<AppId, RuntimeTool>> = {
   openclaw: "openclaw",
   hermes: "hermes",
   pi: "pi",
+  qoder: "qoder",
   dsh: "dsh",
 };
 

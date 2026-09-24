@@ -142,6 +142,10 @@ impl ConfigService {
                 // Pi owns its shared models/settings documents; this legacy
                 // single-provider live-sync path must not rewrite them.
             }
+            AppType::Qoder => {
+                // Qoder uses additive provider membership and is synchronized
+                // directly by the Qoder provider service.
+            }
             AppType::DeepSeekHarness => {
                 // DSH has no live config writing
             }

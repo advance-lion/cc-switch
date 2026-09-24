@@ -128,8 +128,9 @@ SQLite at <app_config_dir>/ccswitch.db. Key tables:
 - After an installation, always verify the real executable with `<command> --version`.
 - CC Switch rescans its managed-Agent adapters after every successful assistant turn.
 - Qoder is registered as the `qoder` runtime and must be installed from the official
-  `@qoder-ai/qodercli` package. Its lifecycle is managed here, but its Provider
-  projection is not yet supported; never claim that Provider settings were synced.
+  `@qoder-ai/qodercli` package. It uses the additive Provider template: multiple
+  Provider entries coexist under `~/.qoder/settings.json` → `providers`, and CC Switch
+  manages installation, updates, uninstall, launch, native import, and Provider projection.
 - For an Agent without a managed adapter, state plainly that installation succeeded
   but CC Switch integration still needs an adapter. Do not describe it as registered.
 

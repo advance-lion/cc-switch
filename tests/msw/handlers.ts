@@ -14,6 +14,7 @@ import {
   listSessions,
   resetProviderState,
   setCurrentProviderId,
+  setLiveProviderIds,
   updateProvider,
   updateSortOrder,
   getSettings,
@@ -93,6 +94,33 @@ export const handlers = [
 
   http.post(`${TAURI_ENDPOINT}/get_openclaw_default_model`, () =>
     success({ primary: null, fallback: [] }),
+  ),
+
+  http.post(
+    `${TAURI_ENDPOINT}/get_provider_live_membership`,
+    async ({ request }) => {
+      const { app } = await withJson<{ app: "qoder" | "dsh" }>(request);
+      return success({
+        status: "available",
+        providerIds: getLiveProviderIds(app),
+      });
+    },
+  ),
+
+  http.post(
+    `${TAURI_ENDPOINT}/set_provider_live_enabled`,
+    async ({ request }) => {
+      const { app, providerId, enabled } = await withJson<{
+        app: "qoder" | "dsh";
+        providerId: string;
+        enabled: boolean;
+      }>(request);
+      const providerIds = new Set(getLiveProviderIds(app));
+      if (enabled) providerIds.add(providerId);
+      else providerIds.delete(providerId);
+      setLiveProviderIds(app, [...providerIds]);
+      return success({ status: "available", providerIds: [...providerIds] });
+    },
   ),
 
   http.post(`${TAURI_ENDPOINT}/scan_openclaw_config_health`, () => success([])),

@@ -87,6 +87,7 @@ import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { PiProviderForm } from "./PiProviderForm";
 import { DshProviderForm } from "./DshProviderForm";
+import { QoderProviderForm } from "./QoderProviderForm";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
@@ -279,6 +280,9 @@ export function ProviderForm(props: ProviderFormProps) {
   }
   if (props.appId === "pi") {
     return <PiProviderForm {...props} />;
+  }
+  if (props.appId === "qoder") {
+    return <QoderProviderForm {...props} />;
   }
   if (props.appId === "claude-desktop") {
     return <ClaudeDesktopProviderForm {...props} />;

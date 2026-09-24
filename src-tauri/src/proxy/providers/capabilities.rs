@@ -57,7 +57,7 @@ pub mod route {
 ///
 /// `target_agent` uses `AppType::as_str()` values:
 /// `claude`, `claude-desktop`, `codex`, `gemini`, `grokbuild`,
-/// `opencode`, `openclaw`, `hermes`, `pi`.
+/// `opencode`, `openclaw`, `hermes`, `pi`, `qoder`.
 pub fn resolve_compatibility(upstream_protocol: &str, target_agent: &str) -> Compatibility {
     let proto = normalize_protocol(upstream_protocol);
     let agent = target_agent.trim().to_lowercase();
@@ -106,6 +106,10 @@ pub fn resolve_compatibility(upstream_protocol: &str, target_agent: &str) -> Com
 
         // ── Pi (universal) ───────────────────────────────────────────
         ("pi", _) => Compatibility::Direct,
+
+        // ── Qoder ────────────────────────────────────────────────────
+        // Qoder custom providers natively expose these three protocols.
+        ("qoder", "openai-chat" | "openai-responses" | "anthropic") => Compatibility::Direct,
 
         // ── DeepSeek Harness ─────────────────────────────────────────────
         // Hand-declared llm-pi-ai providers support these three native APIs.
@@ -292,6 +296,21 @@ mod tests {
                 "pi should be direct for {proto}"
             );
         }
+    }
+
+    #[test]
+    fn qoder_supports_its_three_native_protocols() {
+        for proto in &["openai-chat", "openai-responses", "anthropic"] {
+            assert_eq!(
+                resolve_compatibility(proto, "qoder"),
+                Compatibility::Direct,
+                "qoder should be direct for {proto}"
+            );
+        }
+        assert!(matches!(
+            resolve_compatibility("gemini", "qoder"),
+            Compatibility::Unsupported { .. }
+        ));
     }
 
     #[test]

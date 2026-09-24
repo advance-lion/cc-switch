@@ -10,6 +10,7 @@ export const PROVIDER_CENTER_APPS: ProviderCenterApp[] = [
   "openclaw",
   "hermes",
   "pi",
+  "qoder",
   "dsh",
 ];
 
@@ -23,6 +24,7 @@ export const PROVIDER_CENTER_APP_LABELS: Record<ProviderCenterApp, string> = {
   openclaw: "OpenClaw",
   hermes: "Hermes",
   pi: "Pi",
+  qoder: "Qoder",
   dsh: "DeepSeek Harness",
 };
 

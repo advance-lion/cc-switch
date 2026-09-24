@@ -56,6 +56,7 @@ const protocolsByApp: Record<AppId, readonly string[]> = {
   ],
   hermes: ["openai-chat", "ollama"],
   pi: ["openai-chat", "openai-responses", "anthropic", "gemini", "ollama"],
+  qoder: ["openai-chat", "openai-responses", "anthropic"],
   dsh: ["openai-chat", "openai-responses", "anthropic", "ollama"],
 };
 
@@ -69,6 +70,7 @@ const defaultProtocolByApp: Record<AppId, string> = {
   openclaw: "openai-chat",
   hermes: "openai-chat",
   pi: "openai-chat",
+  qoder: "openai-chat",
   dsh: "openai-chat",
 };
 

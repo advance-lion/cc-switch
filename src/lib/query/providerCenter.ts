@@ -68,7 +68,7 @@ export async function refreshProviderCenterApps(
       invalidations.push(
         queryClient.invalidateQueries({ queryKey: piKeys.currentState }),
       );
-    } else if (appId === "dsh") {
+    } else if (appId === "qoder" || appId === "dsh") {
       invalidations.push(
         queryClient.invalidateQueries({
           queryKey: providerLiveMembershipKeys.app(appId),

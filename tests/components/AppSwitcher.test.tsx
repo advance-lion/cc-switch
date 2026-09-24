@@ -5,13 +5,13 @@ import { AppSwitcher } from "@/components/AppSwitcher";
 import { DEFAULT_VISIBLE_APPS } from "@/config/appConfig";
 import type { ManagedAgent } from "@/lib/managedAgents";
 
-const qoder: ManagedAgent = {
-  id: "qoder",
-  tool: "qoder",
-  name: "Qoder",
-  shortLabel: "Qoder",
-  icon: "qoder",
-  packageName: "@qoder-ai/qodercli",
+const customAgent: ManagedAgent = {
+  id: "custom-agent",
+  tool: "custom-agent",
+  name: "Custom Agent",
+  shortLabel: "Custom Agent",
+  icon: "custom-agent",
+  packageName: "@example/custom-agent",
   version: "1.1.62",
   installedButBroken: false,
   error: null,
@@ -26,13 +26,15 @@ describe("AppSwitcher managed Agents", () => {
         activeApp="claude"
         onSwitch={vi.fn()}
         visibleApps={DEFAULT_VISIBLE_APPS}
-        managedAgents={[qoder]}
+        managedAgents={[customAgent]}
         onSwitchManagedAgent={onSwitchManagedAgent}
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Qoder" }));
-    expect(onSwitchManagedAgent).toHaveBeenCalledWith("qoder");
-    expect(localStorage.getItem("cc-switch-last-app")).toBe("managed:qoder");
+    await userEvent.click(screen.getByRole("button", { name: "Custom Agent" }));
+    expect(onSwitchManagedAgent).toHaveBeenCalledWith("custom-agent");
+    expect(localStorage.getItem("cc-switch-last-app")).toBe(
+      "managed:custom-agent",
+    );
   });
 });

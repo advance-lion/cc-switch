@@ -157,6 +157,11 @@ pub(crate) fn build_provider_from_request(
                 "Pi providers must be added from the Pi provider page".to_string(),
             ));
         }
+        AppType::Qoder => {
+            return Err(AppError::InvalidInput(
+                "Qoder providers must be added from the Qoder provider page".to_string(),
+            ));
+        }
         AppType::DeepSeekHarness => {
             return Err(AppError::InvalidInput(
                 "DeepSeekHarness has no provider management".to_string(),

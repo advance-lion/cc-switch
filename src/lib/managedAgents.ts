@@ -24,17 +24,7 @@ type ManagedAgentAdapter = Omit<
  * Provider/config adapter”.  Adding a lifecycle-only Agent must not make the
  * Provider UI write another application's config by accident.
  */
-export const MANAGED_AGENT_ADAPTERS: readonly ManagedAgentAdapter[] = [
-  {
-    id: "qoder",
-    tool: "qoder",
-    name: "Qoder",
-    shortLabel: "Qoder",
-    icon: "qoder",
-    packageName: "@qoder-ai/qodercli",
-    providerIntegration: "planned",
-  },
-] as const;
+export const MANAGED_AGENT_ADAPTERS: readonly ManagedAgentAdapter[] = [];
 
 /** Detect installed, runnable Agents that have a lifecycle adapter. */
 export async function discoverManagedAgents(): Promise<ManagedAgent[]> {

@@ -172,6 +172,7 @@ export function AddProviderDialog({
           appId === "openclaw" ||
           appId === "hermes" ||
           appId === "pi" ||
+          appId === "qoder" ||
           appId === "dsh") &&
         values.providerKey
       ) {
@@ -297,6 +298,10 @@ export function AddProviderDialog({
         } else if (appId === "hermes") {
           if (parsedConfig.base_url) {
             addUrl(parsedConfig.base_url as string);
+          }
+        } else if (appId === "qoder") {
+          if (parsedConfig.baseUrl) {
+            addUrl(parsedConfig.baseUrl as string);
           }
         }
 

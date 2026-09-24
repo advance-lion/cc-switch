@@ -6,11 +6,9 @@ import {
   ChevronRight,
   CircleAlert,
   CircleStop,
-  FilePenLine,
   Loader2,
   MessageCircle,
   Send,
-  ShieldAlert,
   Terminal,
   X,
 } from "lucide-react";
@@ -23,8 +21,6 @@ import { cn } from "@/lib/utils";
 import {
   isCodexAssistantWebBridgeActive,
   settingsApi,
-  type CodexAssistantApproval,
-  type CodexAssistantApprovalDecision,
   type CodexAssistantChatTurn,
 } from "@/lib/api";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -88,141 +84,7 @@ interface CodexAssistantDockProps {
   openRequestId?: number;
 }
 
-function ApprovalCard({
-  approval,
-  responding,
-  onRespond,
-}: {
-  approval: CodexAssistantApproval;
-  responding: boolean;
-  onRespond: (decision: CodexAssistantApprovalDecision) => void;
-}) {
-  const { t } = useTranslation();
-  const isCommand = approval.type === "command";
-  const supports = (decision: CodexAssistantApprovalDecision) =>
-    approval.availableDecisions.includes(decision);
-
-  return (
-    <div
-      className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/[0.055] p-3"
-      data-testid={`codex-approval-${approval.id}`}
-    >
-      <div className="flex items-start gap-2.5">
-        <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-amber-500/15 text-amber-700 dark:text-amber-200">
-          {isCommand ? (
-            <Terminal className="h-3.5 w-3.5" />
-          ) : (
-            <FilePenLine className="h-3.5 w-3.5" />
-          )}
-        </span>
-        <div className="min-w-0">
-          <p className="text-sm font-semibold">
-            {isCommand
-              ? t("codexAssistant.commandApproval", {
-                  defaultValue: "Command approval",
-                })
-              : t("codexAssistant.fileApproval", {
-                  defaultValue: "File change approval",
-                })}
-          </p>
-          {approval.reason && (
-            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-              {approval.reason}
-            </p>
-          )}
-        </div>
-      </div>
-
-      {approval.command && (
-        <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border/70 bg-background/70 px-2.5 py-2 font-mono text-[11px] leading-relaxed">
-          {approval.command}
-        </pre>
-      )}
-
-      <dl className="space-y-1 text-[11px] text-muted-foreground">
-        {approval.cwd && (
-          <div className="flex gap-2">
-            <dt className="shrink-0 font-medium text-foreground/80">
-              {t("codexAssistant.workingDirectory", {
-                defaultValue: "Working directory",
-              })}
-            </dt>
-            <dd className="min-w-0 break-all">{approval.cwd}</dd>
-          </div>
-        )}
-        {approval.networkHost && (
-          <div className="flex gap-2">
-            <dt className="shrink-0 font-medium text-foreground/80">
-              {t("codexAssistant.networkHost", { defaultValue: "Network" })}
-            </dt>
-            <dd className="min-w-0 break-all">{approval.networkHost}</dd>
-          </div>
-        )}
-        {approval.grantRoot && (
-          <div className="flex gap-2">
-            <dt className="shrink-0 font-medium text-foreground/80">
-              {t("codexAssistant.grantRoot", { defaultValue: "Write access" })}
-            </dt>
-            <dd className="min-w-0 break-all">{approval.grantRoot}</dd>
-          </div>
-        )}
-      </dl>
-
-      <div className="flex flex-wrap justify-end gap-2">
-        {supports("cancel") && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={responding}
-            onClick={() => onRespond("cancel")}
-          >
-            {t("codexAssistant.cancelApproval", {
-              defaultValue: "Cancel task",
-            })}
-          </Button>
-        )}
-        {supports("decline") && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={responding}
-            onClick={() => onRespond("decline")}
-          >
-            {t("codexAssistant.declineApproval", { defaultValue: "Deny" })}
-          </Button>
-        )}
-        {supports("accept") && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={responding}
-            onClick={() => onRespond("accept")}
-          >
-            {t("codexAssistant.approveOnce", { defaultValue: "Allow once" })}
-          </Button>
-        )}
-        {approval.allowForSession && supports("acceptForSession") && (
-          <Button
-            type="button"
-            size="sm"
-            disabled={responding}
-            onClick={() => onRespond("acceptForSession")}
-          >
-            {responding && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {t("codexAssistant.approveForSession", {
-              defaultValue: "Allow for session",
-            })}
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** A persistent Codex app-server conversation with explicit approval prompts. */
+/** A persistent Codex CLI conversation. */
 export function CodexAssistantDock({
   providerReady,
   onOpenCodexConfiguration,
@@ -244,10 +106,6 @@ export function CodexAssistantDock({
   const [installing, setInstalling] = useState(false);
   const [request, setRequest] = useState("");
   const [logs, setLogs] = useState<string[]>([]);
-  const [approvals, setApprovals] = useState<CodexAssistantApproval[]>([]);
-  const [respondingApprovalIds, setRespondingApprovalIds] = useState<
-    Set<string>
-  >(new Set());
   const [runError, setRunError] = useState<string | null>(null);
   const [startingSession, setStartingSession] = useState(false);
   const [running, setRunning] = useState(false);
@@ -394,13 +252,14 @@ export function CodexAssistantDock({
             if (event.message) appendLog(`stderr · ${event.message}`);
             return;
           case "disconnected":
-            // Keep the session alive: the backend preserves thread_id for
-            // resume, so the user can retry without losing context.
+            // The app-server process is gone, so this session id can no
+            // longer accept messages. Preserve the rendered conversation,
+            // but create a fresh backend session on the next send.
+            sessionIdRef.current = null;
+            setSessionId(null);
             streamAssistantMessageRef.current = false;
             setRunning(false);
             setStopping(false);
-            setApprovals([]);
-            setRespondingApprovalIds(new Set());
             setRunError(event.message);
             toast.error(t("codexAssistant.runFailed"), {
               description: event.message,
@@ -427,19 +286,11 @@ export function CodexAssistantDock({
               });
             }
             return;
-          case "approval":
-            setApprovals((current) => [
-              ...current.filter((item) => item.id !== event.approval.id),
-              event.approval,
-            ]);
-            return;
           case "finished":
             if (!openRef.current) setHasUnread(true);
             streamAssistantMessageRef.current = false;
             setRunning(false);
             setStopping(false);
-            setApprovals([]);
-            setRespondingApprovalIds(new Set());
             if (!event.success && !event.cancelled) {
               const message = event.message || t("codexAssistant.runFailed");
               setRunError(message);
@@ -541,38 +392,6 @@ export function CodexAssistantDock({
     }
   };
 
-  const respondToApproval = async (
-    approvalId: string,
-    decision: CodexAssistantApprovalDecision,
-  ) => {
-    const activeSessionId = sessionIdRef.current;
-    if (!activeSessionId || respondingApprovalIds.has(approvalId)) return;
-    setRespondingApprovalIds((current) => new Set(current).add(approvalId));
-    try {
-      await settingsApi.respondCodexAssistantApproval(
-        activeSessionId,
-        approvalId,
-        decision,
-      );
-      setApprovals((current) =>
-        current.filter((approval) => approval.id !== approvalId),
-      );
-    } catch (error) {
-      toast.error(
-        t("codexAssistant.approvalFailed", {
-          defaultValue: "Could not send the approval decision",
-        }),
-        { description: extractErrorMessage(error) || undefined },
-      );
-    } finally {
-      setRespondingApprovalIds((current) => {
-        const next = new Set(current);
-        next.delete(approvalId);
-        return next;
-      });
-    }
-  };
-
   const cancelRun = async () => {
     const activeSessionId = sessionIdRef.current;
     if (!activeSessionId || stopping) return;
@@ -595,8 +414,6 @@ export function CodexAssistantDock({
     streamAssistantMessageRef.current = false;
     setRunning(false);
     setStopping(false);
-    setApprovals([]);
-    setRespondingApprovalIds(new Set());
     if (activeSessionId) {
       void settingsApi
         .closeCodexAssistantSession(activeSessionId)
@@ -684,8 +501,7 @@ export function CodexAssistantDock({
   };
 
   const closeAssistant = () => {
-    // Only hide the panel - the backend session stays alive so running
-    // tasks continue in the background and the user can reopen later.
+    closeSession();
     setOpen(false);
     onDismiss?.();
   };
@@ -914,27 +730,6 @@ export function CodexAssistantDock({
                 ))
               )}
             </div>
-
-            {approvals.length > 0 && (
-              <div className="space-y-2" aria-live="assertive">
-                <p className="flex items-center gap-1.5 px-1 text-xs font-medium text-amber-700 dark:text-amber-200">
-                  <ShieldAlert className="h-3.5 w-3.5" />
-                  {t("codexAssistant.approvalRequired", {
-                    defaultValue: "Your approval is required",
-                  })}
-                </p>
-                {approvals.map((approval) => (
-                  <ApprovalCard
-                    key={approval.id}
-                    approval={approval}
-                    responding={respondingApprovalIds.has(approval.id)}
-                    onRespond={(decision) =>
-                      void respondToApproval(approval.id, decision)
-                    }
-                  />
-                ))}
-              </div>
-            )}
 
             <div className="rounded-xl border border-border bg-card p-3">
               <Input

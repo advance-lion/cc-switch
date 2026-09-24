@@ -534,6 +534,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Qoder
         | AppType::ClaudeDesktop
         | AppType::DeepSeekHarness => false,
     }
@@ -610,6 +611,7 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Qoder
         | AppType::ClaudeDesktop
         | AppType::DeepSeekHarness => Ok(settings.clone()),
     }
@@ -671,6 +673,7 @@ fn apply_common_config_to_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Qoder
         | AppType::ClaudeDesktop
         | AppType::DeepSeekHarness => Ok(settings.clone()),
     }
@@ -1441,6 +1444,11 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 "Pi providers use the Pi provider service".to_string(),
             ));
         }
+        AppType::Qoder => {
+            return Err(AppError::InvalidInput(
+                "Qoder providers use the Qoder provider service".to_string(),
+            ));
+        }
         AppType::DeepSeekHarness => {
             return Err(AppError::InvalidInput(
                 "DeepSeek Harness providers must be written through the DSH RPC service"
@@ -1834,6 +1842,9 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
         AppType::Pi => Err(AppError::InvalidInput(
             "Pi providers are read from Pi's native models file".to_string(),
         )),
+        AppType::Qoder => Err(AppError::InvalidInput(
+            "Qoder providers are read from Qoder's native settings file".to_string(),
+        )),
         AppType::DeepSeekHarness => Err(AppError::InvalidInput(
             "DeepSeekHarness has no live config".to_string(),
         )),
@@ -1946,7 +1957,7 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
             })
         }
         // OpenCode, OpenClaw and Hermes use additive mode and are handled by early return above
-        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi => {
+        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::Qoder => {
             unreachable!("additive mode apps are handled by early return")
         }
         AppType::DeepSeekHarness => {

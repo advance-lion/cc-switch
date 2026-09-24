@@ -24,6 +24,7 @@ const APP_NAME_KEYS: Partial<Record<AppId, string>> = {
   openclaw: "apps.openclaw",
   hermes: "apps.hermes",
   pi: "apps.pi",
+  qoder: "apps.qoder",
 };
 
 const APP_CONFIG = APP_IDS.map((id) => ({ id, nameKey: APP_NAME_KEYS[id] }));

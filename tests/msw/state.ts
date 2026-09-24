@@ -12,7 +12,7 @@ type ProvidersByApp = Record<AppId, Record<string, Provider>>;
 type CurrentProviderState = Record<AppId, string>;
 type McpConfigState = Record<AppId, Record<string, McpServer>>;
 type LiveProviderIdsByApp = Record<
-  "opencode" | "openclaw" | "hermes",
+  "opencode" | "openclaw" | "hermes" | "qoder" | "dsh",
   string[]
 >;
 
@@ -74,6 +74,7 @@ const createDefaultProviders = (): ProvidersByApp => ({
   openclaw: {},
   hermes: {},
   pi: {},
+  qoder: {},
   dsh: {},
 });
 
@@ -87,6 +88,7 @@ const createDefaultCurrent = (): CurrentProviderState => ({
   openclaw: "",
   hermes: "",
   pi: "",
+  qoder: "",
   dsh: "",
 });
 
@@ -96,6 +98,8 @@ let liveProviderIds: LiveProviderIdsByApp = {
   opencode: [],
   openclaw: [],
   hermes: [],
+  qoder: [],
+  dsh: [],
 };
 let settingsState: Settings = {
   showInTray: true,
@@ -202,6 +206,7 @@ let mcpConfigs: McpConfigState = {
   openclaw: {},
   hermes: {},
   pi: {},
+  qoder: {},
   dsh: {},
 };
 
@@ -215,6 +220,8 @@ export const resetProviderState = () => {
     opencode: [],
     openclaw: [],
     hermes: [],
+    qoder: [],
+    dsh: [],
   };
   sessionsState = createDefaultSessions();
   sessionMessagesState = createDefaultSessionMessages();
@@ -273,6 +280,7 @@ export const resetProviderState = () => {
     openclaw: {},
     hermes: {},
     pi: {},
+    qoder: {},
     dsh: {},
   };
 };
@@ -283,11 +291,11 @@ export const getProviders = (appType: AppId) =>
 export const getCurrentProviderId = (appType: AppId) => current[appType] ?? "";
 
 export const getLiveProviderIds = (
-  appType: "opencode" | "openclaw" | "hermes",
+  appType: "opencode" | "openclaw" | "hermes" | "qoder" | "dsh",
 ) => [...liveProviderIds[appType]];
 
 export const setLiveProviderIds = (
-  appType: "opencode" | "openclaw" | "hermes",
+  appType: "opencode" | "openclaw" | "hermes" | "qoder" | "dsh",
   ids: string[],
 ) => {
   liveProviderIds[appType] = [...ids];

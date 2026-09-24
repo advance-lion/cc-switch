@@ -95,6 +95,12 @@ impl AppAdapterRegistry {
                 render_pi,
             ),
             AppAdapter::new(
+                AppType::Qoder,
+                "openai-chat",
+                &["openai-chat", "openai-responses", "anthropic"],
+                render_qoder,
+            ),
+            AppAdapter::new(
                 AppType::DeepSeekHarness,
                 "openai-chat",
                 &["openai-chat", "openai-responses", "anthropic", "ollama"],
@@ -167,6 +173,20 @@ impl AppAdapter {
     }
 
     pub(crate) fn infer_protocol(&self, provider: &Provider) -> String {
+        if self.app_type == AppType::Qoder {
+            if let Some(protocol) = provider
+                .settings_config
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+            {
+                return match protocol {
+                    "openai-responses" => "openai-responses",
+                    "anthropic" => "anthropic",
+                    _ => "openai-chat",
+                }
+                .to_string();
+            }
+        }
         let api = provider
             .settings_config
             .get("api")
@@ -714,6 +734,59 @@ fn render_pi(definition: &ProviderDefinition, secret: &str) -> Result<Provider, 
         json!({
             "apiKey": secret,
             "models": models
+        }),
+        None,
+    ))
+}
+
+fn render_qoder(definition: &ProviderDefinition, secret: &str) -> Result<Provider, AppError> {
+    let protocol = match definition.protocol.as_str() {
+        "openai-chat" => "openai",
+        "openai-responses" => "openai-responses",
+        "anthropic" => "anthropic",
+        _ => return Err(render_error()),
+    };
+    let defs = model_defs(definition);
+    let first_model = defs
+        .first()
+        .map(|model| model.id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let models: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|model| {
+            let supports_vision = model
+                .input_modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("image"));
+            let mut entry = json!({
+                "model": model.id,
+                "displayName": model.display_name.as_deref().unwrap_or(&model.id),
+                "capabilities": {
+                    "tools": true,
+                    "vision": supports_vision,
+                }
+            });
+            if let Some(context_window) = model.context_window {
+                entry["contextWindow"] = json!(context_window);
+            }
+            if let Some(max_output_tokens) = model.max_output_tokens {
+                entry["maxOutputTokens"] = json!(max_output_tokens);
+            }
+            entry
+        })
+        .collect();
+    Ok(Provider::with_id(
+        String::new(),
+        definition.name.clone(),
+        json!({
+            "type": "openai-compatible",
+            "displayName": definition.name,
+            "protocol": protocol,
+            "authType": "bearer",
+            "baseUrl": openai_compatible_base_url(definition),
+            "apiKey": secret,
+            "model": first_model,
+            "models": models,
         }),
         None,
     ))

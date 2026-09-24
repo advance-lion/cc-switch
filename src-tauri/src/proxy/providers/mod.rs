@@ -211,6 +211,7 @@ impl ProviderType {
             AppType::GrokBuild => ProviderType::Codex,
             AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => ProviderType::Codex,
             AppType::Pi => return None,
+            AppType::Qoder => return None,
             AppType::DeepSeekHarness => return None,
         };
         Some(provider_type)
@@ -268,6 +269,7 @@ pub fn get_adapter(app_type: &AppType) -> Option<Box<dyn ProviderAdapter>> {
         AppType::GrokBuild => Box::new(CodexAdapter::new()),
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => Box::new(CodexAdapter::new()),
         AppType::Pi => return None,
+        AppType::Qoder => return None,
         AppType::DeepSeekHarness => return None,
     })
 }

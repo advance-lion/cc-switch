@@ -7,8 +7,8 @@ use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
 use crate::provider::{ClaudeDesktopMode, Provider};
 use crate::services::{
-    DshProviderService, EndpointLatency, ProviderLiveMembership, ProviderService,
-    ProviderSortUpdate, SpeedtestService, SwitchResult,
+    EndpointLatency, ProviderLiveMembership, ProviderService, ProviderSortUpdate, SpeedtestService,
+    SwitchResult,
 };
 use crate::store::AppState;
 use std::str::FromStr;
@@ -117,15 +117,10 @@ pub fn remove_provider_from_live_config(
 #[tauri::command]
 pub async fn get_provider_live_membership(app: String) -> Result<ProviderLiveMembership, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    if app_type != AppType::DeepSeekHarness {
-        return Err(format!(
-            "App {} does not expose the generic live membership API",
-            app_type.as_str()
-        ));
-    }
-    tauri::async_runtime::spawn_blocking(DshProviderService::membership)
+    tauri::async_runtime::spawn_blocking(move || ProviderService::live_membership(app_type))
         .await
-        .map_err(|e| format!("读取 DSH live membership 任务失败: {e}"))
+        .map_err(|e| format!("读取 Provider live membership 任务失败: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -136,24 +131,17 @@ pub async fn set_provider_live_enabled(
     enabled: bool,
 ) -> Result<ProviderLiveMembership, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    if app_type != AppType::DeepSeekHarness {
-        return Err(format!(
-            "App {} does not expose the generic live membership API",
-            app_type.as_str()
-        ));
-    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()
             .ok_or_else(|| "应用状态不可用".to_string())?;
         // This command intentionally does not call guard_projection_mutation:
         // changing membership is the narrow operation shared projections permit.
-        DshProviderService::set_enabled(state.inner(), &providerId, enabled)
-            .map_err(|e| e.to_string())?;
-        Ok(DshProviderService::membership())
+        ProviderService::set_live_enabled(state.inner(), app_type, &providerId, enabled)
+            .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("更新 DSH live membership 任务失败: {e}"))?
+    .map_err(|e| format!("更新 Provider live membership 任务失败: {e}"))?
 }
 
 fn switch_provider_internal(

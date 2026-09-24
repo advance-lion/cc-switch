@@ -32,7 +32,8 @@ impl McpApps {
             AppType::OpenCode => self.opencode,
             AppType::OpenClaw => false, // OpenClaw doesn't support MCP
             AppType::Hermes => self.hermes,
-            AppType::Pi => false, // Pi core has no native MCP registry.
+            AppType::Pi => false,    // Pi core has no native MCP registry.
+            AppType::Qoder => false, // Qoder provider integration has no MCP registry here.
             AppType::ClaudeDesktop => false,
             AppType::DeepSeekHarness => false, // DSH has no MCP config
         }
@@ -49,6 +50,7 @@ impl McpApps {
             AppType::OpenClaw => {} // OpenClaw doesn't support MCP, ignore
             AppType::Hermes => self.hermes = enabled,
             AppType::Pi => {}              // Pi core has no native MCP registry.
+            AppType::Qoder => {}           // Qoder MCP remains native to Qoder.
             AppType::ClaudeDesktop => {} // Claude Desktop 3P provider config doesn't support MCP here
             AppType::DeepSeekHarness => {} // DSH has no MCP config
         }
@@ -119,6 +121,7 @@ impl SkillApps {
             AppType::OpenCode => self.opencode,
             AppType::Hermes => self.hermes,
             AppType::Pi => self.pi,
+            AppType::Qoder => false,
             AppType::OpenClaw => false, // OpenClaw doesn't support Skills
             AppType::ClaudeDesktop => false,
             AppType::DeepSeekHarness => false, // DSH has no Skills
@@ -135,6 +138,7 @@ impl SkillApps {
             AppType::OpenCode => self.opencode = enabled,
             AppType::Hermes => self.hermes = enabled,
             AppType::Pi => self.pi = enabled,
+            AppType::Qoder => {}
             AppType::OpenClaw => {} // OpenClaw doesn't support Skills, ignore
             AppType::ClaudeDesktop => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
             AppType::DeepSeekHarness => {} // DSH has no Skills
@@ -396,6 +400,7 @@ pub enum AppType {
     OpenClaw,
     Hermes,
     Pi,
+    Qoder,
     #[serde(rename = "dsh")]
     DeepSeekHarness,
 }
@@ -445,6 +450,7 @@ impl AppType {
             AppType::OpenClaw => "openclaw",
             AppType::Hermes => "hermes",
             AppType::Pi => "pi",
+            AppType::Qoder => "qoder",
             AppType::DeepSeekHarness => "dsh",
         }
     }
@@ -461,6 +467,12 @@ impl AppType {
             AppType::Pi => ProviderBehavior {
                 mode: ProviderMode::Additive,
                 live_backend: ProviderLiveBackend::PiService,
+                startup_sync: ProviderStartupSync::ExplicitOnly,
+                supports_shared_projection: true,
+            },
+            AppType::Qoder => ProviderBehavior {
+                mode: ProviderMode::Additive,
+                live_backend: ProviderLiveBackend::File,
                 startup_sync: ProviderStartupSync::ExplicitOnly,
                 supports_shared_projection: true,
             },
@@ -507,6 +519,7 @@ impl AppType {
             AppType::OpenClaw,
             AppType::Hermes,
             AppType::Pi,
+            AppType::Qoder,
             AppType::DeepSeekHarness,
         ]
         .into_iter()
@@ -528,11 +541,12 @@ impl FromStr for AppType {
             "openclaw" => Ok(AppType::OpenClaw),
             "hermes" => Ok(AppType::Hermes),
             "pi" => Ok(AppType::Pi),
+            "qoder" | "qodercli" | "qoder-cli" => Ok(AppType::Qoder),
             "dsh" | "deepseek-harness" | "deepseek_harness" => Ok(AppType::DeepSeekHarness),
             other => Err(AppError::localized(
                 "unsupported_app",
-                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, dsh。"),
-                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, dsh."),
+                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, qoder, dsh。"),
+                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, qoder, dsh."),
             )),
         }
     }
@@ -573,6 +587,7 @@ impl CommonConfigSnippets {
             AppType::OpenClaw => self.openclaw.as_ref(),
             AppType::Hermes => self.hermes.as_ref(),
             AppType::Pi => None,
+            AppType::Qoder => None,
             AppType::DeepSeekHarness => None,
         }
     }
@@ -589,6 +604,7 @@ impl CommonConfigSnippets {
             AppType::OpenClaw => self.openclaw = snippet,
             AppType::Hermes => self.hermes = snippet,
             AppType::Pi => {}
+            AppType::Qoder => {}
             AppType::DeepSeekHarness => {}
         }
     }
@@ -916,6 +932,7 @@ impl MultiAppConfig {
             // Pi was added after prompts moved to SQLite. Keeping it out of
             // this legacy config avoids a second, unused prompt state.
             AppType::Pi => return Ok(false),
+            AppType::Qoder => return Ok(false),
             AppType::DeepSeekHarness => return Ok(false), // DSH has no prompts
         };
 
@@ -961,6 +978,7 @@ impl MultiAppConfig {
                 AppType::OpenClaw => continue, // OpenClaw MCP is still in development, skip
                 AppType::Hermes => continue,   // Hermes didn't exist in v3.6.x, skip
                 AppType::Pi => continue,       // Pi didn't exist in v3.6.x, skip
+                AppType::Qoder => continue,    // Qoder didn't exist in v3.6.x, skip
                 AppType::DeepSeekHarness => continue, // DSH didn't exist in v3.6.x, skip
             };
 

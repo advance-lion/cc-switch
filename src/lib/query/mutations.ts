@@ -66,6 +66,7 @@ export const useAddProviderMutation = (appId: AppId) => {
         appId === "openclaw" ||
         appId === "hermes" ||
         appId === "pi" ||
+        appId === "qoder" ||
         appId === "dsh"
       ) {
         if (
@@ -121,9 +122,9 @@ export const useAddProviderMutation = (appId: AppId) => {
       if (appId === "hermes") {
         await invalidateHermesProviderCaches(queryClient);
       }
-      if (appId === "dsh") {
+      if (appId === "qoder" || appId === "dsh") {
         await queryClient.invalidateQueries({
-          queryKey: providerLiveMembershipKeys.app("dsh"),
+          queryKey: providerLiveMembershipKeys.app(appId),
         });
       }
       try {
@@ -200,9 +201,9 @@ export const useUpdateProviderMutation = (appId: AppId) => {
       if (appId === "hermes") {
         await invalidateHermesProviderCaches(queryClient);
       }
-      if (appId === "dsh") {
+      if (appId === "qoder" || appId === "dsh") {
         await queryClient.invalidateQueries({
-          queryKey: providerLiveMembershipKeys.app("dsh"),
+          queryKey: providerLiveMembershipKeys.app(appId),
         });
       }
       toast.success(
@@ -272,9 +273,9 @@ export const useDeleteProviderMutation = (appId: AppId) => {
       if (appId === "hermes") {
         await invalidateHermesProviderCaches(queryClient);
       }
-      if (appId === "dsh") {
+      if (appId === "qoder" || appId === "dsh") {
         await queryClient.invalidateQueries({
-          queryKey: providerLiveMembershipKeys.app("dsh"),
+          queryKey: providerLiveMembershipKeys.app(appId),
         });
       }
       try {
@@ -364,9 +365,9 @@ export const useSwitchProviderMutation = (appId: AppId) => {
       if (appId === "hermes") {
         await invalidateHermesProviderCaches(queryClient);
       }
-      if (appId === "dsh") {
+      if (appId === "qoder" || appId === "dsh") {
         await queryClient.invalidateQueries({
-          queryKey: providerLiveMembershipKeys.app("dsh"),
+          queryKey: providerLiveMembershipKeys.app(appId),
         });
       }
       try {

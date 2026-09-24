@@ -556,6 +556,57 @@ describe("ProviderList Component", () => {
     });
   });
 
+  it("derives Qoder membership from settings.json providers", async () => {
+    const provider = createProvider({
+      id: "qoder-provider",
+      name: "Qoder Provider",
+      settingsConfig: {
+        protocol: "openai",
+        baseUrl: "https://api.example.com/v1",
+        model: "model-a",
+        models: [{ model: "model-a" }],
+      },
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_provider_live_membership`, () =>
+        HttpResponse.json({
+          status: "available",
+          providerIds: ["qoder-provider"],
+        }),
+      ),
+    );
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{ [provider.id]: provider }}
+        currentProviderId=""
+        appId="qoder"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const latestCardProps = providerCardRenderSpy.mock.calls
+        .map(([props]) => props)
+        .filter((props) => props.provider.id === provider.id)
+        .at(-1);
+      expect(latestCardProps).toMatchObject({
+        isCurrent: false,
+        isInConfig: true,
+        isStateChangeProtected: false,
+      });
+    });
+  });
+
   it("sets an inactive Pi provider through the ordinary provider action", async () => {
     const provider = createProvider({
       id: "inactive-pi",

@@ -7,6 +7,7 @@ mod endpoints;
 mod gemini_auth;
 mod live;
 mod pi;
+mod qoder;
 mod usage;
 
 use indexmap::IndexMap;
@@ -4058,6 +4059,48 @@ wire_api = "responses"
 }
 
 impl ProviderService {
+    /// Read authoritative membership for apps whose Provider template permits
+    /// multiple providers to coexist in the native runtime configuration.
+    pub fn live_membership(app_type: AppType) -> Result<ProviderLiveMembership, AppError> {
+        match app_type {
+            AppType::Qoder => Ok(qoder::membership()),
+            AppType::DeepSeekHarness => Ok(dsh::DshProviderService::membership()),
+            _ => Err(AppError::InvalidInput(format!(
+                "App {} does not expose the generic live membership API",
+                app_type.as_str()
+            ))),
+        }
+    }
+
+    /// Enable or disable one provider without changing any other provider in
+    /// an additive runtime. This narrow operation is also safe for Provider
+    /// Center projections because it does not edit or delete the projection.
+    pub fn set_live_enabled(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+        enabled: bool,
+    ) -> Result<ProviderLiveMembership, AppError> {
+        match app_type {
+            AppType::Qoder => {
+                if enabled {
+                    qoder::enable(state, id)?;
+                } else {
+                    qoder::remove(state, id)?;
+                }
+                Ok(qoder::membership())
+            }
+            AppType::DeepSeekHarness => {
+                dsh::DshProviderService::set_enabled(state, id, enabled)?;
+                Ok(dsh::DshProviderService::membership())
+            }
+            _ => Err(AppError::InvalidInput(format!(
+                "App {} does not expose the generic live membership API",
+                app_type.as_str()
+            ))),
+        }
+    }
+
     fn managed_codex_oauth_account_id(provider: &Provider) -> Option<String> {
         provider
             .meta
@@ -4295,7 +4338,10 @@ impl ProviderService {
     ) -> Result<(), AppError> {
         // Pi and DSH use their own persistence implementations. Neither runs
         // these normalizers in AppAdapter::apply.
-        if matches!(app_type, AppType::Pi | AppType::DeepSeekHarness) {
+        if matches!(
+            app_type,
+            AppType::Pi | AppType::Qoder | AppType::DeepSeekHarness
+        ) {
             return Ok(());
         }
 
@@ -4406,6 +4452,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::list(state);
         }
+        if app_type == AppType::Qoder {
+            return qoder::list(state);
+        }
         state.db.get_all_providers(app_type.as_str())
     }
 
@@ -4417,6 +4466,9 @@ impl ProviderService {
     ) -> Result<IndexMap<String, Provider>, AppError> {
         if app_type == AppType::Pi {
             return pi::list_read_only(state);
+        }
+        if app_type == AppType::Qoder {
+            return qoder::list_read_only(state);
         }
         state.db.get_all_providers(app_type.as_str())
     }
@@ -4446,6 +4498,9 @@ impl ProviderService {
     ) -> Result<bool, AppError> {
         if app_type == AppType::Pi {
             return pi::add(state, provider, add_to_live);
+        }
+        if app_type == AppType::Qoder {
+            return qoder::add(state, provider, add_to_live);
         }
         if app_type == AppType::DeepSeekHarness {
             return dsh::DshProviderService::add(state, provider, add_to_live);
@@ -4570,6 +4625,9 @@ impl ProviderService {
     ) -> Result<bool, AppError> {
         if app_type == AppType::Pi {
             return pi::update(state, original_id, provider);
+        }
+        if app_type == AppType::Qoder {
+            return qoder::update(state, original_id, provider);
         }
         if app_type == AppType::DeepSeekHarness {
             return dsh::DshProviderService::update(state, original_id, provider);
@@ -4925,6 +4983,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::delete(state, id);
         }
+        if app_type == AppType::Qoder {
+            return qoder::delete(state, id);
+        }
         if app_type == AppType::DeepSeekHarness {
             return dsh::DshProviderService::delete(state, id);
         }
@@ -5003,6 +5064,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::remove(state, id);
         }
+        if app_type == AppType::Qoder {
+            return qoder::remove(state, id);
+        }
         if app_type == AppType::DeepSeekHarness {
             return dsh::DshProviderService::set_enabled(state, id, false);
         }
@@ -5073,6 +5137,9 @@ impl ProviderService {
     pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
         if app_type == AppType::Pi {
             return pi::enable(state, id);
+        }
+        if app_type == AppType::Qoder {
+            return qoder::enable(state, id);
         }
 
         // Check if provider exists
@@ -5675,6 +5742,7 @@ impl ProviderService {
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
             AppType::Pi => Ok(String::new()),
+            AppType::Qoder => Ok(String::new()),
             AppType::DeepSeekHarness => Ok(String::new()),
         }
     }
@@ -5694,6 +5762,7 @@ impl ProviderService {
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
             AppType::Pi => Ok(String::new()),
+            AppType::Qoder => Ok(String::new()),
             AppType::DeepSeekHarness => Ok(String::new()),
         }
     }
@@ -6463,6 +6532,12 @@ impl ProviderService {
             AppType::Pi => {
                 crate::pi_config::validate_provider_node(&provider.id, &provider.settings_config)?;
             }
+            AppType::Qoder => {
+                crate::qoder_config::validate_provider_node(
+                    &provider.id,
+                    &provider.settings_config,
+                )?;
+            }
             AppType::DeepSeekHarness => {
                 dsh::DshProviderService::validate_provider(&provider)?;
             }
@@ -6670,7 +6745,11 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
-            AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::DeepSeekHarness => {
+            AppType::OpenClaw
+            | AppType::Hermes
+            | AppType::Pi
+            | AppType::Qoder
+            | AppType::DeepSeekHarness => {
                 // These native formats use apiKey and baseUrl directly on the object.
                 let api_key = provider
                     .settings_config

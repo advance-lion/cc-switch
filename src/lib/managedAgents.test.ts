@@ -11,7 +11,7 @@ import { discoverManagedAgents } from "@/lib/managedAgents";
 describe("discoverManagedAgents", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("registers an installed Qoder CLI as a managed Agent", async () => {
+  it("does not duplicate first-class Provider Agents in the lifecycle-only registry", async () => {
     settingsApiMock.getToolVersions.mockResolvedValue([
       {
         name: "qoder",
@@ -22,15 +22,8 @@ describe("discoverManagedAgents", () => {
       },
     ]);
 
-    await expect(discoverManagedAgents()).resolves.toEqual([
-      expect.objectContaining({
-        id: "qoder",
-        tool: "qoder",
-        name: "Qoder",
-        version: "1.1.62",
-        providerIntegration: "planned",
-      }),
-    ]);
+    await expect(discoverManagedAgents()).resolves.toEqual([]);
+    expect(settingsApiMock.getToolVersions).toHaveBeenCalledWith([]);
   });
 
   it("does not add an Agent that is not installed", async () => {

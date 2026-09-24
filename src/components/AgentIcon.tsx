@@ -22,12 +22,11 @@ const BUILTIN_AGENT_VISUALS = {
   openclaw: { label: "OpenClaw", icon: "openclaw" },
   hermes: { label: "Hermes", icon: "hermes" },
   pi: { label: "Pi", icon: "pi" },
+  qoder: { label: "Qoder", icon: "qoder" },
   dsh: { label: "DeepSeek Harness", shortLabel: "DSH", icon: "dsh" },
 } satisfies Record<AppId, AgentVisual>;
 
-const MANAGED_AGENT_VISUALS: Record<string, AgentVisual> = {
-  qoder: { label: "Qoder", icon: "qoder" },
-};
+const MANAGED_AGENT_VISUALS: Record<string, AgentVisual> = {};
 
 const overrides = new Map<string, Partial<AgentVisual>>();
 const listeners = new Set<() => void>();
